@@ -1,0 +1,10 @@
+{
+  "name": "Neo4j GraphRAG Advanced",
+  "description": "Advanced GraphRAG with entity extraction, knowledge graph, and native vector indexes",
+  "author_name": "Matteo Cacciola",
+  "plugin_url": "https://github.com/matteocacciola/cat_graphrag",
+  "tags": "graph, neo4j, knowledge graph, entity extraction, vector indexes",
+  "thumb": "https://raw.githubusercontent.com/matteocacciola/cat-graphrag/main/thumb.jpg",
+  "version": "0.1.0",
+  "dependencies": ["base_plugin"]
+}
