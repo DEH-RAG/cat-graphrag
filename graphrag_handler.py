@@ -6,7 +6,7 @@ from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManag
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
-from cat import BaseVectorDatabaseHandler
+from cat import BaseVectorDatabaseHandler, Embeddings
 from cat.services.memory.models import (
     DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
 )
@@ -60,6 +60,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self._entity_extractor: Optional[EntityExtractor] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
         self._user_message = None
+        self._embedder: Optional[Embeddings] = None
 
     def _eq(self, other: "GraphRAGHandler") -> bool:
         return (
@@ -74,6 +75,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     @user_message.setter
     def user_message(self, value: str):
         self._user_message = value
+
+    @property
+    def embedder(self) -> Optional[Embeddings]:
+        return self._embedder
+
+    @embedder.setter
+    def embedder(self, value: Embeddings):
+        self._embedder = value
         
     @property
     def client(self):
@@ -512,108 +521,141 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self,
         document_id: str,
         content: str,
-        metadata: Dict
+        metadata: Dict,
     ) -> None:
         """
         Extracts entities from the document and links them to the graph.
         Runs in the background.
+
+        Uses three batched UNWIND queries instead of N sequential calls:
+        one for entity nodes, one for MENTIONS edges, one for RELATED_TO edges.
+        Relations with the same (source, target, type) key are deduplicated
+        in Python before being sent, averaging their weights.
         """
-        create_entity_query = """
-        MERGE (e:Entity {
-            id: $id,
-            tenant_id: $tenant_id
-        })
-        ON CREATE SET 
-            e.name = $name,
-            e.type = $type,
+        batch_entity_query = """
+        UNWIND $entities AS ent
+        MERGE (e:Entity {id: ent.id, tenant_id: $tenant_id})
+        ON CREATE SET
+            e.name       = ent.name,
+            e.type       = ent.type,
             e.created_at = datetime(),
-            e.metadata = $metadata
-        ON MATCH SET 
-            e.last_seen = datetime()
-        RETURN e.id AS id
+            e.metadata   = ent.metadata,
+            e.embedding  = ent.embedding
+        ON MATCH SET
+            e.last_seen  = datetime(),
+            e.embedding  = CASE WHEN ent.embedding IS NOT NULL THEN ent.embedding ELSE e.embedding END
         """
 
-        mention_query = """
+        batch_mention_query = """
         MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
-        MATCH (e:Entity {id: $entity_id, tenant_id: $tenant_id})
+        WITH d
+        UNWIND $mentions AS m
+        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
         MERGE (d)-[r:MENTIONS]->(e)
-        ON CREATE SET r.created_at = datetime(), r.confidence = $confidence
-        ON MATCH SET r.last_seen = datetime(), r.confidence = $confidence
-        RETURN r
+        ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
+        ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
         """
 
-        rel_query = """
-        MATCH (s:Entity {id: $source_id, tenant_id: $tenant_id})
-        MATCH (t:Entity {id: $target_id, tenant_id: $tenant_id})
-        MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
-        ON CREATE SET r.weight = $weight, r.created_at = datetime()
-        ON MATCH SET r.weight = (r.weight + $weight) / 2
+        batch_relation_query = """
+        UNWIND $relations AS rel
+        MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
+        MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
+        MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
+        ON CREATE SET r.weight = rel.weight, r.created_at = datetime()
+        ON MATCH SET  r.weight = (r.weight + rel.weight) / 2
         """
 
         try:
-            extracted = await self._entity_extractor.extract(
-                content, document_id, metadata
-            )
-
+            extracted = await self._entity_extractor.extract(content, document_id, metadata)
             if not extracted.entities:
                 return
 
-            # Build name → type map for correct relation hashing (fix: was always UNKNOWN)
             entity_type_map = {e.name: e.type for e in extracted.entities}
 
+            # Build batch payload for entities and mentions in one pass
+            entities_batch = []
+            mentions_batch = []
+            for entity in extracted.entities:
+                entity_id = self._entity_extractor.get_entity_hash(
+                    entity.name, entity.type, self.agent_id
+                )
+                entities_batch.append({
+                    "id":        entity_id,
+                    "name":      entity.name.lower().strip(),
+                    "type":      entity.type.value,
+                    "metadata":  {"source_document": document_id, "confidence": entity.confidence},
+                    "embedding": None,  # populated below when enable_entity_embeddings=True
+                })
+                mentions_batch.append({
+                    "entity_id":  entity_id,
+                    "confidence": entity.confidence,
+                })
+
+            # Batch-embed all entity names in one call (non-blocking via thread)
+            if self.config.enable_entity_embeddings and self._embedder is not None:
+                try:
+                    names = [ent["name"] for ent in entities_batch]
+                    embeddings = await asyncio.to_thread(
+                        self._embedder.embed_documents, names
+                    )
+                    for ent, emb in zip(entities_batch, embeddings):
+                        ent["embedding"] = emb
+                except Exception as emb_err:
+                    log.warning(f"[GraphRAG] Entity embedding skipped: {emb_err}")
+
+            # Build and deduplicate relation payload (average weights on collision)
+            rel_map: Dict[Tuple, Dict] = {}
+            for relation in extracted.relations:
+                source_type = entity_type_map.get(relation.source_entity, EntityType.UNKNOWN)
+                target_type = entity_type_map.get(relation.target_entity, EntityType.UNKNOWN)
+                source_id = self._entity_extractor.get_entity_hash(
+                    relation.source_entity, source_type, self.agent_id
+                )
+                target_id = self._entity_extractor.get_entity_hash(
+                    relation.target_entity, target_type, self.agent_id
+                )
+                if not source_id or not target_id or source_id == target_id:
+                    continue
+                key = (source_id, target_id, relation.relation_type)
+                if key in rel_map:
+                    rel_map[key]["weight"] = (rel_map[key]["weight"] + relation.weight) / 2
+                else:
+                    rel_map[key] = {
+                        "source_id": source_id,
+                        "target_id": target_id,
+                        "rel_type":  relation.relation_type,
+                        "weight":    relation.weight,
+                    }
+            relations_batch = list(rel_map.values())
+
             async with self._get_session() as session:
-                for entity in extracted.entities:
-                    entity_id = self._entity_extractor.get_entity_hash(
-                        entity.name, entity.type, self.agent_id
-                    )
-
+                await session.run(
+                    batch_entity_query, entities=entities_batch, tenant_id=self.agent_id
+                )
+                await session.run(
+                    batch_mention_query,
+                    mentions=mentions_batch, doc_id=document_id, tenant_id=self.agent_id
+                )
+                if relations_batch:
                     await session.run(
-                        create_entity_query,
-                        id=entity_id,
-                        tenant_id=self.agent_id,
-                        name=entity.name.lower().strip(),  # normalized: consistent with get_entity_hash
-                        type=entity.type.value,
-                        metadata={"source_document": document_id, "confidence": entity.confidence}  # native map
+                        batch_relation_query, relations=relations_batch, tenant_id=self.agent_id
                     )
-
-                    await session.run(
-                        mention_query,
-                        doc_id=document_id,
-                        entity_id=entity_id,
-                        tenant_id=self.agent_id,
-                        confidence=entity.confidence
-                    )
-
-                # Extract relationships among entities
-                for relation in extracted.relations:
-                    # Use an actual entity type for the correct hash (not EntityType.UNKNOWN)
-                    source_type = entity_type_map.get(relation.source_entity, EntityType.UNKNOWN)
-                    target_type = entity_type_map.get(relation.target_entity, EntityType.UNKNOWN)
-                    source_id = self._entity_extractor.get_entity_hash(
-                        relation.source_entity, source_type, self.agent_id
-                    )
-                    target_id = self._entity_extractor.get_entity_hash(
-                        relation.target_entity, target_type, self.agent_id
-                    )
-
-                    if source_id and target_id:
-                        await session.run(
-                            rel_query,
-                            source_id=source_id,
-                            target_id=target_id,
-                            tenant_id=self.agent_id,
-                            rel_type=relation.relation_type,
-                            weight=relation.weight
-                        )
 
             log.debug(
-                f"Extracted {len(extracted.entities)} entities and {len(extracted.relations)} relations for {document_id}"
+                f"Linked {len(entities_batch)} entities and {len(relations_batch)} relations "
+                f"for document {document_id}"
             )
         except Exception as e:
             log.error(f"Failed to extract entities for {document_id}: {e}")
 
     async def _create_similarity_relationships(self, point_id: str, vector: List[float], collection_name: str):
-        """Creates SIMILAR_TO relationships between similar documents."""
+        """
+        Creates bidirectional SIMILAR_TO relationships between similar documents.
+
+        Both directions (a→b and b→a) are stored so graph traversal never misses
+        a link regardless of the direction used by future queries.
+        A single UNWIND query replaces the previous one-round-trip-per-document loop.
+        """
         find_similar_query = """
         MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
         CALL db.index.vector.queryNodes($index_name, 20, $vector)
@@ -626,10 +668,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
 
         create_rel_query = """
-        MATCH (a:Document {id: $source_id})
-        MATCH (b:Document {id: $target_id})
-        MERGE (a)-[r:SIMILAR_TO]->(b)
-        SET r.score = $score, r.created_at = datetime()
+        UNWIND $similar AS sim
+        MATCH (a:Document {id: $point_id})
+        MATCH (b:Document {id: sim.id})
+        MERGE (a)-[r1:SIMILAR_TO]->(b)
+        SET r1.score = sim.score, r1.updated_at = datetime()
+        MERGE (b)-[r2:SIMILAR_TO]->(a)
+        SET r2.score = sim.score, r2.updated_at = datetime()
         """
 
         try:
@@ -641,19 +686,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                     index_name=self.config.document_vector_index,
                     vector=vector,
                     point_id=point_id,
-                    threshold=self.config.vector_similarity_threshold
+                    threshold=self.config.vector_similarity_threshold,
                 )
                 similar = await result.data()
 
-                for sim in similar:
-                    await session.run(
-                        create_rel_query,
-                        source_id=point_id,
-                        target_id=sim["id"],
-                        score=sim["score"]
-                    )
+                if similar:
+                    await session.run(create_rel_query, similar=similar, point_id=point_id)
 
-            log.debug(f"Created {len(similar)} similarity relationships for {point_id}")
+            log.debug(f"Created {len(similar) * 2} similarity relationships for {point_id}")
 
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
@@ -755,45 +795,64 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         threshold: float | None = None,
     ) -> List[DocumentRecall]:
         """
-        GraphRAG hybrid retrieval — two parallel phases, then a smart merge.
+        GraphRAG hybrid retrieval — four parallel signals, then a smart merge.
 
-        Phase A (entity-first, only when enable_entity_expansion=True):
-          ① Extract named entities from the *user's raw message* (_USER_MESSAGE)
-             using the same spaCy pipeline used for ingestion.
-          ② Direct lookup — find documents that explicitly MENTION those entities.
-             Score = (matched entities) / (total query entities), so docs that
-             cover more of the query entities rank higher.
-          ③ Related lookup — walk the RELATED_TO graph up to `graph_retrieval_depth`
-             hops from the query entities and retrieve documents that mention the
-             reached entities.  Score decays with hop distance.
+        Phase A (entity-first):
+          ② Direct lookup — find documents that explicitly MENTION entities
+             extracted from the raw user message (spaCy pipeline).
+             Score = matched_entities / total_query_entities.
+             Only when `enable_entity_expansion=True` and query entities found.
+          ③ Related lookup — walk the RELATED_TO graph up to
+             `graph_retrieval_depth` hops from the query entities.
+             Score decays with hop distance.
+             Only when `enable_entity_expansion=True` and query entities found.
+          ④ Entity vector search — query the entity embedding index with the
+             query embedding; retrieve documents that mention the closest entities.
+             Score = max entity-similarity score across matched entities.
+             Only when `enable_entity_embeddings=True` and embedder injected.
 
         Phase B (always active):
-          ④ Standard HNSW vector search on the document embeddings.
+          ⑤ Standard HNSW vector search on document embeddings.
 
         Merge:
-          Documents found by both Phase A and Phase B receive a confidence boost
-          (they are both semantically similar AND topically relevant).
-          Documents found only by one phase are included with their own score.
-          The final list is sorted by score and capped at k.
+          A③ and A④ results are combined into one "indirect evidence" pool
+          (max score when the same document appears in both).
+          Documents found by both the entity pool and Phase B receive a boost.
+          The final list is sorted by composite score and capped at k.
         """
-        async def retrieve() -> Tuple[List[Dict], List[Dict], List[Dict]]:
-            # Entity expansion disabled → pure vector search only
+        async def _empty() -> List[Dict]:
+            return []
+
+        async def retrieve() -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
+            # A④ and B are always candidates — build their coroutines now
+            ev_coro = (
+                self._recall_entity_by_vector(collection_name, embedding, k_fetch)
+                if self.config.enable_entity_embeddings and self._embedder is not None
+                else _empty()
+            )
+            vr_coro = self._recall_by_vector(collection_name, embedding, k_fetch, threshold)
+
+            # Entity name expansion (A② + A③) disabled → only A④ + B
             if not self.config.enable_entity_expansion or not self._entity_extractor:
-                vr = await self._recall_by_vector(collection_name, embedding, k_fetch, threshold)
-                return [], [], vr
+                ev, vr = await asyncio.gather(ev_coro, vr_coro)
+                return [], [], ev, vr
+
             # ── Phase A ──────────────────────────────────────────────────────
             query_entity_names = await self._extract_query_entities()
-            # No recognisable entities in the query → pure vector
+
+            # No recognisable entities in the query → A④ + B only
             if not query_entity_names:
-                vr = await self._recall_by_vector(collection_name, embedding, k_fetch, threshold)
-                return [], [], vr
-            # Run A② + A③ + B in parallel — they are fully independent
-            ed, er, vr = await asyncio.gather(
+                ev, vr = await asyncio.gather(ev_coro, vr_coro)
+                return [], [], ev, vr
+
+            # Run A② + A③ + A④ + B all in parallel — fully independent
+            ed, er, ev, vr = await asyncio.gather(
                 self._recall_entity_direct(collection_name, query_entity_names, k_fetch),
                 self._recall_entity_related(collection_name, query_entity_names, k_fetch, depth, decay),
-                self._recall_by_vector(collection_name, embedding, k_fetch, threshold),
+                ev_coro,
+                vr_coro,
             )
-            return ed, er, vr
+            return ed, er, ev, vr
 
         await self._ensure_connected()
 
@@ -805,8 +864,21 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         # $param arithmetic is not supported inside Cypher, so pre-compute in Python.
         k_fetch = k * 2
 
-        entity_direct, entity_related, vector_raw = await retrieve()
-        return self._merge_and_rerank(entity_direct, entity_related, vector_raw, k, decay)
+        entity_direct, entity_related, entity_vector, vector_raw = await retrieve()
+
+        # Merge A③ and A④ into one "indirect evidence" pool.
+        # Both phases surface documents through associated entities rather than
+        # direct name matches; treat them symmetrically and keep the best score
+        # when the same document is found by both.
+        indirect_map: Dict[str, Dict] = {}
+        for r in entity_related:
+            indirect_map[r["id"]] = r
+        for r in entity_vector:
+            if r["id"] not in indirect_map or r["score"] > indirect_map[r["id"]]["score"]:
+                indirect_map[r["id"]] = r
+        entity_indirect = list(indirect_map.values())
+
+        return self._merge_and_rerank(entity_direct, entity_indirect, vector_raw, k, decay)
 
     # ── Phase A helpers ───────────────────────────────────────────────────────
 
@@ -928,6 +1000,57 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             )
             return await result.data()
 
+    # ── Phase A④ helper ──────────────────────────────────────────────────────
+
+    async def _recall_entity_by_vector(
+        self,
+        collection_name: str,
+        embedding: List[float],
+        k: int,
+    ) -> List[Dict]:
+        """
+        Phase A④: searches the entity vector index with the query embedding.
+
+        Finds entity nodes whose stored embedding is semantically close to the
+        query, then returns documents that MENTION those entities.  The score
+        for each document is the maximum entity-similarity score across all
+        matched entities.
+
+        This phase is complementary to A② (direct name match): it catches
+        entities that are semantically related to the query even when spaCy
+        did not extract them explicitly (paraphrases, abbreviations, synonyms).
+
+        Only active when `enable_entity_embeddings=True` and entity embeddings
+        have been stored during ingestion (requires the embedder to be injected).
+        """
+        query = """
+        CALL db.index.vector.queryNodes($index_name, $k, $vector)
+        YIELD node AS ent, score AS ent_score
+        WHERE ent.tenant_id = $tenant_id
+        MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(ent)
+        WHERE EXISTS {
+            MATCH (d)-[:BELONGS_TO]->(:Collection {name: $collection_name, tenant_id: $tenant_id})
+        }
+        WITH d, max(ent_score) AS score
+        RETURN d.id        AS id,
+               d.content   AS content,
+               d.metadata  AS metadata,
+               d.embedding AS embedding,
+               score
+        ORDER BY score DESC
+        LIMIT $k
+        """
+        async with self._get_session() as session:
+            result = await session.run(
+                query,
+                index_name=self.config.entity_vector_index,
+                k=k,
+                vector=embedding,
+                tenant_id=self.agent_id,
+                collection_name=collection_name,
+            )
+            return await result.data()
+
     # ── Phase B helper ────────────────────────────────────────────────────────
 
     async def _recall_by_vector(
@@ -974,7 +1097,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     @staticmethod
     def _merge_and_rerank(
         entity_direct: List[Dict],
-        entity_related: List[Dict],
+        entity_indirect: List[Dict],
         vector_results: List[Dict],
         k: int,
         decay: float,
@@ -983,12 +1106,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         Merges Phase A and Phase B results into a single ranked list.
 
+        `entity_indirect` is the pre-merged pool of A③ (graph traversal) and
+        A④ (entity vector search) results — both surfaces documents through
+        associated entities rather than direct name matches.
+
         Scoring rules (applied in order of priority):
-          1. Doc found by entity_direct AND vector  → max(es, vs) × boost   (jackpot)
-          2. Doc found by entity_direct only        → entity_score
-          3. Doc found by entity_related AND vector → max(es, vs) × (boost * decay)
-          4. Doc found by entity_related only       → entity_score
-          5. Doc found by vector only               → vector_score
+          1. Doc found by entity_direct AND vector   → max(es, vs) × boost        (jackpot)
+          2. Doc found by entity_direct only         → entity_score
+          3. Doc found by entity_indirect AND vector → max(es, vs) × (boost × decay)
+          4. Doc found by entity_indirect only       → entity_score
+          5. Doc found by vector only                → vector_score
 
         The boost (default 1.3, capped at 1.0) rewards documents that are both
         semantically similar to the query AND topically grounded in the graph.
@@ -1026,7 +1153,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 "entity_score": r["score"],
                 "vector_score": 0.0,
                 "is_direct": False,
-            } for r in entity_related if r["id"] not in registry # entity_direct always takes priority
+            } for r in entity_indirect if r["id"] not in registry  # entity_direct always takes priority
         })
 
         for r in vector_results:
@@ -1060,7 +1187,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         log.debug(
             f"[GraphRAG] Merge: {len(entity_direct)} direct + "
-            f"{len(entity_related)} related + {len(vector_results)} vector "
+            f"{len(entity_indirect)} indirect (graph+vector) + {len(vector_results)} vector "
             f"→ {len(documents)} final"
         )
         return documents

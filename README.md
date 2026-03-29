@@ -354,48 +354,22 @@ Plugin metadata name: **Neo4j GraphRAG Advanced**
 
 ## Known Limitations
 
-The following limitations are known and accepted for the current release. They do not affect correctness in normal use, 
-but are worth understanding before deploying at scale or in specialized domains.
-
-### 1. Ingestion performance: sequential Neo4j round-trips per document
-
-Entity extraction runs in the background after each document is stored. For each document, the handler issues one Neo4j
-query per extracted entity and one per extracted relation. A document yielding 20 entities and 15 relations generates
-roughly 55 sequential database calls.
-
-This does not block the user response (all extraction is scheduled with `asyncio.create_task`), but it can slow down
-bulk ingestion. A future improvement will batch this writes using `UNWIND`-based queries.
-
-### 2. `SIMILAR_TO` relationships are directional
-
-Document-to-document similarity links are stored as directed relationships:
-
-```
-(a:Document)-[:SIMILAR_TO]->(b:Document)
-```
-
-Similarity is inherently symmetric, but the current graph only records one direction per pair. The active retrieval
-pipeline does not traverse `SIMILAR_TO` edges directly, so this has no impact on recall quality today. Any future
-extension that performs graph traversal over similarity links should use an undirected pattern (`-[:SIMILAR_TO]-`)
-to avoid missing half the graph.
-
-### 3. Technology pattern list is English-centric
+### Technology pattern list is English-centric
 
 The built-in `TECHNOLOGY_PATTERNS` list targets English proper nouns (framework names, cloud providers, programming
 languages). It will miss technology terms written in other scripts or domain-specific jargon outside the list.
 
-The `extra_technology_patterns` setting is available to extend the list at configuration time. For non-English or
-highly specialized knowledge bases, this field should be populated accordingly.
+Two mitigations are available:
 
-### 4. `enable_entity_embeddings` does not yet drive retrieval
+- **Use a multilingual spaCy model** — models such as `xx_ent_wiki_sm` cover named entities across many languages.
+  The NER component is language-agnostic; only the regex patterns are English-centric.
+  Set `spacy_model` in the plugin configuration to switch model.
+- **Extend the regex list** — use `extra_technology_patterns` to add domain-specific or non-English terms at
+  configuration time.
 
-When `enable_entity_embeddings` is set to `True`, the plugin creates a vector index on entity nodes and stores an
-embedding on each entity. However, the current retrieval pipeline (`_recall_entity_direct`, `_recall_entity_related`)
-uses graph traversal exclusively and does not query the entity vector index.
+For knowledge bases in languages other than English, combining a multilingual model with a curated
+`extra_technology_patterns` list gives the best coverage.
 
-The flag is forward-looking: it anticipates a future retrieval phase where the user query embedding is matched against
-entity embeddings directly, adding a fourth signal to the hybrid pipeline. Until that phase is implemented, enabling
-this option increases storage usage without improving recall.
 
 ---
 
