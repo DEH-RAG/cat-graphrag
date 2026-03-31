@@ -2,7 +2,7 @@ import asyncio
 from cat import log
 import hashlib
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from spacy import load as spacy_load
 from spacy.language import Language
 from spacy.tokens import Doc
@@ -31,7 +31,7 @@ class EntityExtractor:
                 domain-specific keywords not covered by the built-in list.
         """
         self.model_name = model_name
-        self.nlp: Language | None = None
+        self.nlp: Optional[Language] = None
         self._initialized = False
         # Build the instance-level pattern list so it can be extended per-instance
         self._technology_patterns = list(TECHNOLOGY_PATTERNS)

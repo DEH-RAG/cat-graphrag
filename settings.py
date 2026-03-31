@@ -59,8 +59,8 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         default="en_core_web_lg",
         description="spaCy model name (en_core_web_sm, en_core_web_md, en_core_web_lg, en_core_web_trf)",
     )
-    extra_technology_patterns: List[str] = Field(
-        default_factory=list,
+    extra_technology_patterns: List[str] | None = Field(
+        default=[],
         description=(
             "Additional regex patterns for technology entity extraction. "
             "Useful for domain-specific keywords or non-English tech terms not "

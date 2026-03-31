@@ -2,8 +2,8 @@ import random
 import uuid
 import json
 import asyncio
-from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager
-from neo4j import AsyncGraphDatabase, AsyncDriver
+from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager, cast, LiteralString
+from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession
 from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
 from cat import BaseVectorDatabaseHandler, Embeddings
@@ -31,7 +31,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         neo4j_user: str,
         neo4j_password: str,
         neo4j_database: str = "neo4j",
-        neo4j_kwargs: Dict = {},
+        neo4j_kwargs: Dict = None,
         document_vector_index: str = "document_embeddings",
         entity_vector_index: str = "entity_embeddings",
         vector_similarity_threshold: float = 0.7,
@@ -42,6 +42,8 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         extra_technology_patterns: List[str] | None = None,
         save_memory_snapshots: bool = False,
     ):
+        neo4j_kwargs = neo4j_kwargs or {}
+
         super().__init__(save_memory_snapshots=save_memory_snapshots)
         self.config = Neo4jGraphRAGConfig(
             neo4j_uri=neo4j_uri,
@@ -93,7 +95,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     def tenant_field_condition(self) -> Dict:
         return {"key": "tenant_id", "match": {"value": self.agent_id}}
         
-    def _get_session(self) -> AsyncContextManager:
+    def _get_session(self) -> AsyncContextManager[AsyncSession]:
         if not self._driver:
             raise RuntimeError("Neo4j driver not initialized")
         return self._driver.session(database=self.config.neo4j_database)
@@ -104,13 +106,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             
     async def _connect(self):
         try:
-            self._driver = AsyncGraphDatabase.driver(
+            self._driver: AsyncDriver = AsyncGraphDatabase.driver(
                 self.config.neo4j_uri,
                 auth=(self.config.neo4j_user, self.config.neo4j_password),
                 max_connection_pool_size=self.config.connection_pool_size,
                 connection_acquisition_timeout=60,
                 **self.config.neo4j_kwargs,
             )
+            assert isinstance(self._driver, AsyncDriver)
             async with self._driver.session(database=self.config.neo4j_database) as session:
                 await session.run("RETURN 1")
             log.info(f"Connected to Neo4j at {self.config.neo4j_uri}")
@@ -170,6 +173,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     @staticmethod
     async def _ensure_constraints_in_session(session):
         """Creates integrity constraints using an already opened session."""
+        # noinspection SqlNoDataSourceInspection
         constraints = [
             "CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
             "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
@@ -231,6 +235,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             self.config.entity_vector_index,
         ]:
             try:
+                # noinspection SqlNoDataSourceInspection
                 await session.run(f"DROP INDEX {index_name} IF EXISTS")
                 log.info(f"[GraphRAG] Dropped vector index: {index_name}")
             except Exception as e:
@@ -324,6 +329,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 model_name=self.config.spacy_model,
                 extra_technology_patterns=self.config.extra_technology_patterns or None,
             )
+            assert isinstance(self._entity_extractor, EntityExtractor)
             await self._entity_extractor.initialize()
             log.info(f"Entity extractor initialized with model: {self.config.spacy_model}")
 
@@ -421,8 +427,8 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         DELETE e
         """
         async with self._get_session() as session:
-            await session.run(delete_docs_query, name=collection_name, tenant_id=self.agent_id)
-            await session.run(delete_orphan_entities_query, tenant_id=self.agent_id)
+            await session.run(cast(LiteralString, delete_docs_query), name=collection_name, tenant_id=self.agent_id)
+            await session.run(cast(LiteralString, delete_orphan_entities_query), tenant_id=self.agent_id)
         log.info(f"Collection {collection_name} deleted (orphaned entities pruned)")
         
     async def check_collection_existence(self, collection_name: str) -> bool:
@@ -431,7 +437,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         RETURN count(c) > 0 AS exists
         """
         async with self._get_session() as session:
-            result = await session.run(query, name=collection_name, tenant_id=self.agent_id)
+            result = await session.run(cast(LiteralString, query), name=collection_name, tenant_id=self.agent_id)
             record = await result.single()
             return record["exists"] if record else False
             
@@ -441,7 +447,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         RETURN c.name AS name
         """
         async with self._get_session() as session:
-            result = await session.run(query, tenant_id=self.agent_id)
+            result = await session.run(cast(LiteralString, query), tenant_id=self.agent_id)
             records = await result.data()
             return [r["name"] for r in records]
         
@@ -488,7 +494,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         
         async with self._get_session() as session:
             await session.run(
-                create_query,
+                cast(LiteralString, create_query),
                 collection_name=collection_name,
                 tenant_id=self.agent_id,
                 id=point_id,
@@ -633,15 +639,15 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
             async with self._get_session() as session:
                 await session.run(
-                    batch_entity_query, entities=entities_batch, tenant_id=self.agent_id
+                    cast(LiteralString, batch_entity_query), entities=entities_batch, tenant_id=self.agent_id,
                 )
                 await session.run(
-                    batch_mention_query,
-                    mentions=mentions_batch, doc_id=document_id, tenant_id=self.agent_id
+                    cast(LiteralString, batch_mention_query),
+                    mentions=mentions_batch, doc_id=document_id, tenant_id=self.agent_id,
                 )
                 if relations_batch:
                     await session.run(
-                        batch_relation_query, relations=relations_batch, tenant_id=self.agent_id
+                        cast(LiteralString, batch_relation_query), relations=relations_batch, tenant_id=self.agent_id,
                     )
 
             log.debug(
@@ -683,7 +689,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         try:
             async with self._get_session() as session:
                 result = await session.run(
-                    find_similar_query,
+                    cast(LiteralString, find_similar_query),
                     collection_name=collection_name,
                     tenant_id=self.agent_id,
                     index_name=self.config.document_vector_index,
@@ -694,7 +700,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 similar = await result.data()
 
                 if similar:
-                    await session.run(create_rel_query, similar=similar, point_id=point_id)
+                    await session.run(cast(LiteralString, create_rel_query), similar=similar, point_id=point_id)
 
             log.debug(f"Created {len(similar) * 2} similarity relationships for {point_id}")
 
@@ -708,10 +714,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         for point in points:
             await self.add_point_to_tenant(
                 collection_name,
-                point.payload.get("page_content", ""),
+                point.payload.get("page_content", ""),  # type: ignore[arg-type]
                 point.vector,
-                point.payload.get("metadata", {}),
-                point.id
+                point.payload.get("metadata", {}),  # type: ignore[arg-type]
+                str(point.id),
             )
         return UpdateResult(status="completed", operation_id=operation_id)
         
@@ -737,7 +743,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
 
         async with self._get_session() as session:
-            await session.run(query, **params)
+            await session.run(cast(LiteralString, query), **params)
 
         return UpdateResult(status="completed", operation_id=operation_id)
         
@@ -756,12 +762,12 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         async with self._get_session() as session:
             await session.run(
-                query,
+                cast(LiteralString, query),
                 collection_name=collection_name,
                 ids=points_ids,
                 tenant_id=self.agent_id
             )
-            await session.run(orphan_query, tenant_id=self.agent_id)
+            await session.run(cast(LiteralString, orphan_query), tenant_id=self.agent_id)
         return UpdateResult(status="completed", operation_id=operation_id)
         
     async def retrieve_tenant_points(self, collection_name: str, points: List) -> List[Record]:
@@ -771,7 +777,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         RETURN d.id AS id, d.content AS content, d.metadata AS metadata, d.embedding AS embedding
         """
         async with self._get_session() as session:
-            result = await session.run(query, ids=points, tenant_id=self.agent_id)
+            result = await session.run(cast(LiteralString, query), ids=points, tenant_id=self.agent_id)
             records = await result.data()
             
         return [
@@ -881,7 +887,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 indirect_map[r["id"]] = r
         entity_indirect = list(indirect_map.values())
 
-        return self._merge_and_rerank(entity_direct, entity_indirect, vector_raw, k, decay)
+        return self._merge_and_rerank(entity_direct, entity_indirect, vector_raw, k, decay)  # type: ignore[arg-type]
 
     # ── Phase A helpers ───────────────────────────────────────────────────────
 
@@ -899,7 +905,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         extractor = self._entity_extractor  # narrow type: EntityExtractor (not Optional)
         doc = await asyncio.to_thread(extractor.nlp, self.user_message)
         entities = extractor.extract_entities(doc)
-        entities += extractor.extract_technologies_regex(self.user_message)
+        entities += extractor.extract_technologies_regex(self.user_message)  # type: ignore[arg-type]
         entities = EntityExtractor.deduplicate_entities(entities)
 
         names = [e.name.lower().strip() for e in entities]
@@ -942,7 +948,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         async with self._get_session() as session:
             result = await session.run(
-                query,
+                cast(LiteralString, query),
                 entity_names=entity_names,
                 tenant_id=self.agent_id,
                 collection_name=collection_name,
@@ -994,7 +1000,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         async with self._get_session() as session:
             result = await session.run(
-                query,
+                cast(LiteralString, query),
                 entity_names=entity_names,
                 tenant_id=self.agent_id,
                 collection_name=collection_name,
@@ -1045,7 +1051,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         async with self._get_session() as session:
             result = await session.run(
-                query,
+                cast(LiteralString, query),
                 index_name=self.config.entity_vector_index,
                 k=k,
                 vector=embedding,
@@ -1061,7 +1067,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         collection_name: str,
         embedding: List[float],
         k_fetch: int,
-        threshold: float,
+        threshold: float | None = None,
     ) -> List[Dict]:
         """
         Phase B: standard HNSW vector search on document embeddings.
@@ -1085,11 +1091,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         async with self._get_session() as session:
             result = await session.run(
-                query,
+                cast(LiteralString, query),
                 index_name=self.config.document_vector_index,
                 k_fetch=k_fetch,
                 vector=embedding,
-                threshold=threshold,
+                threshold=threshold or 0.0,
                 collection_name=collection_name,
                 tenant_id=self.agent_id,
             )
@@ -1124,8 +1130,8 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         semantically similar to the query AND topically grounded in the graph.
         """
         def get_final_score(info) -> float:
-            es = info["entity_score"]
-            vs = info["vector_score"]
+            es = float(info["entity_score"])
+            vs = float(info["vector_score"])
             is_direct = info["is_direct"]
             if es > 0 and vs > 0:
                 applied_boost = boost if is_direct else boost * decay
@@ -1178,11 +1184,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         documents = [
             DocumentRecall(
                 document=LangChainDocument(
-                    page_content=info.get("data", {}).get("content"),
-                    metadata=load_metadata(info.get("data", {}).get("metadata")),
+                    page_content=info.get("data", {}).get("content", ""),
+                    metadata=load_metadata(info.get("data", {}).get("metadata", {})),
                     id=doc_id,
                 ),
-                vector=info.get("data", {}).get("embedding"),
+                vector=info.get("data", {}).get("embedding", []),
                 id=doc_id,
                 score=final_score,
             ) for doc_id, final_score, info in final[:k]
@@ -1202,7 +1208,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         RETURN d.id AS id, d.content AS content, d.metadata AS metadata, d.embedding AS embedding
         """
         async with self._get_session() as session:
-            result = await session.run(query, collection_name=collection_name, tenant_id=self.agent_id)
+            result = await session.run(
+                cast(LiteralString, query), collection_name=collection_name, tenant_id=self.agent_id,
+            )
             records = await result.data()
             
         documents = []
@@ -1259,7 +1267,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         
         async with self._get_session() as session:
-            result = await session.run(query, **params)
+            result = await session.run(cast(LiteralString, query), **params)
             records = await result.data()
             
         points = []
@@ -1298,7 +1306,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         RETURN count(d) AS count
         """
         async with self._get_session() as session:
-            result = await session.run(query, collection_name=collection_name, tenant_id=self.agent_id)
+            result = await session.run(
+                cast(LiteralString, query), collection_name=collection_name, tenant_id=self.agent_id,
+            )
             record = await result.single()
             return record["count"] if record else 0
             
@@ -1329,13 +1339,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         
         async with self._get_session() as session:
             result = await session.run(
-                search_query,
+                cast(LiteralString, search_query),
                 collection_name=collection_name,
                 tenant_id=self.agent_id,
                 index_name=self.config.document_vector_index,
                 vector=query_vector,
                 limit=limit,
-                threshold=score_threshold or 0.0
+                threshold=score_threshold or 0.0,
             )
             records = await result.data()
             
