@@ -1,5 +1,4 @@
-from .graphrag_handler import GraphRAGHandler
-from .settings import Neo4jGraphRAGConfig
+from .graphrag_handler import GraphRAGHandler, Neo4jGraphRAGConfig
 from .entity_extractor import EntityExtractor
 from .models import Entity, EntityType, ExtractedEntity, ExtractedRelation
 

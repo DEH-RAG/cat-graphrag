@@ -1,8 +1,16 @@
 from typing import List
 from langchain_core.documents import Document
 
-from cat import hook, RecallSettings
+from cat import hook, RecallSettings, VectorDatabaseSettings
 from cat.looking_glass.stray_cat import StrayCat
+
+from .graphrag_handler import Neo4jGraphRAGConfig
+
+
+@hook(priority=10)
+def factory_allowed_vector_databases(allowed: List[VectorDatabaseSettings], cat) -> List:
+    allowed.append(Neo4jGraphRAGConfig)
+    return allowed
 
 
 @hook(priority=10)
