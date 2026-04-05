@@ -6,7 +6,7 @@ from cat.looking_glass.stray_cat import StrayCat
 
 
 @hook(priority=10)
-def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> RecallSettings:
+async def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> RecallSettings:
     """
     Injects the current user message and embedder into the GraphRAGHandler
     before any memory retrieval takes place.
@@ -22,14 +22,14 @@ def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> Recall
         cat.vector_memory_handler.user_message = cat.working_memory.user_message.text
 
     if hasattr(cat.vector_memory_handler, "embedder"):
-        cat.vector_memory_handler.embedder = cat.embedder
+        cat.vector_memory_handler.embedder = await cat.embedder()
 
     return config
 
 
 @hook(priority=10)
-def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
     if hasattr(cat.vector_memory_handler, "embedder"):
-        cat.vector_memory_handler.embedder = cat.embedder
+        cat.vector_memory_handler.embedder = await cat.embedder()
 
     return docs

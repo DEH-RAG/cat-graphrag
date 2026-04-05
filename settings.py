@@ -87,10 +87,6 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         default=50,
         description="Neo4j connection pool size",
     )
-    save_memory_snapshots: bool = Field(
-        default=False,
-        description="Enable snapshot backup",
-    )
     
     model_config = ConfigDict(
         json_schema_extra={

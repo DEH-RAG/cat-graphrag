@@ -12,7 +12,6 @@ from cat.services.memory.models import (
 )
 from cat.log import log
 
-from .settings import Neo4jGraphRAGConfig
 from .entity_extractor import EntityExtractor
 from .models import EntityType
 
@@ -40,36 +39,60 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         enable_entity_expansion: bool = True,
         spacy_model: str = "en_core_web_lg",
         extra_technology_patterns: List[str] | None = None,
+        graph_retrieval_depth: int = 2,
+        graph_decay_factor: float = 0.5,
+        connection_pool_size: int = 50,
         save_memory_snapshots: bool = False,
     ):
-        neo4j_kwargs = neo4j_kwargs or {}
-
         super().__init__(save_memory_snapshots=save_memory_snapshots)
-        self.config = Neo4jGraphRAGConfig(
-            neo4j_uri=neo4j_uri,
-            neo4j_user=neo4j_user,
-            neo4j_password=neo4j_password,
-            neo4j_database=neo4j_database,
-            neo4j_kwargs=neo4j_kwargs,
-            document_vector_index=document_vector_index,
-            entity_vector_index=entity_vector_index,
-            vector_similarity_threshold=vector_similarity_threshold,
-            enable_entity_extraction=enable_entity_extraction,
-            enable_entity_embeddings=enable_entity_embeddings,
-            enable_entity_expansion=enable_entity_expansion,
-            spacy_model=spacy_model,
-            extra_technology_patterns=extra_technology_patterns,
-        )
+
+        self._neo4j_uri=neo4j_uri
+        self._neo4j_user=neo4j_user
+        self._neo4j_password=neo4j_password
+        self._neo4j_database=neo4j_database
+        self._neo4j_kwargs=neo4j_kwargs or {}
+        self._document_vector_index=document_vector_index
+        self._entity_vector_index=entity_vector_index
+        self._vector_similarity_threshold=vector_similarity_threshold
+        self._enable_entity_extraction=enable_entity_extraction
+        self._enable_entity_embeddings=enable_entity_embeddings
+        self._enable_entity_expansion=enable_entity_expansion
+        self._spacy_model=spacy_model
+        self._extra_technology_patterns=extra_technology_patterns
+        self._graph_retrieval_depth=graph_retrieval_depth
+        self._graph_decay_factor=graph_decay_factor
+        self._connection_pool_size=connection_pool_size
+
         self._driver: Optional[AsyncDriver] = None
         self._entity_extractor: Optional[EntityExtractor] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
         self._user_message = None
         self._embedder: Optional[Embeddings] = None
+    
+    def __dict__(self):
+        return {
+            "neo4j_uri": self._neo4j_uri,
+            "neo4j_user": self._neo4j_user,
+            "neo4j_password": self._neo4j_password,
+            "neo4j_database": self._neo4j_database,
+            "neo4j_kwargs": self._neo4j_kwargs,
+            "document_vector_index": self._document_vector_index,
+            "entity_vector_index": self._entity_vector_index,
+            "vector_similarity_threshold": self._vector_similarity_threshold,
+            "enable_entity_extraction": self._enable_entity_extraction,
+            "enable_entity_embeddings": self._enable_entity_embeddings,
+            "enable_entity_expansion": self._enable_entity_expansion,
+            "spacy_model": self._spacy_model,
+            "extra_technology_patterns": self._extra_technology_patterns,
+            "graph_retrieval_depth": self._graph_retrieval_depth,
+            "graph_decay_factor": self._graph_decay_factor,
+            "connection_pool_size": self._connection_pool_size,
+        }
 
     def _eq(self, other: "GraphRAGHandler") -> bool:
         return (
             self.__class__.__name__ == other.__class__.__name__
-            and self.config == other.config
+            and self.__dict__() == other.__dict__()
         )
 
     @property
@@ -98,7 +121,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     def _get_session(self) -> AsyncContextManager[AsyncSession]:
         if not self._driver:
             raise RuntimeError("Neo4j driver not initialized")
-        return self._driver.session(database=self.config.neo4j_database)
+        return self._driver.session(database=self._neo4j_database)
             
     async def _ensure_connected(self):
         if not self._driver:
@@ -107,16 +130,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     async def _connect(self):
         try:
             self._driver: AsyncDriver = AsyncGraphDatabase.driver(
-                self.config.neo4j_uri,
-                auth=(self.config.neo4j_user, self.config.neo4j_password),
-                max_connection_pool_size=self.config.connection_pool_size,
+                self._neo4j_uri,
+                auth=(self._neo4j_user, self._neo4j_password),
+                max_connection_pool_size=self._connection_pool_size,
                 connection_acquisition_timeout=60,
-                **self.config.neo4j_kwargs,
+                **self._neo4j_kwargs,
             )
             assert isinstance(self._driver, AsyncDriver)
-            async with self._driver.session(database=self.config.neo4j_database) as session:
+            async with self._driver.session(database=self._neo4j_database) as session:
                 await session.run("RETURN 1")
-            log.info(f"Connected to Neo4j at {self.config.neo4j_uri}")
+            log.info(f"Connected to Neo4j at {self._neo4j_uri}")
         except Exception as e:
             log.error(f"Failed to connect to Neo4j: {e}")
             raise
@@ -125,7 +148,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """Creates vector indexes for Document and Entity, using an already opened session."""
         # Index for Document
         doc_index_query = f"""
-        CREATE VECTOR INDEX {self.config.document_vector_index} IF NOT EXISTS
+        CREATE VECTOR INDEX {self._document_vector_index} IF NOT EXISTS
         FOR (d:Document) ON d.embedding
         OPTIONS {{
             indexConfig: {{
@@ -139,7 +162,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         # Index for Entity (optional)
         entity_index_query = f"""
-        CREATE VECTOR INDEX {self.config.entity_vector_index} IF NOT EXISTS
+        CREATE VECTOR INDEX {self._entity_vector_index} IF NOT EXISTS
         FOR (e:Entity) ON e.embedding
         OPTIONS {{
             indexConfig: {{
@@ -154,17 +177,17 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         # Create document index
         try:
             await session.run(doc_index_query)
-            log.info(f"Document vector index ensured: {self.config.document_vector_index}")
+            log.info(f"Document vector index ensured: {self._document_vector_index}")
         except Exception as e:
             if "already exists" not in str(e):
                 log.error(f"Document index creation warning: {e}")
                 raise e
 
         # Create an entity index (if enabled)
-        if self.config.enable_entity_embeddings:
+        if self._enable_entity_embeddings:
             try:
                 await session.run(entity_index_query)
-                log.info(f"Entity vector index ensured: {self.config.entity_vector_index}")
+                log.info(f"Entity vector index ensured: {self._entity_vector_index}")
             except Exception as e:
                 if "already exists" not in str(e):
                     log.error(f"Entity index creation warning: {e}")
@@ -231,8 +254,8 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """Drops the document (and optional entity) vector index so they can be
         recreated with the new embedder dimensions."""
         for index_name in [
-            self.config.document_vector_index,
-            self.config.entity_vector_index,
+            self._document_vector_index,
+            self._entity_vector_index,
         ]:
             try:
                 # noinspection SqlNoDataSourceInspection
@@ -284,7 +307,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             # 1. Dimension mismatch → the HNSW index must be dropped and
             #    recreated (Neo4j vector indexes are immutable once created).
             index_dims = await self._get_index_dimensions(
-                session, self.config.document_vector_index
+                session, self._document_vector_index
             )
             index_needs_rebuild = index_dims is not None and index_dims != embedder_size
 
@@ -324,14 +347,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             await self._ensure_vector_indexes_in_session(session, embedder_size)
 
         # Initialize entity extractor
-        if self.config.enable_entity_extraction:
+        if self._enable_entity_extraction:
             self._entity_extractor = EntityExtractor(
-                model_name=self.config.spacy_model,
-                extra_technology_patterns=self.config.extra_technology_patterns or None,
+                model_name=self._spacy_model,
+                extra_technology_patterns=self._extra_technology_patterns or None,
             )
             assert isinstance(self._entity_extractor, EntityExtractor)
             await self._entity_extractor.initialize()
-            log.info(f"Entity extractor initialized with model: {self.config.spacy_model}")
+            log.info(f"Entity extractor initialized with model: {self._spacy_model}")
 
         # Create / update collections — always store current embedder metadata.
         async with self._get_session() as session:
@@ -344,7 +367,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             f"Advanced GraphRAG initialized "
             f"(embedder={embedder_name}, dims={embedder_size})"
         )
-        
+
     async def close(self):
         # Cancel and clean up all pending entity tasks
         for task in self._pending_entity_tasks:
@@ -354,14 +377,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         if self._pending_entity_tasks:
             await asyncio.gather(*self._pending_entity_tasks, return_exceptions=True)
         self._pending_entity_tasks.clear()
-                
+
         if self._driver:
             await self._driver.close()
             self._driver = None
 
     def is_db_remote(self) -> bool:
         return True
-        
+
     # ========== COLLECTION METHODS ==========
 
     async def _ensure_collection_exists_in_session(
@@ -400,11 +423,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             await self._ensure_collection_exists_in_session(
                 session, collection_name, embedder_name, embedder_size
             )
-        
+
     async def create_hybrid_collection(self, collection_name: str, dense_config: str, sparse_config: str):
         log.warning("Hybrid collections not supported")
         pass
-        
+
     async def delete_collection(self, collection_name: str, timeout: int | None = None):
         """
         Deletes a collection and its documents.
@@ -430,7 +453,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             await session.run(cast(LiteralString, delete_docs_query), name=collection_name, tenant_id=self.agent_id)
             await session.run(cast(LiteralString, delete_orphan_entities_query), tenant_id=self.agent_id)
         log.info(f"Collection {collection_name} deleted (orphaned entities pruned)")
-        
+
     async def check_collection_existence(self, collection_name: str) -> bool:
         query = """
         MATCH (c:Collection {name: $name, tenant_id: $tenant_id})
@@ -440,7 +463,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             result = await session.run(cast(LiteralString, query), name=collection_name, tenant_id=self.agent_id)
             record = await result.single()
             return record["exists"] if record else False
-            
+
     async def get_collection_names(self) -> List[str]:
         query = """
         MATCH (c:Collection {tenant_id: $tenant_id})
@@ -450,13 +473,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             result = await session.run(cast(LiteralString, query), tenant_id=self.agent_id)
             records = await result.data()
             return [r["name"] for r in records]
-        
+
     async def save_dump(self, collection_name: str, folder: str = "dormouse/"):
         log.info(f"Save dump not implemented, use neo4j-admin dump")
         pass
-        
+
     # ========== POINT METHODS ==========
-    
+
     async def add_point_to_tenant(
         self,
         collection_name: str,
@@ -472,12 +495,12 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         - Starts entity extraction in the background
         """
         await self._ensure_connected()
-        
+
         point_id = id_point or str(uuid.uuid4())
         vector_list = list(vector)
         metadata = metadata or {}
         metadata["tenant_id"] = self.agent_id
-        
+
         create_query = """
         MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
         CREATE (d:Document {
@@ -491,7 +514,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         CREATE (d)-[:BELONGS_TO]->(c)
         RETURN d.id AS id
         """
-        
+
         async with self._get_session() as session:
             await session.run(
                 cast(LiteralString, create_query),
@@ -502,9 +525,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 embedding=vector_list,
                 metadata=metadata  # stored as native Neo4j map (no json.dumps)
             )
-            
+
         # Start entity extraction in the background
-        if self.config.enable_entity_extraction and self._entity_extractor:
+        if self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
 
@@ -514,7 +537,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         # Clean up completed tasks
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
-        
+
         return PointStruct(
             id=point_id,
             payload={
@@ -601,7 +624,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 })
 
             # Batch-embed all entity names in one call (non-blocking via thread)
-            if self.config.enable_entity_embeddings and self._embedder is not None:
+            if self._enable_entity_embeddings and self._embedder is not None:
                 try:
                     names = [ent["name"] for ent in entities_batch]
                     embeddings = await asyncio.to_thread(
@@ -692,10 +715,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                     cast(LiteralString, find_similar_query),
                     collection_name=collection_name,
                     tenant_id=self.agent_id,
-                    index_name=self.config.document_vector_index,
+                    index_name=self._document_vector_index,
                     vector=vector,
                     point_id=point_id,
-                    threshold=self.config.vector_similarity_threshold,
+                    threshold=self._vector_similarity_threshold,
                 )
                 similar = await result.data()
 
@@ -706,7 +729,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
-            
+
     async def add_points_to_tenant(
         self, collection_name: str, points: List[PointStruct]
     ) -> UpdateResult:
@@ -720,7 +743,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 str(point.id),
             )
         return UpdateResult(status="completed", operation_id=operation_id)
-        
+
     async def delete_tenant_points(self, collection_name: str, metadata: Dict | None = None) -> UpdateResult:
         operation_id = random.randint(1, 100000)
 
@@ -746,7 +769,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             await session.run(cast(LiteralString, query), **params)
 
         return UpdateResult(status="completed", operation_id=operation_id)
-        
+
     async def delete_tenant_points_by_ids(self, collection_name: str, points_ids: List) -> UpdateResult:
         operation_id = random.randint(1, 100000)
 
@@ -769,7 +792,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             )
             await session.run(cast(LiteralString, orphan_query), tenant_id=self.agent_id)
         return UpdateResult(status="completed", operation_id=operation_id)
-        
+
     async def retrieve_tenant_points(self, collection_name: str, points: List) -> List[Record]:
         query = """
         MATCH (d:Document)
@@ -779,7 +802,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         async with self._get_session() as session:
             result = await session.run(cast(LiteralString, query), ids=points, tenant_id=self.agent_id)
             records = await result.data()
-            
+
         return [
             Record(
                 id=r["id"],
@@ -792,7 +815,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             )
             for r in records
         ]
-        
+
     # ========== MAIN METHOD: HYBRID RECALL ==========
 
     async def recall_tenant_memory_from_embedding(
@@ -836,13 +859,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             # A④ and B are always candidates — build their coroutines now
             ev_coro = (
                 self._recall_entity_by_vector(collection_name, embedding, k_fetch)
-                if self.config.enable_entity_embeddings and self._embedder is not None
+                if self._enable_entity_embeddings and self._embedder is not None
                 else _empty()
             )
             vr_coro = self._recall_by_vector(collection_name, embedding, k_fetch, threshold)
 
             # Entity name expansion (A② + A③) disabled → only A④ + B
-            if not self.config.enable_entity_expansion or not self._entity_extractor:
+            if not self._enable_entity_expansion or not self._entity_extractor:
                 ev, vr = await asyncio.gather(ev_coro, vr_coro)
                 return [], [], ev, vr
 
@@ -865,10 +888,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         await self._ensure_connected()
 
-        threshold = threshold or self.config.vector_similarity_threshold
+        threshold = threshold or self._vector_similarity_threshold
         k = k or 5
-        depth = self.config.graph_retrieval_depth
-        decay = self.config.graph_decay_factor
+        depth = self._graph_retrieval_depth
+        decay = self._graph_decay_factor
         # Fetch more than k to compensate for post-hoc collection filtering;
         # $param arithmetic is not supported inside Cypher, so pre-compute in Python.
         k_fetch = k * 2
@@ -1052,7 +1075,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         async with self._get_session() as session:
             result = await session.run(
                 cast(LiteralString, query),
-                index_name=self.config.entity_vector_index,
+                index_name=self._entity_vector_index,
                 k=k,
                 vector=embedding,
                 tenant_id=self.agent_id,
@@ -1092,7 +1115,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         async with self._get_session() as session:
             result = await session.run(
                 cast(LiteralString, query),
-                index_name=self.config.document_vector_index,
+                index_name=self._document_vector_index,
                 k_fetch=k_fetch,
                 vector=embedding,
                 threshold=threshold or 0.0,
@@ -1212,7 +1235,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 cast(LiteralString, query), collection_name=collection_name, tenant_id=self.agent_id,
             )
             records = await result.data()
-            
+
         documents = []
         for r in records:
             metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
@@ -1226,9 +1249,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 id=r["id"],
             ))
         return documents
-        
+
     # ========== GET ALL METHODS ==========
-    
+
     async def get_all_tenant_points(
         self,
         collection_name: str,
@@ -1239,7 +1262,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     ) -> Tuple[List[Record], int | str | None]:
         skip = int(offset) if offset and offset.isdigit() else 0
         query_limit = limit or 1000
-        
+
         where_clauses = ["d.tenant_id = $tenant_id", "c.name = $collection_name"]
         params = {
             "tenant_id": self.agent_id,
@@ -1247,7 +1270,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             "skip": skip,
             "limit": query_limit
         }
-        
+
         if metadata:
             for k, v in metadata.items():
                 # Use meta_ prefix to avoid collision with reserved param names
@@ -1255,9 +1278,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 safe_param = f"meta_{k.replace('-', '_').replace('.', '_')}"
                 where_clauses.append(f"d.metadata['{k}'] = ${safe_param}")
                 params[safe_param] = v
-                
+
         where_str = " AND ".join(where_clauses)
-        
+
         query = f"""
         MATCH (c:Collection)<-[:BELONGS_TO]-(d:Document)
         WHERE {where_str}
@@ -1265,11 +1288,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         SKIP $skip
         LIMIT $limit
         """
-        
+
         async with self._get_session() as session:
             result = await session.run(cast(LiteralString, query), **params)
             records = await result.data()
-            
+
         points = []
         for r in records:
             metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
@@ -1282,24 +1305,24 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 },
                 vector=r["embedding"] if with_vectors else None
             ))
-            
+
         next_offset = str(skip + len(points)) if len(points) == query_limit else None
         return points, next_offset
-        
+
     async def get_all_tenant_points_from_web(
         self, collection_name: str, limit: int | None = None, offset: str | None = None
     ) -> Tuple[List[Record], int | str | None]:
         return await self.get_all_tenant_points(
             collection_name, limit, offset, {"source": "http"}, with_vectors=False
         )
-        
+
     async def get_all_tenant_points_from_files(
         self, collection_name: str, limit: int | None = None, offset: str | None = None
     ) -> Tuple[List[Record], int | str | None]:
         return await self.get_all_tenant_points(
             collection_name, limit, offset, {"source": "file"}, with_vectors=False
         )
-        
+
     async def get_tenant_vectors_count(self, collection_name: str) -> int:
         query = """
         MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})<-[:BELONGS_TO]-(d:Document)
@@ -1311,9 +1334,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             )
             record = await result.single()
             return record["count"] if record else 0
-            
+
     # ========== SEARCH METHODS ==========
-    
+
     async def search_in_tenant(
         self,
         collection_name: str,
@@ -1336,13 +1359,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         ORDER BY score DESC
         LIMIT $limit
         """
-        
+
         async with self._get_session() as session:
             result = await session.run(
                 cast(LiteralString, search_query),
                 collection_name=collection_name,
                 tenant_id=self.agent_id,
-                index_name=self.config.document_vector_index,
+                index_name=self._document_vector_index,
                 vector=query_vector,
                 limit=limit,
                 threshold=score_threshold or 0.0,
