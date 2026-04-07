@@ -1,9 +1,12 @@
 import asyncio
+from langdetect import DetectorFactory, detect_langs
 from cat import log
 import hashlib
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict
 from spacy import load as spacy_load
+from spacy.util import is_package as spacy_is_package
+from spacy.cli.download import download as spacy_download
 from spacy.language import Language
 from spacy.tokens import Doc
 
@@ -16,58 +19,103 @@ class EntityExtractor:
     Extracts entities and relations from text using spaCy.
     Supports multilingual models and extension with custom rules.
     """
-    def __init__(self, model_name: str = "en_core_web_lg", extra_technology_patterns: List[str] = None):
+    def __init__(self, models: Dict[str, str], extra_technology_patterns: List[str] = None):
         """
         Initializes the spaCy model.
 
         Args:
-            model_name: spaCy model to load.
-                - en_core_web_sm: small, fast
-                - en_core_web_md: medium
-                - en_core_web_lg: large, better accuracy
-                - en_core_web_trf: transformer-based, slower but best
+            models: A dictionary mapping language codes (e.g. "en") to spaCy model names (e.g. "en_core_web_sm").
+                The specified models will be loaded on demand when processing documents in the corresponding language.
             extra_technology_patterns: additional regex patterns appended to
                 TECHNOLOGY_PATTERNS. Useful for non-English tech terms or
                 domain-specific keywords not covered by the built-in list.
         """
-        self.model_name = model_name
-        self.nlp: Optional[Language] = None
+        self.nlps: Dict[str, Language] = {}
+        self._models = models
         self._initialized = False
+
         # Build the instance-level pattern list so it can be extended per-instance
         self._technology_patterns = list(TECHNOLOGY_PATTERNS)
         if extra_technology_patterns:
             self._technology_patterns.extend(extra_technology_patterns)
 
-    async def initialize(self):
-        """Loads the spaCy model (asynchronously)."""
-        if self._initialized:
-            return
-            
+    @staticmethod
+    def _download_spacy_model(model_name: str):
+        if not spacy_is_package(model_name):
+            spacy_download(model_name)
+
+    @staticmethod
+    def detect_language(text: str) -> str | None:
+        DetectorFactory.seed = 0
+        text = text.strip()
+        if len(text) < 5:
+            return None
         try:
-            # Load in a separate thread because this is blocking
-            self.nlp = await asyncio.to_thread(spacy_load, self.model_name)
-            self._initialized = True
-            log.info(f"Loaded spaCy model: {self.model_name}")
+            langs = detect_langs(text)
+            langs = [l.lang for l in langs if l.prob > 0.8]
+            if len(langs) == 0:
+                return None
+            return langs[0]
+        except Exception:
+            return None
+
+    def _load_model(self, lang: str, model_name: str):
+        try:
+            self._download_spacy_model(model_name)
+            nlp = spacy_load(model_name)
+            log.info(f"Loaded spaCy model '{model_name}' for language '{lang}'")
         except Exception as e:
-            log.error(f"Failed to load spaCy model {self.model_name}: {e}")
+            log.error(f"Failed to load spaCy model '{model_name}' for language '{lang}': {e}")
             # Fallback to a smaller model
             try:
-                self.nlp = await asyncio.to_thread(spacy_load, "en_core_web_sm")
-                self._initialized = True
+                lang = "en"
+                nlp = spacy_load("en_core_web_sm")
                 log.warning(f"Falling back to en_core_web_sm")
             except Exception as e2:
                 log.error(f"Failed to load fallback model: {e2}")
                 raise
-            
+
+        self.nlps[lang] = nlp
+
+    async def ensure_downloaded(self):
+        """Downloads the spaCy model (asynchronously)."""
+        await asyncio.gather(*[
+            asyncio.to_thread(self._download_spacy_model, model_name)
+            for lang, model_name in self._models.items()
+        ])
+
+    async def ensure_initialized(self):
+        """Loads the spaCy model (asynchronously)."""
+        if self._initialized:
+            return
+
+        # parallel loads each self._models into the self.nlps in separate threads because this is blocking and can take
+        # several seconds
+        await asyncio.gather(*[
+            asyncio.to_thread(self._load_model, lang, model_name)
+            for lang, model_name in self._models.items()
+        ])
+
+        self._initialized = True
+
+    async def extract_doc(self, text: str) -> Doc:
+        if not self._initialized:
+            await self.ensure_initialized()
+
+        lang = self.detect_language(text) or "en"
+        nlp = self.nlps.get(lang, self.nlps.get("en"))
+        return nlp(text)
+
     async def extract(self, text: str, document_id: str, metadata: Dict = None) -> DocumentWithEntities:
         """
         Extracts entities and relations from text.
         """
         if not self._initialized:
-            await self.initialize()
+            await self.ensure_initialized()
             
         # Process text with spaCy
-        doc: Doc = await asyncio.to_thread(self.nlp, text)
+        nlp = self.nlps.get(self.detect_language(text) or "en", self.nlps.get("en"))
+        doc: Doc = await asyncio.to_thread(nlp, text)
         
         # Extract entities
         extracted_entities = self.extract_entities(doc)
@@ -304,7 +352,3 @@ class EntityExtractor:
 
         key = f"{tenant_id}:{entity_type.value}:{normalized}"
         return hashlib.md5(key.encode()).hexdigest()
-
-    @property
-    def initialized(self):
-        return self._initialized

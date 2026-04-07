@@ -39,7 +39,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         enable_entity_extraction: bool = True,
         enable_entity_embeddings: bool = False,
         enable_entity_expansion: bool = True,
-        spacy_model: str = "en_core_web_lg",
+        spacy_models: Dict[str, str] = None,
         extra_technology_patterns: List[str] | None = None,
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
@@ -48,28 +48,33 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     ):
         super().__init__(save_memory_snapshots=save_memory_snapshots)
 
-        self._neo4j_uri=neo4j_uri
-        self._neo4j_user=neo4j_user
-        self._neo4j_password=neo4j_password
-        self._neo4j_database=neo4j_database
-        self._neo4j_kwargs=neo4j_kwargs or {}
-        self._document_vector_index=document_vector_index
-        self._entity_vector_index=entity_vector_index
-        self._vector_similarity_threshold=vector_similarity_threshold
-        self._enable_entity_extraction=enable_entity_extraction
-        self._enable_entity_embeddings=enable_entity_embeddings
-        self._enable_entity_expansion=enable_entity_expansion
-        self._spacy_model=spacy_model
+        self._neo4j_uri = neo4j_uri
+        self._neo4j_user = neo4j_user
+        self._neo4j_password = neo4j_password
+        self._neo4j_database = neo4j_database
+        self._neo4j_kwargs = neo4j_kwargs or {}
+        self._document_vector_index = document_vector_index
+        self._entity_vector_index = entity_vector_index
+        self._vector_similarity_threshold = vector_similarity_threshold
+        self._enable_entity_extraction = enable_entity_extraction
+        self._enable_entity_embeddings = enable_entity_embeddings
+        self._enable_entity_expansion = enable_entity_expansion
+        self._spacy_models = spacy_models or {"en": "en_core_web_sm"}
         self._extra_technology_patterns=extra_technology_patterns
         self._graph_retrieval_depth=graph_retrieval_depth
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
 
         self._driver: Optional[AsyncDriver] = None
-        self._entity_extractor: Optional[EntityExtractor] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
         self._user_message = None
         self._embedder: Optional[Embeddings] = None
+
+        # Initialize entity extractor
+        self._entity_extractor: Optional[EntityExtractor] = EntityExtractor(
+            models=self._spacy_models,
+            extra_technology_patterns=self._extra_technology_patterns or None,
+        ) if self._enable_entity_extraction else None
     
     def __dict__(self):
         return {
@@ -84,7 +89,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             "enable_entity_extraction": self._enable_entity_extraction,
             "enable_entity_embeddings": self._enable_entity_embeddings,
             "enable_entity_expansion": self._enable_entity_expansion,
-            "spacy_model": self._spacy_model,
+            "spacy_models": self._spacy_models,
             "extra_technology_patterns": self._extra_technology_patterns,
             "graph_retrieval_depth": self._graph_retrieval_depth,
             "graph_decay_factor": self._graph_decay_factor,
@@ -116,6 +121,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     @property
     def client(self):
         return self._driver
+
+    @property
+    def entity_extractor(self) -> EntityExtractor | None:
+        return self._entity_extractor
         
     def tenant_field_condition(self) -> Dict:
         return {"key": "tenant_id", "match": {"value": self.agent_id}}
@@ -347,16 +356,6 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             # If they were just dropped, this recreates them;
             # if they already match, IF NOT EXISTS is a no-op.
             await self._ensure_vector_indexes_in_session(session, embedder_size)
-
-        # Initialize entity extractor
-        if self._enable_entity_extraction:
-            self._entity_extractor = EntityExtractor(
-                model_name=self._spacy_model,
-                extra_technology_patterns=self._extra_technology_patterns or None,
-            )
-            assert isinstance(self._entity_extractor, EntityExtractor)
-            await self._entity_extractor.initialize()
-            log.info(f"Entity extractor initialized with model: {self._spacy_model}")
 
         # Create / update collections — always store current embedder metadata.
         async with self._get_session() as session:
@@ -924,14 +923,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         Returns an empty list if the extractor is not ready or no entities
         are found, so callers can safely skip Phase A without failing.
         """
-        if not self.user_message or not self._entity_extractor or not self._entity_extractor.initialized:
+        if not self.user_message or not self._entity_extractor:
             return []
 
-        extractor = self._entity_extractor  # narrow type: EntityExtractor (not Optional)
-        doc = await asyncio.to_thread(extractor.nlp, self.user_message)
-        entities = extractor.extract_entities(doc)
-        entities += extractor.extract_technologies_regex(self.user_message)  # type: ignore[arg-type]
-        entities = EntityExtractor.deduplicate_entities(entities)
+        doc = await self._entity_extractor.extract_doc(self.user_message)
+
+        entities = self._entity_extractor.extract_entities(doc)
+        entities += self._entity_extractor.extract_technologies_regex(self.user_message)  # type: ignore[arg-type]
+        entities = self._entity_extractor.deduplicate_entities(entities)
 
         names = [e.name.lower().strip() for e in entities]
         log.debug(f"[GraphRAG] Query entities: {names}")
@@ -1435,9 +1434,9 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         description="Enable vector embeddings for entities (increases storage)",
     )
     enable_entity_expansion: bool = Field(default=True, description="Enable entity expansion during retrieval")
-    spacy_model: str = Field(
-        default="en_core_web_lg",
-        description="spaCy model name (en_core_web_sm, en_core_web_md, en_core_web_lg, en_core_web_trf)",
+    spacy_models: Dict[str, str] = Field(
+        default={"en": "en_core_web_lg"},
+        description="spaCy model names for different languages (e.g. {'en': 'en_core_web_lg', 'de': 'de_core_news_lg'})",
     )
     extra_technology_patterns: List[str] | None = Field(
         default=[],
