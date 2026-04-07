@@ -76,7 +76,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             extra_technology_patterns=self._extra_technology_patterns or None,
         ) if self._enable_entity_extraction else None
     
-    def __dict__(self):
+    def to_dict(self):
         return {
             "neo4j_uri": self._neo4j_uri,
             "neo4j_user": self._neo4j_user,
@@ -97,10 +97,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         }
 
     def _eq(self, other: "GraphRAGHandler") -> bool:
-        return (
-            self.__class__.__name__ == other.__class__.__name__
-            and self.__dict__() == other.__dict__()
-        )
+        return self.to_dict() == other.to_dict()
 
     @property
     def user_message(self) -> Optional[str]:
