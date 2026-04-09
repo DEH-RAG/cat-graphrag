@@ -30,8 +30,11 @@ class EntityExtractor:
                 TECHNOLOGY_PATTERNS. Useful for non-English tech terms or
                 domain-specific keywords not covered by the built-in list.
         """
-        self.nlps: Dict[str, Language] = {}
         self._models = models
+        self._models["default"] = "en_core_web_sm"
+        self._models_loaded = {k: False for k in self._models.keys()}
+
+        self._nlps: Dict[str, Language] = {}
         self._initialized = False
 
         # Build the instance-level pattern list so it can be extended per-instance
@@ -45,7 +48,7 @@ class EntityExtractor:
             spacy_download(model_name)
 
     @staticmethod
-    def detect_language(text: str) -> str | None:
+    def _detect_language(text: str) -> str | None:
         DetectorFactory.seed = 0
         text = text.strip()
         if len(text) < 5:
@@ -60,22 +63,16 @@ class EntityExtractor:
             return None
 
     def _load_model(self, lang: str, model_name: str):
+        if self._models_loaded[lang]:
+            return
         try:
             self._download_spacy_model(model_name)
-            nlp = spacy_load(model_name)
+            self._nlps[lang] = spacy_load(model_name)
+            self._models_loaded[lang] = True
+
             log.info(f"Loaded spaCy model '{model_name}' for language '{lang}'")
         except Exception as e:
             log.error(f"Failed to load spaCy model '{model_name}' for language '{lang}': {e}")
-            # Fallback to a smaller model
-            try:
-                lang = "en"
-                nlp = spacy_load("en_core_web_sm")
-                log.warning(f"Falling back to en_core_web_sm")
-            except Exception as e2:
-                log.error(f"Failed to load fallback model: {e2}")
-                raise
-
-        self.nlps[lang] = nlp
 
     async def ensure_downloaded(self):
         """Downloads the spaCy model (asynchronously)."""
@@ -102,8 +99,8 @@ class EntityExtractor:
         if not self._initialized:
             await self.ensure_initialized()
 
-        lang = self.detect_language(text) or "en"
-        nlp = self.nlps.get(lang, self.nlps.get("en"))
+        lang = self._detect_language(text)
+        nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
         return nlp(text)
 
     async def extract(self, text: str, document_id: str, metadata: Dict = None) -> DocumentWithEntities:
@@ -112,9 +109,10 @@ class EntityExtractor:
         """
         if not self._initialized:
             await self.ensure_initialized()
-            
+
         # Process text with spaCy
-        nlp = self.nlps.get(self.detect_language(text) or "en", self.nlps.get("en"))
+        lang = self._detect_language(text)
+        nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
         doc: Doc = await asyncio.to_thread(nlp, text)
         
         # Extract entities

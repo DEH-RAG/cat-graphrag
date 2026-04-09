@@ -67,6 +67,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
+        # Semaphore: caps concurrent Neo4j write transactions to reduce lock
+        # contention and deadlock probability during bulk PDF ingestion.
+        # Shared between entity extraction and similarity writes.
+        self._neo4j_write_semaphore = asyncio.Semaphore(4)
         self._user_message = None
         self._embedder: Optional[Embeddings] = None
 
@@ -142,6 +146,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 auth=(self._neo4j_user, self._neo4j_password),
                 max_connection_pool_size=self._connection_pool_size,
                 connection_acquisition_timeout=60,
+                # Suppress GQL warnings 01N51 / 01N52 ("relationship type / property
+                # key does not exist") that Neo4j emits on a fresh database before any
+                # schema elements have been written.  These are harmless — queries that
+                # match nothing simply return zero rows — but pollute the log on startup.
+                notifications_disabled_categories=["UNRECOGNIZED"],
                 **self._neo4j_kwargs,
             )
             assert isinstance(self._driver, AsyncDriver)
@@ -247,14 +256,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         or None if the collection does not exist or was created before this field
         was introduced.
         """
+        # Avoid IS NOT NULL filters on properties that may not yet exist in the
+        # database schema — Neo4j 5.x emits GQL warning 01N52 in that case.
+        # Instead, fetch the raw values and perform the null check in Python.
         query = """
         MATCH (c:Collection {name: $name, tenant_id: $tenant_id})
-        WHERE c.embedder_name IS NOT NULL AND c.embedder_size IS NOT NULL
         RETURN c.embedder_name AS embedder_name, c.embedder_size AS embedder_size
         """
         result = await session.run(query, name=collection_name, tenant_id=self.agent_id)
         record = await result.single()
-        if record:
+        if record and record["embedder_name"] is not None and record["embedder_size"] is not None:
             return record["embedder_name"], int(record["embedder_size"])
         return None
 
@@ -506,6 +517,12 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         vector_list = list(vector)
         metadata = metadata or {}
         metadata["tenant_id"] = self.agent_id
+        # Neo4j does not support Map-type node properties (only primitives /
+        # arrays of primitives are allowed).  Serialise to a JSON string so the
+        # CREATE never raises ClientError.Statement.TypeError.  All retrieve
+        # helpers already call json.loads() when they get back a string, so this
+        # is fully backward-compatible.
+        metadata_json = json.dumps(metadata)
 
         create_query = """
         MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
@@ -522,15 +539,25 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
 
         async with self._get_session() as session:
-            await session.run(
+            result = await session.run(
                 cast(LiteralString, create_query),
                 collection_name=collection_name,
                 tenant_id=self.agent_id,
                 id=point_id,
                 content=content,
                 embedding=vector_list,
-                metadata=metadata  # stored as native Neo4j map (no json.dumps)
+                metadata=metadata_json,
             )
+            # Consuming the result surfaces any server-side error immediately
+            # (otherwise the async driver silently discards it on session close).
+            record = await result.single()
+            if record is None:
+                log.warning(
+                    f"[GraphRAG] Document {point_id} was NOT created: "
+                    f"collection '{collection_name}' not found for tenant '{self.agent_id}'. "
+                    "Make sure initialize() was called before ingesting documents."
+                )
+                return None
 
         # Start entity extraction in the background
         if self._enable_entity_extraction and self._entity_extractor:
@@ -621,7 +648,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                     "id":        entity_id,
                     "name":      entity.name.lower().strip(),
                     "type":      entity.type.value,
-                    "metadata":  {"source_document": document_id, "confidence": entity.confidence},
+                    # Serialise to JSON string: Neo4j does not support Map-type
+                    # node properties (only primitives / arrays are allowed).
+                    "metadata":  json.dumps({"source_document": document_id, "confidence": entity.confidence}),
                     "embedding": None,  # populated below when enable_entity_embeddings=True
                 })
                 mentions_batch.append({
@@ -666,18 +695,39 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                     }
             relations_batch = list(rel_map.values())
 
-            async with self._get_session() as session:
-                await session.run(
-                    cast(LiteralString, batch_entity_query), entities=entities_batch, tenant_id=self.agent_id,
+            # Sort all batches by ID so every concurrent transaction acquires
+            # Neo4j node locks in the same order — breaks circular wait chains.
+            entities_batch.sort(key=lambda e: e["id"])
+            mentions_batch.sort(key=lambda m: m["entity_id"])
+            relations_batch.sort(key=lambda r: (r["source_id"], r["target_id"]))
+
+            # execute_write wraps all three queries in a single managed write
+            # transaction that the Neo4j driver automatically retries on
+            # TransientError (including DeadlockDetected).
+            # The semaphore caps concurrent write transactions to further
+            # reduce lock contention during bulk PDF ingestion.
+            async def _write_entities(tx):
+                await tx.run(
+                    cast(LiteralString, batch_entity_query),
+                    entities=entities_batch,
+                    tenant_id=self.agent_id,
                 )
-                await session.run(
+                await tx.run(
                     cast(LiteralString, batch_mention_query),
-                    mentions=mentions_batch, doc_id=document_id, tenant_id=self.agent_id,
+                    mentions=mentions_batch,
+                    doc_id=document_id,
+                    tenant_id=self.agent_id,
                 )
                 if relations_batch:
-                    await session.run(
-                        cast(LiteralString, batch_relation_query), relations=relations_batch, tenant_id=self.agent_id,
+                    await tx.run(
+                        cast(LiteralString, batch_relation_query),
+                        relations=relations_batch,
+                        tenant_id=self.agent_id,
                     )
+
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.execute_write(_write_entities)
 
             log.debug(
                 f"Linked {len(entities_batch)} entities and {len(relations_batch)} relations "
@@ -716,6 +766,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
 
         try:
+            # Read phase — auto-commit, read-only, no write locks acquired.
             async with self._get_session() as session:
                 result = await session.run(
                     cast(LiteralString, find_similar_query),
@@ -728,8 +779,28 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 )
                 similar = await result.data()
 
-                if similar:
-                    await session.run(cast(LiteralString, create_rel_query), similar=similar, point_id=point_id)
+            if not similar:
+                log.debug(f"No similar documents found for {point_id}")
+                return
+
+            # Sort by document id so every concurrent transaction acquires
+            # node relationship-group locks in the same order, breaking
+            # circular wait chains between transactions.
+            similar.sort(key=lambda s: s["id"])
+
+            # Write phase — execute_write uses a managed transaction that the
+            # Neo4j driver automatically retries on TransientError (deadlock).
+            # The semaphore caps concurrent writers to reduce contention.
+            async def _write_similarity(tx):
+                await tx.run(
+                    cast(LiteralString, create_rel_query),
+                    similar=similar,
+                    point_id=point_id,
+                )
+
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.execute_write(_write_similarity)
 
             log.debug(f"Created {len(similar) * 2} similarity relationships for {point_id}")
 
@@ -756,15 +827,17 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         await self._ensure_connected()
 
         operation_id = random.randint(1, 100000)
-        params = {"tenant_id": self.agent_id, "collection_name": collection_name}
 
-        conditions = []
+        conditions: List[str] = []
+        params: Dict = {"tenant_id": self.agent_id, "collection_name": collection_name}
+
         if metadata:
             for k, v in metadata.items():
-                # Sanitize key for use as a Cypher parameter name
                 safe_param = f"meta_{k.replace('-', '_').replace('.', '_')}"
-                conditions.append(f"d.metadata['{k}'] = ${safe_param}")
-                params[safe_param] = v
+                # Same CONTAINS strategy as get_all_tenant_points: match the
+                # exact JSON fragment that json.dumps produces for this pair.
+                conditions.append(f"d.metadata CONTAINS ${safe_param}")
+                params[safe_param] = f'"{k}": {json.dumps(v)}'
 
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -775,7 +848,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
 
         async with self._get_session() as session:
-            await session.run(cast(LiteralString, query), **params)
+            await (await session.run(cast(LiteralString, query), **params)).consume()
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
@@ -1281,20 +1354,23 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         query_limit = limit or 1000
 
         where_clauses = ["d.tenant_id = $tenant_id", "c.name = $collection_name"]
-        params = {
+        params: Dict = {
             "tenant_id": self.agent_id,
             "collection_name": collection_name,
             "skip": skip,
-            "limit": query_limit
+            "limit": query_limit,
         }
 
         if metadata:
             for k, v in metadata.items():
-                # Use meta_ prefix to avoid collision with reserved param names
-                # and sanitize key for valid Cypher identifier
                 safe_param = f"meta_{k.replace('-', '_').replace('.', '_')}"
-                where_clauses.append(f"d.metadata['{k}'] = ${safe_param}")
-                params[safe_param] = v
+                # metadata is stored as a JSON string (not a Map property).
+                # Use CONTAINS with the exact JSON fragment that json.dumps
+                # always produces for this key-value pair so the filter runs
+                # server-side without requiring APOC or map-index syntax.
+                # e.g.  {"source": "file", ...}  CONTAINS  '"source": "file"'
+                where_clauses.append(f"d.metadata CONTAINS ${safe_param}")
+                params[safe_param] = f'"{k}": {json.dumps(v)}'
 
         where_str = " AND ".join(where_clauses)
 
@@ -1312,7 +1388,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         points = []
         for r in records:
-            metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
+            metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (r["metadata"] or {})
             points.append(Record(
                 id=r["id"],
                 payload={
