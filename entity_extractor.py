@@ -1,8 +1,8 @@
 import asyncio
-from langdetect import DetectorFactory, detect_langs
-from cat import log
 import hashlib
 import re
+from langdetect import DetectorFactory, detect_langs
+from cat import log
 from typing import List, Dict
 from spacy import load as spacy_load
 from spacy.util import is_package as spacy_is_package
@@ -14,36 +14,113 @@ from .constants import SPACY_TO_ENTITY_TYPE, TECHNOLOGY_PATTERNS, MAX_CO_OCCURRE
 from .models import ExtractedEntity, ExtractedRelation, EntityType, DocumentWithEntities
 
 
+# ---------------------------------------------------------------------------
+# Module-level spaCy model cache
+#
+# Rationale: spaCy models are read-only after loading — they carry no
+# per-tenant state.  Sharing a single Language object across all
+# EntityExtractor instances (i.e. all CheshireCat tenants) is therefore
+# safe and avoids loading the same large binary multiple times.
+#
+# The cache is bounded by the number of *distinct* spaCy model names that
+# are actually requested, which in practice is a small, fixed set regardless
+# of how many CheshireCat instances are running.
+#
+# _SPACY_REGISTRY_LOCK  – serialises creation of per-model locks so that
+#                          two coroutines cannot both decide "this lock does
+#                          not exist yet" and create it simultaneously.
+# _SPACY_MODEL_LOCKS    – one asyncio.Lock per model name; ensures that when
+#                          the model is not yet cached, exactly one coroutine
+#                          loads it while all others wait and then reuse it.
+# _SPACY_MODEL_CACHE    – the actual model store, populated lazily.
+# ---------------------------------------------------------------------------
+
+_SPACY_MODEL_CACHE: Dict[str, Language] = {}
+_SPACY_MODEL_LOCKS: Dict[str, asyncio.Lock] = {}
+_SPACY_REGISTRY_LOCK = asyncio.Lock()
+
+
+async def _get_or_load_model(model_name: str) -> Language:
+    """Return the cached spaCy Language for *model_name*, loading it if needed.
+
+    Uses double-checked locking so that:
+    * after the first successful load, all subsequent callers take the fast
+      path (no lock acquisition);
+    * during the first load, concurrent callers block on a per-model lock
+      rather than all attempting to load simultaneously.
+    """
+    # Fast-path: model already in cache
+    if model_name in _SPACY_MODEL_CACHE:
+        return _SPACY_MODEL_CACHE[model_name]
+
+    # Ensure a dedicated lock exists for this model name
+    async with _SPACY_REGISTRY_LOCK:
+        if model_name not in _SPACY_MODEL_LOCKS:
+            _SPACY_MODEL_LOCKS[model_name] = asyncio.Lock()
+        model_lock = _SPACY_MODEL_LOCKS[model_name]
+
+    # Double-checked locking: re-test inside the per-model lock
+    async with model_lock:
+        if model_name in _SPACY_MODEL_CACHE:
+            return _SPACY_MODEL_CACHE[model_name]
+
+        # Download if needed, then load — both are blocking operations
+        if not spacy_is_package(model_name):
+            await asyncio.to_thread(spacy_download, model_name)
+
+        nlp: Language = await asyncio.to_thread(spacy_load, model_name)
+        _SPACY_MODEL_CACHE[model_name] = nlp
+        log.info(f"Loaded spaCy model '{model_name}' (globally cached)")
+        return nlp
+
+
 class EntityExtractor:
     """
     Extracts entities and relations from text using spaCy.
     Supports multilingual models and extension with custom rules.
+
+    spaCy models are loaded lazily on the first call to `ensure_initialized`
+    and stored in a module-level cache so that multiple EntityExtractor
+    instances (one per CheshireCat tenant) share the same Language objects
+    in memory.  Each instance keeps a ``_nlps`` dict that maps language codes
+    to the shared Language references — no per-instance copies are made.
     """
+
     def __init__(self, models: Dict[str, str], extra_technology_patterns: List[str] = None):
         """
-        Initializes the spaCy model.
+        Initializes the EntityExtractor.
 
         Args:
-            models: A dictionary mapping language codes (e.g. "en") to spaCy model names (e.g. "en_core_web_sm").
-                The specified models will be loaded on demand when processing documents in the corresponding language.
+            models: A dictionary mapping language codes (e.g. "en") to spaCy
+                model names (e.g. "en_core_web_sm").  The special key
+                ``"default"`` is added automatically and maps to
+                ``"en_core_web_sm"`` unless already present.
             extra_technology_patterns: additional regex patterns appended to
                 TECHNOLOGY_PATTERNS. Useful for non-English tech terms or
                 domain-specific keywords not covered by the built-in list.
         """
         self._models = models
-        self._models["default"] = "en_core_web_sm"
-        self._models_loaded = {k: False for k in self._models.keys()}
+        self._models.setdefault("default", "en_core_web_sm")
 
+        # Maps language code → shared Language object (populated by ensure_initialized)
         self._nlps: Dict[str, Language] = {}
         self._initialized = False
+        # Per-instance lock: prevents duplicate initialisation when several
+        # coroutines call ensure_initialized concurrently on the same instance.
+        self._init_lock = asyncio.Lock()
 
         # Build the instance-level pattern list so it can be extended per-instance
         self._technology_patterns = list(TECHNOLOGY_PATTERNS)
         if extra_technology_patterns:
             self._technology_patterns.extend(extra_technology_patterns)
 
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _download_spacy_model(model_name: str):
+        """Synchronously downloads *model_name* if it is not yet installed."""
         if not spacy_is_package(model_name):
             spacy_download(model_name)
 
@@ -62,38 +139,41 @@ class EntityExtractor:
         except Exception:
             return None
 
-    def _load_model(self, lang: str, model_name: str):
-        if self._models_loaded[lang]:
-            return
-        try:
-            self._download_spacy_model(model_name)
-            self._nlps[lang] = spacy_load(model_name)
-            self._models_loaded[lang] = True
-
-            log.info(f"Loaded spaCy model '{model_name}' for language '{lang}'")
-        except Exception as e:
-            log.error(f"Failed to load spaCy model '{model_name}' for language '{lang}': {e}")
-
     async def ensure_downloaded(self):
-        """Downloads the spaCy model (asynchronously)."""
+        """Downloads all configured spaCy models (asynchronously)."""
         await asyncio.gather(*[
             asyncio.to_thread(self._download_spacy_model, model_name)
-            for lang, model_name in self._models.items()
+            for model_name in self._models.values()
         ])
 
     async def ensure_initialized(self):
-        """Loads the spaCy model (asynchronously)."""
+        """Populates ``self._nlps`` from the global cache, loading models as needed.
+
+        Safe to call concurrently: uses double-checked locking so that the
+        actual model loading (which may be slow) happens at most once per
+        unique model name across *all* EntityExtractor instances.
+        """
+        # Fast-path: already initialised for this instance
         if self._initialized:
             return
 
-        # parallel loads each self._models into the self.nlps in separate threads because this is blocking and can take
-        # several seconds
-        await asyncio.gather(*[
-            asyncio.to_thread(self._load_model, lang, model_name)
-            for lang, model_name in self._models.items()
-        ])
+        async with self._init_lock:
+            if self._initialized:
+                return
 
-        self._initialized = True
+            # Load all models in parallel; each individual model is protected
+            # by its own lock inside _get_or_load_model, so concurrent calls
+            # for the same model name across different instances are safe.
+            nlps = await asyncio.gather(*[
+                _get_or_load_model(model_name)
+                for model_name in self._models.values()
+            ])
+            self._nlps = dict(zip(self._models.keys(), nlps))
+            self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Extraction API
+    # ------------------------------------------------------------------
 
     async def extract_doc(self, text: str) -> Doc:
         if not self._initialized:
@@ -114,19 +194,19 @@ class EntityExtractor:
         lang = self._detect_language(text)
         nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
         doc: Doc = await asyncio.to_thread(nlp, text)
-        
+
         # Extract entities
         extracted_entities = self.extract_entities(doc)
-        
+
         # Add technology entities with regex (captures things spaCy might miss)
         extracted_entities.extend(self.extract_technologies_regex(text))
-        
+
         # Deduplicate entities
         extracted_entities = self.deduplicate_entities(extracted_entities)
-        
+
         # Extract relations
         relations = self._extract_relations(doc, extracted_entities, text)
-        
+
         # Add co-occurrence relations only for small entity sets.
         # N*(N-1)/2 pairs are too expensive for large documents.
         if len(extracted_entities) <= MAX_CO_OCCURRENCE_ENTITIES:
@@ -140,7 +220,7 @@ class EntityExtractor:
                 for i in range(len(extracted_entities))
                 for j in range(i + 1, len(extracted_entities))
             ])
-        
+
         return DocumentWithEntities(
             document_id=document_id,
             content=text,
@@ -148,6 +228,10 @@ class EntityExtractor:
             relations=relations,
             metadata=metadata or {}
         )
+
+    # ------------------------------------------------------------------
+    # Static / instance extraction helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def extract_entities(doc: Doc) -> List[ExtractedEntity]:
@@ -186,11 +270,10 @@ class EntityExtractor:
     @staticmethod
     def deduplicate_entities(entities: List[ExtractedEntity]) -> List[ExtractedEntity]:
         """Deduplicates nearby or identical entities."""
-        # Normalize names
         normalized = {}
         for ent in entities:
             name_lower = ent.name.lower().strip()
-            
+
             if name_lower in normalized:
                 # Keep the one with higher confidence
                 existing = normalized[name_lower]
@@ -198,7 +281,7 @@ class EntityExtractor:
                     normalized[name_lower] = ent
             else:
                 normalized[name_lower] = ent
-                
+
         return list(normalized.values())
 
     @staticmethod
