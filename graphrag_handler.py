@@ -1,4 +1,5 @@
 import random
+import math
 import uuid
 import json
 import asyncio
@@ -514,7 +515,27 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         await self._ensure_connected()
 
         point_id = id_point or str(uuid.uuid4())
+
+        # ── Guard: empty content ──────────────────────────────────────────────
+        if not content or not content.strip():
+            log.warning(
+                f"[GraphRAG] Skipping point {point_id}: content is empty or whitespace-only. "
+                "Check the document splitter / loader upstream."
+            )
+            return None
+
         vector_list = list(vector)
+
+        # ── Guard: zero / non-finite embedding vector ─────────────────────────
+        _l2_sq = sum(x * x for x in vector_list)
+        if _l2_sq == 0.0 or not math.isfinite(math.sqrt(_l2_sq)):
+            log.warning(
+                f"[GraphRAG] Skipping point {point_id}: embedding vector has zero or "
+                "non-finite L2-norm. The embedder may have returned a fallback zero "
+                "tensor (e.g. empty input, cold-start failure, or unreachable model)."
+            )
+            return None
+
         metadata = metadata or {}
         metadata["tenant_id"] = self.agent_id
         # Neo4j does not support Map-type node properties (only primitives /
@@ -744,6 +765,15 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         a link regardless of the direction used by future queries.
         A single UNWIND query replaces the previous one-round-trip-per-document loop.
         """
+        # ── Guard: reject zero / non-finite vectors before hitting Neo4j ──────
+        _l2_sq = sum(x * x for x in vector)
+        if _l2_sq == 0.0 or not math.isfinite(math.sqrt(_l2_sq)):
+            log.warning(
+                f"[GraphRAG] Skipping similarity search for {point_id}: "
+                "vector has zero or non-finite L2-norm."
+            )
+            return
+
         find_similar_query = """
         MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
         CALL db.index.vector.queryNodes($index_name, 20, $vector)
