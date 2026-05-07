@@ -101,6 +101,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             "connection_pool_size": self._connection_pool_size,
         }
 
+    def _is_valid_vector(self, vector: List[float]) -> bool:
+        """Check if a vector has non-zero and finite L2-norm."""
+        _l2_sq = sum(x * x for x in vector)
+        return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
+
     def _eq(self, other: "GraphRAGHandler") -> bool:
         return self.to_dict() == other.to_dict()
 
@@ -527,8 +532,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         vector_list = list(vector)
 
         # ── Guard: zero / non-finite embedding vector ─────────────────────────
-        _l2_sq = sum(x * x for x in vector_list)
-        if _l2_sq == 0.0 or not math.isfinite(math.sqrt(_l2_sq)):
+        if not self._is_valid_vector(vector_list):
             log.warning(
                 f"[GraphRAG] Skipping point {point_id}: embedding vector has zero or "
                 "non-finite L2-norm. The embedder may have returned a fallback zero "
@@ -687,7 +691,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                         self._embedder.embed_documents, names
                     )
                     for ent, emb in zip(entities_batch, embeddings):
-                        ent["embedding"] = emb
+                        if self._is_valid_vector(emb):
+                            ent["embedding"] = emb
+                        else:
+                            log.warning(
+                                f"[GraphRAG] Skipping entity embedding for {ent['name']}: "
+                                "zero or non-finite vector"
+                            )
                 except Exception as emb_err:
                     log.warning(f"[GraphRAG] Entity embedding skipped: {emb_err}")
 
@@ -766,8 +776,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         A single UNWIND query replaces the previous one-round-trip-per-document loop.
         """
         # ── Guard: reject zero / non-finite vectors before hitting Neo4j ──────
-        _l2_sq = sum(x * x for x in vector)
-        if _l2_sq == 0.0 or not math.isfinite(math.sqrt(_l2_sq)):
+        if not self._is_valid_vector(vector):
             log.warning(
                 f"[GraphRAG] Skipping similarity search for {point_id}: "
                 "vector has zero or non-finite L2-norm."
