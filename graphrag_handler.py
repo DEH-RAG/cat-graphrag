@@ -294,6 +294,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         Deletes all Document and Collection nodes belonging to this tenant.
         Orphaned Entity nodes (no remaining MENTIONS) are pruned as well.
 
+        Entity nodes may have RELATED_TO edges, so DETACH DELETE is used
+        to avoid relationship-constraint errors from Neo4j.
+
         Called when an embedder change is detected — all existing embeddings
         are stale and must be discarded before the indexes are rebuilt.
         """
@@ -315,7 +318,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             """
             MATCH (e:Entity {tenant_id: $tenant_id})
             WHERE NOT (e)<-[:MENTIONS]-()
-            DELETE e
+            DETACH DELETE e
             """,
             tenant_id=self.agent_id,
         )
@@ -904,7 +907,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         orphan_query = """
         MATCH (e:Entity {tenant_id: $tenant_id})
         WHERE NOT (e)<-[:MENTIONS]-()
-        DELETE e
+        DETACH DELETE e
         """
         async with self._get_session() as session:
             await session.run(
