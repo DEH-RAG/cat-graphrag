@@ -1013,6 +1013,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         await self._ensure_connected()
 
+        # ── Guard: reject zero / non-finite / null embeddings from CAT ──────────
+        if not embedding or not self._is_valid_vector(embedding):
+            log.warning(
+                "[GraphRAG] recall_tenant_memory_from_embedding called with "
+                "null, zero, or non-finite embedding from CAT — returning empty"
+            )
+            return []
+
         threshold = threshold or self._vector_similarity_threshold
         k = k or 5
         depth = self._graph_retrieval_depth
