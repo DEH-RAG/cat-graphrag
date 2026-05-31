@@ -59,7 +59,7 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     settings = await cat.mad_hatter.get_plugin().load_settings()
     if not settings.get("enable_derived_graph", True):
         return
-    await handler.create_derived_graph_for_source(source, stored_points)
+    await handler.create_derived_graph_for_source(source, stored_points, cat)
 
 
 @hook(priority=10)

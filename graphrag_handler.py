@@ -46,6 +46,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
         enable_derived_graph: bool = True,
+        enable_concept_relations: bool = True,
         save_memory_snapshots: bool = False,
     ):
         super().__init__(save_memory_snapshots=save_memory_snapshots)
@@ -67,6 +68,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
         self._enable_derived_graph = enable_derived_graph
+        self._enable_concept_relations = enable_concept_relations
 
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
@@ -1774,6 +1776,155 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
+        # 8 — LLM-based concept relation extraction
+        if self._enable_concept_relations and stray_cat:
+            try:
+                await self._extract_concept_relations(source, stored_points, stray_cat)
+            except Exception as e:
+                log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
+
+    async def _extract_concept_relations(
+        self, source: str, stored_points: List["PointStruct"], stray_cat
+    ) -> None:
+        tenant_id = self.agent_id
+
+        # Combine chunk texts (up to ~8k chars to stay within context windows)
+        texts: List[str] = []
+        total_len = 0
+        for p in stored_points:
+            content = (p.payload or {}).get("page_content", "")
+            if not content:
+                continue
+            if len(content) > 1000:
+                content = content[:1000]
+            texts.append(content)
+            total_len += len(content)
+            if total_len > 8_000:
+                break
+
+        combined = "\n---\n".join(texts)
+        if not combined.strip():
+            return
+
+        relations = await self._llm_extract_relations(combined, stray_cat)
+        if not relations:
+            return
+
+        await self._store_concept_relations(tenant_id, relations)
+        log.info(
+            f"[GraphRAG] Stored {len(relations)} concept relations for '{source}'"
+        )
+
+    async def _llm_extract_relations(
+        self, text: str, stray_cat
+    ) -> List[Dict[str, str]]:
+        from langchain.chains import LLMChain
+        from langchain.prompts import PromptTemplate
+
+        prompt = PromptTemplate(
+            template=CONCEPT_RELATIONS_EXTRACTION_PROMPT,
+            input_variables=["text"],
+        )
+        chain = LLMChain(llm=stray_cat.large_language_model, prompt=prompt)
+        raw = await chain.arun(text=text)
+        return self._parse_concept_relations(raw)
+
+    @staticmethod
+    def _parse_concept_relations(raw: str) -> List[Dict[str, str]]:
+        import re
+        import json
+
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            text = text.strip()
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\[[\s\S]*\]", text)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                except json.JSONDecodeError:
+                    return []
+            else:
+                return []
+
+        if not isinstance(data, list):
+            return []
+
+        valid = {
+            "IS_A", "PART_OF", "EXAMPLE_OF", "PREREQUISITE_FOR",
+            "BUILDS_UPON", "CONTRASTS_WITH", "APPLIES_TO",
+            "LEADS_TO", "EVIDENCE_FOR",
+        }
+
+        result: List[Dict[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            s = str(item.get("subject", "")).strip()
+            o = str(item.get("object", "")).strip()
+            r = str(item.get("relation_type", "")).strip().upper()
+            if s and o and r in valid:
+                result.append({"subject": s, "relation_type": r, "object": o})
+        return result
+
+    async def _store_concept_relations(
+        self, tenant_id: str, relations: List[Dict[str, str]]
+    ) -> None:
+        if not relations:
+            return
+
+        async with self._get_session() as session:
+            for rel in relations:
+                try:
+                    await session.run(
+                        """
+                        MERGE (s:Entity {tenant_id: $tenant_id, name: $subject})
+                        SET s.type = coalesce(s.type, 'CONCEPT')
+                        MERGE (t:Entity {tenant_id: $tenant_id, name: $object})
+                        SET t.type = coalesce(t.type, 'CONCEPT')
+                        MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
+                        SET r.weight = coalesce(r.weight, 1.0) + 0.5
+                        """,
+                        tenant_id=tenant_id,
+                        subject=rel["subject"],
+                        object=rel["object"],
+                        rel_type=rel["relation_type"],
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"[GraphRAG] Failed to store relation "
+                        f"'{rel['subject']} -[{rel['relation_type']}]-> {rel['object']}': {e}"
+                    )
+
+
+CONCEPT_RELATIONS_EXTRACTION_PROMPT = """You are a concept extraction system for educational content. Analyse the text below and extract meaningful conceptual relationships.
+
+For each pair of related concepts return a JSON object with:
+- "subject": the source concept (short noun phrase, max 3 words)
+- "relation_type": one of IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, BUILDS_UPON, CONTRASTS_WITH, APPLIES_TO, LEADS_TO, EVIDENCE_FOR
+- "object": the target concept (short noun phrase, max 3 words)
+
+IS_A = specialisation / hierarchy  (e.g. Python IS_A programming language)
+PART_OF = composition / containment  (e.g. CPU PART_OF computer)
+EXAMPLE_OF = concrete instance  (e.g. Django EXAMPLE_OF web framework)
+PREREQUISITE_FOR = learning dependency  (e.g. Algebra PREREQUISITE_FOR Calculus)
+BUILDS_UPON = conceptual foundation  (e.g. OOP BUILDS_UPON procedural programming)
+CONTRASTS_WITH = comparative distinction  (e.g. REST CONTRASTS_WITH GraphQL)
+APPLIES_TO = practical application  (e.g. Bayes theorem APPLIES_TO spam filtering)
+LEADS_TO = causal chain  (e.g. Global warming LEADS_TO sea level rise)
+EVIDENCE_FOR = supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
+
+Only extract relations that are explicitly stated or clearly implied in the text.
+Return ONLY a valid JSON array of objects, with no additional text. If nothing matches return [].
+
+Text:
+{text}"""
+
 
 class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     # Neo4j connection
@@ -1815,6 +1966,12 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     enable_derived_graph: bool = Field(
         default=True,
         description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
+    )
+
+    # Concept relation extraction
+    enable_concept_relations: bool = Field(
+        default=True,
+        description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
     )
 
     # Performance
