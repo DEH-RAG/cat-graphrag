@@ -1614,6 +1614,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self,
         source: str,
         stored_points: List[PointStruct],
+        stray_cat=None,
     ) -> None:
         """
         Create derived graph nodes and relations after all documents for a
