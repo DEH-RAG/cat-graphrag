@@ -45,6 +45,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
+        enable_derived_graph: bool = True,
         save_memory_snapshots: bool = False,
     ):
         super().__init__(save_memory_snapshots=save_memory_snapshots)
@@ -65,6 +66,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self._graph_retrieval_depth=graph_retrieval_depth
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
+        self._enable_derived_graph = enable_derived_graph
 
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
@@ -99,6 +101,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             "graph_retrieval_depth": self._graph_retrieval_depth,
             "graph_decay_factor": self._graph_decay_factor,
             "connection_pool_size": self._connection_pool_size,
+            "enable_derived_graph": self._enable_derived_graph,
         }
 
     def _is_valid_vector(self, vector: List[float]) -> bool:
@@ -880,6 +883,17 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 point.payload.get("metadata", {}),  # type: ignore[arg-type]
                 str(point.id),
             )
+
+        if self._enable_derived_graph:
+            sources: Dict[str, List[PointStruct]] = {}
+            for p in points:
+                meta = (p.payload or {}).get("metadata", {}) or {}
+                src = meta.get("source")
+                if src:
+                    sources.setdefault(src, []).append(p)
+            for source, src_points in sources.items():
+                await self.create_derived_graph_for_source(source, src_points)
+
         return UpdateResult(status="completed", operation_id=operation_id)
 
     async def delete_tenant_points(self, collection_name: str, metadata: Dict | None = None) -> UpdateResult:
