@@ -1833,5 +1833,12 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
 
     @classmethod
+    def parse_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
+        # Merge stored config with model defaults so new fields (e.g.
+        # enable_derived_graph) appear in existing saved configs.
+        config = super().parse_config(config)
+        return cls(**config).model_dump()
+
+    @classmethod
     def pyclass(cls) -> Type[GraphRAGHandler]:
         return GraphRAGHandler
