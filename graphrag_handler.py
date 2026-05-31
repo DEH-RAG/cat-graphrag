@@ -1767,15 +1767,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 )
 
         log.info(
-            "[GraphRAG] Derived graph for '%s': %d docs, "
-            "%d sections, %d paragraphs, %d formula, %d child_of, card=%s",
-            source,
-            len(regular_points),
-            sum(1 for r in regular_points if r.get("chunk_level") == "section"),
-            sum(1 for r in regular_points if r.get("chunk_level") == "paragraph"),
-            len(formula_ids),
-            len(child_pairs),
-            "yes" if catalogue_id else "no",
+            f"[GraphRAG] Derived graph for '{source}': {len(regular_points)} docs, "
+            f"{sum(1 for r in regular_points if r.get('chunk_level') == 'section')} sections, "
+            f"{sum(1 for r in regular_points if r.get('chunk_level') == 'paragraph')} paragraphs, "
+            f"{len(formula_ids)} formula, {len(child_pairs)} child_of, "
+            f"card={'yes' if catalogue_id else 'no'}"
         )
 
 
