@@ -167,10 +167,50 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             assert isinstance(self._driver, AsyncDriver)
             async with self._driver.session(database=self._neo4j_database) as session:
                 await session.run("RETURN 1")
+            await self._backfill_missing_entity_ids()
             log.info(f"Connected to Neo4j at {self._neo4j_uri}")
         except Exception as e:
             log.error(f"Failed to connect to Neo4j: {e}")
             raise
+
+    async def _backfill_missing_entity_ids(self):
+        """Set a stable `id` on Entity nodes that lack one (e.g. concept entities
+        created by earlier versions of the plugin before `_store_concept_relations`
+        started setting the property).  Uses the same MD5 hash strategy as
+        `EntityExtractor.get_entity_hash` to guarantee consistency with newly
+        inserted entities."""
+        try:
+            async with self._driver.session(database=self._neo4j_database) as session:
+                result = await session.run(
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.id IS NULL
+                    RETURN e.tenant_id AS tenant_id,
+                           e.name AS name,
+                           coalesce(e.type, 'CONCEPT') AS etype,
+                           elementId(e) AS _elid
+                    """
+                )
+                rows = []
+                async for record in result:
+                    rows.append(record)
+                if not rows:
+                    return
+                for row in rows:
+                    try:
+                        enum_type = EntityType(row["etype"])
+                    except ValueError:
+                        enum_type = EntityType.CONCEPT
+                    eid = EntityExtractor.get_entity_hash(
+                        row["name"], enum_type, row["tenant_id"]
+                    )
+                    await session.run(
+                        "MATCH (e) WHERE elementId(e) = $_elid SET e.id = $eid",
+                        _elid=row["_elid"], eid=eid,
+                    )
+                log.info(f"[GraphRAG] Backfilled id on {len(rows)} Entity node(s)")
+        except Exception as e2:
+            log.warning(f"[GraphRAG] Backfill skipped: {e2}")
 
     async def _ensure_vector_indexes_in_session(self, session, vector_dimensions: int):
         """Creates vector indexes for Document and Entity, using an already opened session."""
@@ -1885,19 +1925,38 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         async with self._get_session() as session:
             for rel in relations:
                 try:
+                    subject = rel["subject"]
+                    object_ = rel["object"]
+                    rel_type = rel["relation_type"]
+
+                    # Generate stable entity IDs using the same hash strategy
+                    # as the entity extractor, so concept entities have a
+                    # non-null `id` property and the frontend visualisation
+                    # can map them correctly in D3.
+                    subject_id = EntityExtractor.get_entity_hash(
+                        subject, EntityType.CONCEPT, tenant_id
+                    )
+                    object_id = EntityExtractor.get_entity_hash(
+                        object_, EntityType.CONCEPT, tenant_id
+                    )
+
                     await session.run(
                         """
                         MERGE (s:Entity {tenant_id: $tenant_id, name: $subject})
+                        SET s.id = coalesce(s.id, $subject_id)
                         SET s.type = coalesce(s.type, 'CONCEPT')
                         MERGE (t:Entity {tenant_id: $tenant_id, name: $object})
+                        SET t.id = coalesce(t.id, $object_id)
                         SET t.type = coalesce(t.type, 'CONCEPT')
                         MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                         SET r.weight = coalesce(r.weight, 1.0) + 0.5
                         """,
                         tenant_id=tenant_id,
-                        subject=rel["subject"],
-                        object=rel["object"],
-                        rel_type=rel["relation_type"],
+                        subject=subject,
+                        subject_id=subject_id,
+                        object=object_,
+                        object_id=object_id,
+                        rel_type=rel_type,
                     )
                 except Exception as e:
                     log.warning(
