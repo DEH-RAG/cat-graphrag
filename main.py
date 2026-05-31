@@ -3,6 +3,7 @@ from langchain_core.documents import Document
 
 from cat import hook, RecallSettings, VectorDatabaseSettings
 from cat.looking_glass.stray_cat import StrayCat
+from cat.services.memory.models import PointStruct
 
 from .graphrag_handler import Neo4jGraphRAGConfig, GraphRAGHandler
 
@@ -44,6 +45,17 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
         await cat.vector_memory_handler.entity_extractor.ensure_initialized()
 
     return docs
+
+
+@hook
+async def after_rabbithole_stored_documents(source: str, stored_points: List[PointStruct], cat) -> None:
+    handler = cat.vector_memory_handler
+    if not isinstance(handler, GraphRAGHandler):
+        return
+    settings = await cat.mad_hatter.get_plugin().load_settings()
+    if not settings.get("enable_derived_graph", True):
+        return
+    await handler.create_derived_graph_for_source(source, stored_points)
 
 
 @hook(priority=10)

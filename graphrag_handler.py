@@ -1561,6 +1561,176 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             return None
         return {"must": [{"key": k, "match": {"value": v}} for k, v in filter_dict.items()]}
 
+    async def create_derived_graph_for_source(
+        self,
+        source: str,
+        stored_points: List[PointStruct],
+    ) -> None:
+        """
+        Create derived graph nodes and relations after all documents for a
+        source have been ingested.  Handles chunkers with different metadata
+        profiles gracefully — only creates structure that the available metadata
+        supports.
+
+        Always created (require only chunk_index + source):
+          - :SourceFile node + [:PART_OF] from each document
+          - [:NEXT] edges between consecutive chunks (ordered by chunk_index)
+
+        Created when chunker provides rich metadata:
+          - :Section / :Paragraph labels on documents with chunk_level
+          - [:CHILD_OF] from parent_id field (HierarchicalChunker)
+          - :FormulaChunk label on documents with has_formula=true
+          - [:HAS_SUMMARY] from SourceFile to the CATALOG card
+        """
+        if not stored_points:
+            return
+
+        await self._ensure_connected()
+        tenant_id = self.agent_id
+
+        # Separate regular points from the CATALOG card, extract metadata
+        catalogue_id: str | None = None
+        regular_points: List[Dict[str, Any]] = []
+
+        for p in stored_points:
+            meta = (p.payload or {}).get("metadata", {}) or {}
+            if meta.get("is_catalogue_card"):
+                catalogue_id = p.id
+                continue
+            ci = meta.get("chunk_index")
+            if ci is not None:
+                regular_points.append({
+                    "id": p.id,
+                    "chunk_index": ci,
+                    "chunk_level": meta.get("chunk_level"),
+                    "parent_id": meta.get("parent_id"),
+                    "has_formula": meta.get("has_formula", False),
+                })
+
+        if not regular_points:
+            return
+
+        regular_points.sort(key=lambda x: x["chunk_index"])
+        point_ids = [rp["id"] for rp in regular_points]
+
+        async with self._get_session() as session:
+            # 1 — SourceFile node (idempotent)
+            await session.run(
+                "MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})",
+                source=source,
+                tenant_id=tenant_id,
+            )
+
+            # 2 — PART_OF links
+            await session.run(
+                """
+                UNWIND $point_ids AS pid
+                MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                MERGE (d)-[:PART_OF]->(sf)
+                """,
+                point_ids=point_ids,
+                source=source,
+                tenant_id=tenant_id,
+            )
+
+            # 3 — NEXT edges between consecutive chunks
+            if len(regular_points) > 1:
+                pairs = [
+                    {"curr": regular_points[i]["id"], "next": regular_points[i + 1]["id"]}
+                    for i in range(len(regular_points) - 1)
+                ]
+                await session.run(
+                    """
+                    UNWIND $pairs AS pair
+                    MATCH (a:Document {id: pair.curr, tenant_id: $tenant_id})
+                    MATCH (b:Document {id: pair.next, tenant_id: $tenant_id})
+                    MERGE (a)-[:NEXT]->(b)
+                    """,
+                    pairs=pairs,
+                    tenant_id=tenant_id,
+                )
+
+            # 4 — Structure labels (Section / Paragraph) from chunk_level
+            if any(rp.get("chunk_level") for rp in regular_points):
+                section_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "section"]
+                paragraph_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "paragraph"]
+                if section_ids:
+                    await session.run(
+                        """
+                        UNWIND $ids AS pid
+                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                        SET d:Section
+                        """,
+                        ids=section_ids,
+                        tenant_id=tenant_id,
+                    )
+                if paragraph_ids:
+                    await session.run(
+                        """
+                        UNWIND $ids AS pid
+                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                        SET d:Paragraph
+                        """,
+                        ids=paragraph_ids,
+                        tenant_id=tenant_id,
+                    )
+
+            # 5 — FormulaChunk label
+            formula_ids = [rp["id"] for rp in regular_points if rp.get("has_formula")]
+            if formula_ids:
+                await session.run(
+                    """
+                    UNWIND $ids AS pid
+                    MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                    SET d:FormulaChunk
+                    """,
+                    ids=formula_ids,
+                    tenant_id=tenant_id,
+                )
+
+            # 6 — CHILD_OF from parent_id
+            child_pairs = [
+                {"child": rp["id"], "parent": rp["parent_id"]}
+                for rp in regular_points if rp.get("parent_id")
+            ]
+            if child_pairs:
+                await session.run(
+                    """
+                    UNWIND $pairs AS pair
+                    MATCH (child:Document {id: pair.child, tenant_id: $tenant_id})
+                    MATCH (parent:Document {id: pair.parent, tenant_id: $tenant_id})
+                    MERGE (child)-[:CHILD_OF]->(parent)
+                    """,
+                    pairs=child_pairs,
+                    tenant_id=tenant_id,
+                )
+
+            # 7 — HAS_SUMMARY from SourceFile to CATALOG card
+            if catalogue_id:
+                await session.run(
+                    """
+                    MATCH (card:Document {id: $card_id, tenant_id: $tenant_id})
+                    MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                    MERGE (sf)-[:HAS_SUMMARY]->(card)
+                    """,
+                    card_id=catalogue_id,
+                    source=source,
+                    tenant_id=tenant_id,
+                )
+
+        log.info(
+            "[GraphRAG] Derived graph for '%s': %d docs, "
+            "%d sections, %d paragraphs, %d formula, %d child_of, card=%s",
+            source,
+            len(regular_points),
+            sum(1 for r in regular_points if r.get("chunk_level") == "section"),
+            sum(1 for r in regular_points if r.get("chunk_level") == "paragraph"),
+            len(formula_ids),
+            len(child_pairs),
+            "yes" if catalogue_id else "no",
+        )
+
 
 class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     # Neo4j connection
@@ -1598,6 +1768,11 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     # Graph retrieval
     graph_retrieval_depth: int = Field(default=2, description="Max depth for graph traversal", ge=1, le=5)
     graph_decay_factor: float = Field(default=0.8, description="Score decay factor per hop", ge=0.5, le=1.0)
+
+    enable_derived_graph: bool = Field(
+        default=True,
+        description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
+    )
 
     # Performance
     connection_pool_size: int = Field(default=50,description="Neo4j connection pool size")
