@@ -9,7 +9,7 @@ from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
 from pydantic import Field, ConfigDict
 
-from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings
+from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
 from cat.services.memory.models import (
     DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
 )
@@ -1788,23 +1788,25 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     ) -> None:
         tenant_id = self.agent_id
 
-        # Combine chunk texts (up to ~8k chars to stay within context windows)
+        # Join full section texts (no per-chunk truncation), up to a total limit
         texts: List[str] = []
         total_len = 0
+        max_chars = 12000
         for p in stored_points:
             content = (p.payload or {}).get("page_content", "")
-            if not content:
+            if not content or not content.strip():
                 continue
-            if len(content) > 1000:
-                content = content[:1000]
             texts.append(content)
             total_len += len(content)
-            if total_len > 8_000:
+            if total_len > max_chars:
                 break
 
-        combined = "\n---\n".join(texts)
+        combined = "\n\n".join(texts)
         if not combined.strip():
             return
+
+        if len(combined) > max_chars:
+            combined = combined[:max_chars] + " [truncated]"
 
         relations = await self._llm_extract_relations(combined, stray_cat)
         if not relations:
@@ -1818,15 +1820,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
     async def _llm_extract_relations(
         self, text: str, stray_cat
     ) -> List[Dict[str, str]]:
-        from langchain.chains import LLMChain
-        from langchain.prompts import PromptTemplate
+        safe_text = text.replace("{", "{{").replace("}", "}}")
 
-        prompt = PromptTemplate(
-            template=CONCEPT_RELATIONS_EXTRACTION_PROMPT,
-            input_variables=["text"],
+        full_prompt = CONCEPT_RELATIONS_EXTRACTION_PROMPT.replace("{text}", safe_text)
+
+        agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
+        agent_output = await stray_cat.agentic_workflow.run(
+            task=agent_input,
+            llm=stray_cat.large_language_model,
         )
-        chain = LLMChain(llm=stray_cat.large_language_model, prompt=prompt)
-        raw = await chain.arun(text=text)
+        raw = agent_output.output
         return self._parse_concept_relations(raw)
 
     @staticmethod
