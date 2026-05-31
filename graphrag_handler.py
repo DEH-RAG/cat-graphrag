@@ -293,6 +293,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         Deletes all Document and Collection nodes belonging to this tenant.
         Orphaned Entity nodes (no remaining MENTIONS) are pruned as well.
+        Orphaned SourceFile nodes (no remaining PART_OF) are pruned as well.
 
         Entity nodes may have RELATED_TO edges, so DETACH DELETE is used
         to avoid relationship-constraint errors from Neo4j.
@@ -319,6 +320,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             MATCH (e:Entity {tenant_id: $tenant_id})
             WHERE NOT (e)<-[:MENTIONS]-()
             DETACH DELETE e
+            """,
+            tenant_id=self.agent_id,
+        )
+        await session.run(
+            """
+            MATCH (sf:SourceFile {tenant_id: $tenant_id})
+            WHERE NOT (sf)<-[:PART_OF]-()
+            DETACH DELETE sf
             """,
             tenant_id=self.agent_id,
         )
@@ -453,6 +462,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         Deletes a collection and its documents.
         Entities are deleted only if they become orphans (no remaining MENTIONS
         from documents in other collections), preserving cross-collection knowledge.
+        Orphaned SourceFile nodes are pruned as well.
         """
         await self._ensure_connected()
 
@@ -471,9 +481,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         WHERE NOT (e)<-[:MENTIONS]-()
         DELETE e
         """
+        # Step 3: delete orphaned SourceFile nodes with no remaining PART_OF.
+        delete_orphan_sourcefiles_query = """
+        MATCH (sf:SourceFile {tenant_id: $tenant_id})
+        WHERE NOT (sf)<-[:PART_OF]-()
+        DETACH DELETE sf
+        """
         async with self._get_session() as session:
             await session.run(cast(LiteralString, delete_docs_query), name=collection_name, tenant_id=self.agent_id)
             await session.run(cast(LiteralString, delete_orphan_entities_query), tenant_id=self.agent_id)
+            await session.run(cast(LiteralString, delete_orphan_sourcefiles_query), tenant_id=self.agent_id)
         log.info(f"Collection {collection_name} deleted (orphaned entities pruned)")
 
     async def check_collection_existence(self, collection_name: str) -> bool:
@@ -892,6 +909,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         async with self._get_session() as session:
             await (await session.run(cast(LiteralString, query), **params)).consume()
 
+        async with self._get_session() as session:
+            await session.run(
+                """
+                MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                WHERE NOT (sf)<-[:PART_OF]-()
+                DETACH DELETE sf
+                """,
+                tenant_id=self.agent_id,
+            )
+
         return UpdateResult(status="completed", operation_id=operation_id)
 
     async def delete_tenant_points_by_ids(self, collection_name: str, points_ids: List) -> UpdateResult:
@@ -909,6 +936,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         WHERE NOT (e)<-[:MENTIONS]-()
         DETACH DELETE e
         """
+        orphan_sf_query = """
+        MATCH (sf:SourceFile {tenant_id: $tenant_id})
+        WHERE NOT (sf)<-[:PART_OF]-()
+        DETACH DELETE sf
+        """
         async with self._get_session() as session:
             await session.run(
                 cast(LiteralString, query),
@@ -917,6 +949,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                 tenant_id=self.agent_id
             )
             await session.run(cast(LiteralString, orphan_query), tenant_id=self.agent_id)
+            await session.run(cast(LiteralString, orphan_sf_query), tenant_id=self.agent_id)
         return UpdateResult(status="completed", operation_id=operation_id)
 
     async def retrieve_tenant_points(self, collection_name: str, points: List) -> List[Record]:
