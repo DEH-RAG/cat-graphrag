@@ -41,8 +41,12 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
     if hasattr(cat.vector_memory_handler, "embedder"):
         cat.vector_memory_handler.embedder = await cat.embedder()
 
-    if isinstance(cat.vector_memory_handler, GraphRAGHandler) and cat.vector_memory_handler.entity_extractor:
-        await cat.vector_memory_handler.entity_extractor.ensure_initialized()
+    if isinstance(cat.vector_memory_handler, GraphRAGHandler):
+        handler = cat.vector_memory_handler
+        if handler.entity_extractor:
+            await handler.entity_extractor.ensure_initialized()
+        for i, doc in enumerate(docs):
+            doc.metadata.setdefault("chunk_index", i)
 
     return docs
 
