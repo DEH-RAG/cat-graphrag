@@ -45,10 +45,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
-        enable_derived_graph: bool = True,
-        enable_concept_relations: bool = True,
-        enable_knowledge_graph: bool = True,
-        enable_student_knowledge_graph: bool = True,
+        enable_derived_graph: bool = False,
+        enable_concept_relations: bool = False,
+        enable_knowledge_graph: bool = False,
+        enable_student_knowledge_graph: bool = False,
         save_memory_snapshots: bool = False,
     ):
         super().__init__(save_memory_snapshots=save_memory_snapshots)
@@ -2033,23 +2033,20 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     graph_decay_factor: float = Field(default=0.8, description="Score decay factor per hop", ge=0.5, le=1.0)
 
     enable_derived_graph: bool = Field(
-        default=True,
+        default=False,
         description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
     )
-
+    enable_concept_relations: bool = Field(
+        default=False,
+        description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
+    )
     enable_knowledge_graph: bool = Field(
-        default=True,
+        default=False,
         description="Enable the knowledge graph feature globally",
     )
     enable_student_knowledge_graph: bool = Field(
-        default=True,
+        default=False,
         description="Enable knowledge graph features for students",
-    )
-
-    # Concept relation extraction
-    enable_concept_relations: bool = Field(
-        default=True,
-        description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
     )
 
     # Performance
