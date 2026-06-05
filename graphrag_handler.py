@@ -442,13 +442,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
     async def close(self):
         # Cancel and clean up all pending entity tasks
-        for task in self._pending_entity_tasks:
-            if not task.done():
-                task.cancel()
-        # Wait for cancellations to propagate
-        if self._pending_entity_tasks:
-            await asyncio.gather(*self._pending_entity_tasks, return_exceptions=True)
-        self._pending_entity_tasks.clear()
+        tasks = getattr(self, '_pending_entity_tasks', [])
+        if tasks:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for cancellations to propagate
+            await asyncio.gather(*tasks, return_exceptions=True)
+            tasks.clear()
 
         if self._driver:
             await self._driver.close()
