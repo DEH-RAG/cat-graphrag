@@ -2031,6 +2031,15 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
     )
 
+    enable_knowledge_graph: bool = Field(
+        default=True,
+        description="Enable the knowledge graph feature globally",
+    )
+    enable_student_knowledge_graph: bool = Field(
+        default=True,
+        description="Enable knowledge graph features for students",
+    )
+
     # Concept relation extraction
     enable_concept_relations: bool = Field(
         default=True,
