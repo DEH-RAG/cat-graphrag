@@ -451,8 +451,9 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             await asyncio.gather(*tasks, return_exceptions=True)
             tasks.clear()
 
-        if self._driver:
-            await self._driver.close()
+        driver = getattr(self, '_driver', None)
+        if driver:
+            await driver.close()
             self._driver = None
 
     def is_db_remote(self) -> bool:
