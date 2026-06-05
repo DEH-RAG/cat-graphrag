@@ -47,6 +47,8 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         connection_pool_size: int = 50,
         enable_derived_graph: bool = True,
         enable_concept_relations: bool = True,
+        enable_knowledge_graph: bool = True,
+        enable_student_knowledge_graph: bool = True,
         save_memory_snapshots: bool = False,
     ):
         super().__init__(save_memory_snapshots=save_memory_snapshots)
@@ -69,6 +71,8 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self._connection_pool_size=connection_pool_size
         self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
+        self._enable_knowledge_graph = enable_knowledge_graph
+        self._enable_student_knowledge_graph = enable_student_knowledge_graph
 
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
