@@ -527,10 +527,13 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """
         # Step 2: delete entities that are now unreferenced (no more MENTIONS
         # from any document, across all collections for this tenant).
+        # DETACH is required because the entity may still carry other
+        # relationship types (RELATED_TO, CO_OCCURS_WITH, CONCEPT_RELATION, etc.)
+        # that are not captured by the MENTIONS check.
         delete_orphan_entities_query = """
         MATCH (e:Entity {tenant_id: $tenant_id})
         WHERE NOT (e)<-[:MENTIONS]-()
-        DELETE e
+        DETACH DELETE e
         """
         # Step 3: delete orphaned SourceFile nodes with no remaining PART_OF.
         delete_orphan_sourcefiles_query = """
