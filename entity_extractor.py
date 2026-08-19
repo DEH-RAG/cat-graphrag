@@ -69,6 +69,7 @@ async def _get_or_load_model(model_name: str) -> Language:
             await asyncio.to_thread(spacy_download, model_name)
 
         nlp: Language = await asyncio.to_thread(spacy_load, model_name)
+        nlp.max_length = 10_000_000
         _SPACY_MODEL_CACHE[model_name] = nlp
         log.info(f"Loaded spaCy model '{model_name}' (globally cached)")
         return nlp
