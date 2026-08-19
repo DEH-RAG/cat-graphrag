@@ -4,7 +4,10 @@ __pycache__/
 *$py.class
 
 # opencode
-.sisyphus
+.sisyphus/
+.omo/
+.opencode/
+AGENTS.md
 
 # C extensions
 *.so
