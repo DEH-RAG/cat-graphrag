@@ -15,11 +15,22 @@ from cat.services.memory.models import (
 )
 from cat.log import log
 
+# Migration guard for the seamless re-embed swap (todo 12, P4). Prefer the
+# Cat distributed lock (Redis-backed, cross-worker); fall back to a simple
+# in-process asyncio lock when the Cat runtime is unavailable (e.g. the
+# standalone test harness stubs ``cat`` without ``cat.db.crud``).
+try:
+    from cat.db.crud import distributed_lock
+except ImportError:
+    distributed_lock = None
+
 from .entity_extractor import EntityExtractor
+from .epoch import EpochMixin
 from .models import EntityType
+from .versioning import ensure_version, retry_on_generation_change
 
 
-class GraphRAGHandler(BaseVectorDatabaseHandler):
+class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     """
     Advanced GraphRAG handler with:
     - Neo4j 5.23+ vector indexes (HNSW)
@@ -82,6 +93,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         self._neo4j_write_semaphore = asyncio.Semaphore(4)
         self._user_message = None
         self._embedder: Optional[Embeddings] = None
+        # In-process fallback lock for reembed_tenant when the Cat distributed
+        # lock is unavailable (see the module-level try/except import).
+        self._reembed_lock = asyncio.Lock()
+
+        # Versioned-schema state (todo 11, P4): the generation token read from
+        # (:Epoch {tenant_id, generation}), the resolved version-suffixed names,
+        # and the per-generation compiled-query cache {query_key: {gen: cypher}}.
+        self._generation: Optional[str] = None
+        self._names: Dict[str, str] = {}
+        self._query_cache: Dict[str, Dict[str, str]] = {}
 
         # Initialize entity extractor
         self._entity_extractor: Optional[EntityExtractor] = EntityExtractor(
@@ -114,6 +135,14 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """Check if a vector has non-zero and finite L2-norm."""
         _l2_sq = sum(x * x for x in vector)
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
+
+    @staticmethod
+    def _next_generation(gen: str) -> str:
+        """Increment a generation token: 'v1' -> 'v2', 'v2' -> 'v3'."""
+        try:
+            return f"v{int(gen.lstrip('v')) + 1}"
+        except ValueError:
+            return "v2"
 
     def _eq(self, other: "GraphRAGHandler") -> bool:
         return self.to_dict() == other.to_dict()
@@ -382,6 +411,239 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         )
         log.info(f"[GraphRAG] Tenant data wiped for agent_id={self.agent_id}")
 
+    async def _ensure_vector_index_in_session(self, session, index_name: str, embedding_prop: str, vector_dimensions: int) -> None:
+        """Creates a single Document vector index at the given (versioned) name.
+
+        Mirror of ``_ensure_vector_indexes_in_session`` scoped to one index,
+        used by the shadow-build phase of ``reembed_tenant`` to create
+        ``document_embeddings_{gen}`` on ``embedding_{gen}``.
+        """
+        query = f"""
+        CREATE VECTOR INDEX {index_name} IF NOT EXISTS
+        FOR (d:Document) ON d.{embedding_prop}
+        OPTIONS {{
+            indexConfig: {{
+                `vector.dimensions`: {vector_dimensions},
+                `vector.similarity_function`: 'cosine',
+                `vector.hnsw.ef_construction`: 200,
+                `vector.hnsw.m`: 16
+            }}
+        }}
+        """
+        try:
+            await session.run(query)
+            log.info(f"Document vector index ensured: {index_name}")
+        except Exception as e:
+            if "already exists" not in str(e):
+                log.error(f"Document index creation warning: {e}")
+                raise e
+
+    async def _create_similarity_relationships_for_gen(
+        self,
+        point_id: str,
+        vector: List[float],
+        collection_name: str,
+        gen: str,
+        tenant_id: str,
+    ) -> None:
+        """Mirror of ``_create_similarity_relationships`` against an explicit
+        generation (used by the shadow-build phase of ``reembed_tenant``).
+
+        Queries the ``{gen}`` vector index and writes ``SIMILAR_TO_{gen}``
+        edges via plain ``session.run`` — no transactions, exactly like the
+        decorated write path.
+        """
+        if not self._is_valid_vector(vector):
+            return
+        try:
+            similar = await self._run_cached(
+                "find_similar",
+                gen,
+                {
+                    "collection_name": collection_name,
+                    "tenant_id": tenant_id,
+                    "vector": vector,
+                    "point_id": point_id,
+                    "threshold": self._vector_similarity_threshold,
+                },
+            )
+            if not similar:
+                return
+            similar.sort(key=lambda s: s["id"])
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(LiteralString, self._compile_query("create_similar_rel", gen)),
+                        similar=similar,
+                        point_id=point_id,
+                    )
+        except Exception as e:
+            log.error(f"Failed to create similarity relationships: {e}")
+
+    async def _gc_generation(self, tenant_id: str, gen: str) -> None:
+        """Drop the old generation's index, SIMILAR_TO edges and embedding property.
+
+        Runs AFTER the epoch flip so no worker is stranded on a deleted set.
+        Every statement is tenant-filtered — other agents' graphs are never
+        touched.
+        """
+        names = self._versioned_names(gen)
+        async with self._get_session() as session:
+            # Drop the old vector index (Neo4j vector indexes are immutable —
+            # the new generation carries its own index at the new dims).
+            await session.run(cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS"))
+            # Delete the old SIMILAR_TO edges (both endpoints tenant-filtered).
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (a:Document {{tenant_id: $tenant_id}})-[r:{names['relation']}]-(b:Document {{tenant_id: $tenant_id}})
+                    DELETE r
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            # Remove the old embedding property from every tenant Document.
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (d:Document {{tenant_id: $tenant_id}})
+                    REMOVE d.{names['embedding_prop']}
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+
+    async def reembed_tenant(self, tenant_id: str, new_embedder) -> None:
+        """Seamless shadow-swap of the tenant's embedding generation (P4, todo 12).
+
+        Phase A (shadow): re-embed every stored Document of *tenant_id* with
+        ``new_embedder`` into the NEW versioned names (``embedding_{new_gen}``,
+        ``document_embeddings_{new_gen}``, ``SIMILAR_TO_{new_gen}``) while the
+        OLD generation stays fully intact and keeps serving reads.
+        Phase B (flip): atomically set the Epoch generation token to the new
+        generation (single MERGE SET).
+        Phase C (GC): AFTER the flip, drop the old index, delete the old
+        SIMILAR_TO edges and remove the old embedding property.
+
+        No transactions in the read paths; the shadow writes use plain
+        ``session.run`` (the batch embedding write is a single UNWIND).
+        Cross-worker sync is handled by the ``ensure_version`` /
+        ``retry_on_generation_change`` decorators probing the Epoch token on
+        their next operation — no broadcast, no canary, no ``WHERE`` guards.
+        The whole swap is guarded by the Cat ``distributed_lock`` so only one
+        worker performs the migration for a tenant at a time.
+        """
+        if new_embedder is None:
+            log.warning(
+                f"[GraphRAG] reembed_tenant({tenant_id}) called without an "
+                "embedder; skipping the swap"
+            )
+            return
+
+        if distributed_lock is not None:
+            async with distributed_lock(f"graphrag_reembed:{tenant_id}"):
+                await self._reembed_tenant_impl(tenant_id, new_embedder)
+        else:
+            # Fallback: single-process lock (documented in the module docstring).
+            async with self._reembed_lock:
+                await self._reembed_tenant_impl(tenant_id, new_embedder)
+
+    async def _reembed_tenant_impl(self, tenant_id: str, new_embedder) -> None:
+        """The shadow-build -> flip -> GC sequence, run under the migration lock."""
+        old_gen = await self._read_generation(tenant_id)
+        new_gen = self._next_generation(old_gen)
+        new_names = self._versioned_names(new_gen)
+
+        # ── Phase A: shadow-build the new generation ─────────────────────
+        # 1. Read every stored Document of the tenant (with its collection).
+        async with self._get_session() as session:
+            result = await session.run(
+                cast(
+                    LiteralString,
+                    """
+                    MATCH (d:Document {tenant_id: $tenant_id})-[:BELONGS_TO]->(c:Collection)
+                    RETURN d.id AS id, d.content AS content, c.name AS collection_name
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            docs = [
+                (record["id"], record["content"] or "", record["collection_name"])
+                async for record in result
+            ]
+
+        if not docs:
+            # Nothing to re-embed — still flip + GC so the schema stays
+            # consistent for the tenant.
+            await self._set_generation(tenant_id, new_gen)
+            await self._gc_generation(tenant_id, old_gen)
+            log.info(
+                f"[GraphRAG] reembed_tenant({tenant_id}): no documents, "
+                f"flipped {old_gen} -> {new_gen}"
+            )
+            return
+
+        # 2. Re-embed all contents with the new embedder (non-blocking).
+        contents = [content for _, content, _ in docs]
+        vectors = await asyncio.to_thread(new_embedder.embed_documents, contents)
+
+        # 3. Write embedding_{new_gen} on each Document (single batch UNWIND).
+        payload = []
+        valid_pairs = []
+        for (doc_id, _, collection_name), vector in zip(docs, vectors):
+            if self._is_valid_vector(vector):
+                payload.append({"id": doc_id, "vector": vector})
+                valid_pairs.append((doc_id, vector, collection_name))
+            else:
+                log.warning(
+                    f"[GraphRAG] Skipping re-embed for {doc_id}: "
+                    "zero or non-finite vector"
+                )
+
+        if payload:
+            async with self._get_session() as session:
+                await session.run(
+                    cast(
+                        LiteralString,
+                        f"""
+                        UNWIND $docs AS d
+                        MATCH (doc:Document {{id: d.id, tenant_id: $tenant_id}})
+                        SET doc.{new_names["embedding_prop"]} = d.vector
+                        """,
+                    ),
+                    docs=payload,
+                    tenant_id=tenant_id,
+                )
+
+        # 4. Create the new vector index at the new embedder's dimensions.
+        async with self._get_session() as session:
+            await self._ensure_vector_index_in_session(
+                session,
+                new_names["index"],
+                new_names["embedding_prop"],
+                new_embedder.size,
+            )
+
+        # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
+        #    _create_similarity_relationships against the new index/relation).
+        for doc_id, vector, collection_name in valid_pairs:
+            await self._create_similarity_relationships_for_gen(
+                doc_id, vector, collection_name, new_gen, tenant_id
+            )
+
+        # ── Phase B: flip the epoch (single atomic write) ────────────────
+        await self._set_generation(tenant_id, new_gen)
+
+        # ── Phase C: GC the old generation (flip-before-GC is mandatory) ─
+        await self._gc_generation(tenant_id, old_gen)
+
+        log.info(
+            f"[GraphRAG] Seamless re-embed swap for tenant_id={tenant_id}: "
+            f"{old_gen} -> {new_gen} ({len(payload)} documents re-embedded)"
+        )
+
     async def initialize(self, embedder_name: str, embedder_size: int):
         await self._connect()
 
@@ -416,13 +678,24 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
                     f"[GraphRAG] Embedder change detected "
                     f"(index_dims={index_dims} → {embedder_size}, "
                     f"name_mismatch={name_mismatch}). "
-                    "Wiping tenant data and rebuilding indexes."
+                    "Running seamless shadow-swap re-embed."
                 )
                 if self.save_memory_snapshots:
                     for collection_name in self._collection_names:
                         await self.save_dump(collection_name)
 
-                await self._drop_tenant_data_in_session(session)
+                # Seamless swap instead of the old full wipe: shadow-build the
+                # new generation (embedding_v2 / document_embeddings_v2 /
+                # SIMILAR_TO_v2), flip the Epoch token, then GC the old set.
+                # No downtime — the old generation keeps serving reads until
+                # the flip, and no worker is stranded because GC runs after.
+                if self._embedder is not None:
+                    await self.reembed_tenant(self.agent_id, self._embedder)
+                else:
+                    log.warning(
+                        "[GraphRAG] Embedder change detected but no embedder "
+                        "injected; skipping the seamless re-embed swap."
+                    )
 
                 if index_needs_rebuild:
                     await self._drop_vector_indexes_in_session(session)
@@ -431,6 +704,39 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             # If they were just dropped, this recreates them;
             # if they already match, IF NOT EXISTS is a no-op.
             await self._ensure_vector_indexes_in_session(session, embedder_size)
+
+            # ── Versioned-schema bootstrap (todo 11, P4) ─────────────────────
+            # The decorated read paths query the versioned index/property for
+            # the current generation (e.g. document_embeddings_v1 / embedding_v1).
+            # On a fresh install — or on pre-P4 data that only carries the
+            # unversioned `embedding` property — that versioned schema does not
+            # exist yet, so the first memory recall would target a missing index
+            # and fail. Ensure the versioned index for the current generation and
+            # backfill the legacy unversioned embedding into it, so reads never
+            # hit a missing index.
+            gen = await self._read_generation()
+            if gen != self._generation:
+                self._rebuild_for_generation(gen)
+            names = self._names
+            await self._ensure_vector_index_in_session(
+                session, names["index"], names["embedding_prop"], embedder_size
+            )
+            # Backfill: copy the legacy unversioned `embedding` property into the
+            # current generation's property for existing documents that lack it.
+            # (The driver suppresses the 01N52 "property does not exist" GQL
+            # warning on a fresh database, so the IS NOT NULL filter is safe.)
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (d:Document {{tenant_id: $tenant_id}})
+                    WHERE d.embedding IS NOT NULL
+                      AND d.{names["embedding_prop"]} IS NULL
+                    SET d.{names["embedding_prop"]} = d.embedding
+                    """,
+                ),
+                tenant_id=self.agent_id,
+            )
 
         # Create / update collections — always store current embedder metadata.
         async with self._get_session() as session:
@@ -623,16 +929,26 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         # is fully backward-compatible.
         metadata_json = json.dumps(metadata)
 
-        create_query = """
-        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
-        CREATE (d:Document {
+        # Resolve the current generation's embedding property name (versioned
+        # schema, todo 11 P4). The write must target the SAME property the
+        # versioned read paths query (embedding_{gen}), not the bare unversioned
+        # `embedding` — otherwise new documents are invisible to the versioned
+        # vector index and the first recall returns embedding: null.
+        gen = await self._read_generation()
+        if gen != self._generation:
+            self._rebuild_for_generation(gen)
+        embedding_prop = self._names["embedding_prop"]
+
+        create_query = f"""
+        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
+        CREATE (d:Document {{
             id: $id,
             content: $content,
-            embedding: $embedding,
+            {embedding_prop}: $embedding,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
-        })
+        }})
         CREATE (d)-[:BELONGS_TO]->(c)
         RETURN d.id AS id
         """
@@ -848,6 +1164,10 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         Both directions (a→b and b→a) are stored so graph traversal never misses
         a link regardless of the direction used by future queries.
         A single UNWIND query replaces the previous one-round-trip-per-document loop.
+
+        Versioned (todo 11, P4): the vector index and the SIMILAR_TO relation
+        name are suffixed with the current generation token; the whole method
+        is re-run once by the decorator if the generation flips mid-run.
         """
         # ── Guard: reject zero / non-finite vectors before hitting Neo4j ──────
         if not self._is_valid_vector(vector):
@@ -857,63 +1177,41 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             )
             return
 
-        find_similar_query = """
-        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
-        CALL db.index.vector.queryNodes($index_name, 20, $vector)
-        YIELD node, score
-        WHERE EXISTS { MATCH (node)-[:BELONGS_TO]->(c) }
-          AND node.id <> $point_id
-          AND score >= $threshold
-        RETURN node.id AS id, score
-        ORDER BY score DESC
-        """
-
-        create_rel_query = """
-        UNWIND $similar AS sim
-        MATCH (a:Document {id: $point_id})
-        MATCH (b:Document {id: sim.id})
-        MERGE (a)-[r1:SIMILAR_TO]->(b)
-        SET r1.score = sim.score, r1.updated_at = datetime()
-        MERGE (b)-[r2:SIMILAR_TO]->(a)
-        SET r2.score = sim.score, r2.updated_at = datetime()
-        """
-
         try:
             # Read phase — auto-commit, read-only, no write locks acquired.
-            async with self._get_session() as session:
-                result = await session.run(
-                    cast(LiteralString, find_similar_query),
-                    collection_name=collection_name,
-                    tenant_id=self.agent_id,
-                    index_name=self._document_vector_index,
-                    vector=vector,
-                    point_id=point_id,
-                    threshold=self._vector_similarity_threshold,
-                )
-                similar = await result.data()
+            similar = await self._run_cached(
+                "find_similar",
+                self._generation,
+                {
+                    "collection_name": collection_name,
+                    "tenant_id": self.agent_id,
+                    "vector": vector,
+                    "point_id": point_id,
+                    "threshold": self._vector_similarity_threshold,
+                },
+            )
 
             if not similar:
                 log.debug(f"No similar documents found for {point_id}")
                 return
 
-            # Sort by document id so every concurrent transaction acquires
+            # Sort by document id so every concurrent writer acquires
             # node relationship-group locks in the same order, breaking
-            # circular wait chains between transactions.
+            # circular wait chains between writers.
             similar.sort(key=lambda s: s["id"])
 
-            # Write phase — execute_write uses a managed transaction that the
-            # Neo4j driver automatically retries on TransientError (deadlock).
-            # The semaphore caps concurrent writers to reduce contention.
-            async def _write_similarity(tx):
-                await tx.run(
-                    cast(LiteralString, create_rel_query),
-                    similar=similar,
-                    point_id=point_id,
-                )
-
+            # Write phase — plain auto-commit session.run (no managed
+            # transaction): correctness is guaranteed by the
+            # retry_on_generation_change decorator (detect-and-rerun-once),
+            # not by driver-managed tx. The semaphore caps concurrent writers
+            # to reduce contention.
             async with self._neo4j_write_semaphore:
                 async with self._get_session() as session:
-                    await session.execute_write(_write_similarity)
+                    await session.run(
+                        cast(LiteralString, self._compile_query("create_similar_rel", self._generation)),
+                        similar=similar,
+                        point_id=point_id,
+                    )
 
             log.debug(f"Created {len(similar) * 2} similarity relationships for {point_id}")
 
@@ -1017,17 +1315,15 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
             await session.run(cast(LiteralString, orphan_sf_query), tenant_id=self.agent_id)
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    @ensure_version
     async def retrieve_tenant_points(self, collection_name: str, points: List) -> List[Record]:
         await self._ensure_connected()
 
-        query = """
-        MATCH (d:Document)
-        WHERE d.id IN $ids AND d.tenant_id = $tenant_id
-        RETURN d.id AS id, d.content AS content, d.metadata AS metadata, d.embedding AS embedding
-        """
-        async with self._get_session() as session:
-            result = await session.run(cast(LiteralString, query), ids=points, tenant_id=self.agent_id)
-            records = await result.data()
+        records = await self._run_cached(
+            "retrieve_tenant_points",
+            self._generation,
+            {"ids": points, "tenant_id": self.agent_id},
+        )
 
         return [
             Record(
@@ -1044,6 +1340,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
     # ========== MAIN METHOD: HYBRID RECALL ==========
 
+    @retry_on_generation_change
     async def recall_tenant_memory_from_embedding(
         self,
         collection_name: str,
@@ -1169,6 +1466,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         log.debug(f"[GraphRAG] Query entities: {names}")
         return names
 
+    @ensure_version
     async def _recall_entity_direct(
         self,
         collection_name: str,
@@ -1182,38 +1480,23 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         entities).  A document mentioning all query entities scores 1.0; one that
         mentions half scores 0.5. This naturally surfaces the most topically
         complete answers.
+
+        Versioned (todo 11, P4): the embedding property read is suffixed with
+        the current generation token.
         """
-        query = """
-        UNWIND $entity_names AS q_name
-        MATCH (q_e:Entity {tenant_id: $tenant_id})
-        WHERE q_e.name = q_name
-        WITH DISTINCT q_e
+        return await self._run_cached(
+            "recall_entity_direct",
+            self._generation,
+            {
+                "entity_names": entity_names,
+                "tenant_id": self.agent_id,
+                "collection_name": collection_name,
+                "num_entities": len(entity_names),
+                "k": k,
+            },
+        )
 
-        MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(q_e)
-        WHERE EXISTS {
-            MATCH (d)-[:BELONGS_TO]->(:Collection {name: $collection_name, tenant_id: $tenant_id})
-        }
-
-        WITH d, count(DISTINCT q_e) AS matched_count
-        RETURN d.id        AS id,
-               d.content   AS content,
-               d.metadata  AS metadata,
-               d.embedding AS embedding,
-               toFloat(matched_count) / $num_entities AS score
-        ORDER BY score DESC
-        LIMIT $k
-        """
-        async with self._get_session() as session:
-            result = await session.run(
-                cast(LiteralString, query),
-                entity_names=entity_names,
-                tenant_id=self.agent_id,
-                collection_name=collection_name,
-                num_entities=len(entity_names),
-                k=k,
-            )
-            return await result.data()
-
+    @ensure_version
     async def _recall_entity_related(
         self,
         collection_name: str,
@@ -1232,42 +1515,26 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         depth is injected as a literal — Neo4j does not allow parameters in
         variable-length relationship bounds (*min..max).
+
+        Versioned (todo 11, P4): the embedding property read is suffixed with
+        the current generation token (depth is part of the cache key since it
+        is inlined into the compiled Cypher).
         """
-        query = f"""
-        UNWIND $entity_names AS q_name
-        MATCH (q_e:Entity {{tenant_id: $tenant_id}})
-        WHERE q_e.name = q_name
-
-        MATCH path = (q_e)-[:RELATED_TO*1..{depth}]-(r_e:Entity {{tenant_id: $tenant_id}})
-        WHERE NOT r_e.name IN $entity_names
-
-        MATCH (d:Document {{tenant_id: $tenant_id}})-[:MENTIONS]->(r_e)
-        WHERE EXISTS {{
-            MATCH (d)-[:BELONGS_TO]->(:Collection {{name: $collection_name, tenant_id: $tenant_id}})
-        }}
-
-        WITH d, min(length(path)) AS min_hops
-        RETURN d.id        AS id,
-               d.content   AS content,
-               d.metadata  AS metadata,
-               d.embedding AS embedding,
-               $decay ^ min_hops AS score
-        ORDER BY score DESC
-        LIMIT $k
-        """
-        async with self._get_session() as session:
-            result = await session.run(
-                cast(LiteralString, query),
-                entity_names=entity_names,
-                tenant_id=self.agent_id,
-                collection_name=collection_name,
-                decay=decay,
-                k=k,
-            )
-            return await result.data()
+        return await self._run_cached(
+            f"recall_entity_related:{depth}",
+            self._generation,
+            {
+                "entity_names": entity_names,
+                "tenant_id": self.agent_id,
+                "collection_name": collection_name,
+                "decay": decay,
+                "k": k,
+            },
+        )
 
     # ── Phase A④ helper ──────────────────────────────────────────────────────
 
+    @ensure_version
     async def _recall_entity_by_vector(
         self,
         collection_name: str,
@@ -1288,37 +1555,24 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         Only active when `enable_entity_embeddings=True` and entity embeddings
         have been stored during ingestion (requires the embedder to be injected).
+
+        Versioned (todo 11, P4): the embedding property read is suffixed with
+        the current generation token (the entity index itself is not versioned).
         """
-        query = """
-        CALL db.index.vector.queryNodes($index_name, $k, $vector)
-        YIELD node AS ent, score AS ent_score
-        WHERE ent.tenant_id = $tenant_id
-        MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(ent)
-        WHERE EXISTS {
-            MATCH (d)-[:BELONGS_TO]->(:Collection {name: $collection_name, tenant_id: $tenant_id})
-        }
-        WITH d, max(ent_score) AS score
-        RETURN d.id        AS id,
-               d.content   AS content,
-               d.metadata  AS metadata,
-               d.embedding AS embedding,
-               score
-        ORDER BY score DESC
-        LIMIT $k
-        """
-        async with self._get_session() as session:
-            result = await session.run(
-                cast(LiteralString, query),
-                index_name=self._entity_vector_index,
-                k=k,
-                vector=embedding,
-                tenant_id=self.agent_id,
-                collection_name=collection_name,
-            )
-            return await result.data()
+        return await self._run_cached(
+            "recall_entity_by_vector",
+            self._generation,
+            {
+                "k": k,
+                "vector": embedding,
+                "tenant_id": self.agent_id,
+                "collection_name": collection_name,
+            },
+        )
 
     # ── Phase B helper ────────────────────────────────────────────────────────
 
+    @ensure_version
     async def _recall_by_vector(
         self,
         collection_name: str,
@@ -1330,33 +1584,21 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         Phase B: standard HNSW vector search on document embeddings.
         Returns raw Cypher records (dicts) so they can be merged with Phase A results
         before the final conversion to DocumentRecall.
+
+        Versioned (todo 11, P4): the vector index and the embedding property
+        read are suffixed with the current generation token.
         """
-        query = """
-        CALL db.index.vector.queryNodes($index_name, $k_fetch, $vector)
-        YIELD node AS doc, score AS doc_score
-        WHERE doc_score >= $threshold
-          AND EXISTS {
-              MATCH (doc)-[:BELONGS_TO]->(:Collection {name: $collection_name, tenant_id: $tenant_id})
-          }
-        RETURN doc.id        AS id,
-               doc.content   AS content,
-               doc.metadata  AS metadata,
-               doc.embedding AS embedding,
-               doc_score     AS score
-        ORDER BY score DESC
-        LIMIT $k_fetch
-        """
-        async with self._get_session() as session:
-            result = await session.run(
-                cast(LiteralString, query),
-                index_name=self._document_vector_index,
-                k_fetch=k_fetch,
-                vector=embedding,
-                threshold=threshold or 0.0,
-                collection_name=collection_name,
-                tenant_id=self.agent_id,
-            )
-            return await result.data()
+        return await self._run_cached(
+            "recall_by_vector",
+            self._generation,
+            {
+                "k_fetch": k_fetch,
+                "vector": embedding,
+                "threshold": threshold or 0.0,
+                "collection_name": collection_name,
+                "tenant_id": self.agent_id,
+            },
+        )
 
     # ── Merge ─────────────────────────────────────────────────────────────────
 
@@ -1458,19 +1700,16 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         )
         return documents
 
+    @ensure_version
     async def recall_tenant_memory(self, collection_name: str) -> List[DocumentRecall]:
         await self._ensure_connected()
 
         """Retrieves all memory points."""
-        query = """
-        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})<-[:BELONGS_TO]-(d:Document)
-        RETURN d.id AS id, d.content AS content, d.metadata AS metadata, d.embedding AS embedding
-        """
-        async with self._get_session() as session:
-            result = await session.run(
-                cast(LiteralString, query), collection_name=collection_name, tenant_id=self.agent_id,
-            )
-            records = await result.data()
+        records = await self._run_cached(
+            "recall_tenant_memory",
+            self._generation,
+            {"collection_name": collection_name, "tenant_id": self.agent_id},
+        )
 
         documents = []
         for r in records:
@@ -1488,6 +1727,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
     # ========== GET ALL METHODS ==========
 
+    @ensure_version
     async def get_all_tenant_points(
         self,
         collection_name: str,
@@ -1522,17 +1762,11 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
         where_str = " AND ".join(where_clauses)
 
-        query = f"""
-        MATCH (c:Collection)<-[:BELONGS_TO]-(d:Document)
-        WHERE {where_str}
-        RETURN d.id AS id, d.content AS content, d.metadata AS metadata, d.embedding AS embedding
-        SKIP $skip
-        LIMIT $limit
-        """
-
-        async with self._get_session() as session:
-            result = await session.run(cast(LiteralString, query), **params)
-            records = await result.data()
+        records = await self._run_cached(
+            f"get_all_tenant_points:{where_str}",
+            self._generation,
+            params,
+        )
 
         points = []
         for r in records:
@@ -1580,6 +1814,7 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
 
     # ========== SEARCH METHODS ==========
 
+    @ensure_version
     async def search_in_tenant(
         self,
         collection_name: str,
@@ -1593,30 +1828,18 @@ class GraphRAGHandler(BaseVectorDatabaseHandler):
         """Direct vector search (without expansion)."""
         await self._ensure_connected()
 
-        search_query = """
-        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
-        CALL db.index.vector.queryNodes($index_name, $limit, $vector)
-        YIELD node, score
-        WHERE EXISTS { MATCH (node)-[:BELONGS_TO]->(c) }
-          AND score >= $threshold
-        RETURN node.id AS id, node.content AS content, node.metadata AS metadata, 
-               node.embedding AS embedding, score
-        ORDER BY score DESC
-        LIMIT $limit
-        """
+        records = await self._run_cached(
+            "search_in_tenant",
+            self._generation,
+            {
+                "collection_name": collection_name,
+                "tenant_id": self.agent_id,
+                "vector": query_vector,
+                "limit": limit,
+                "threshold": score_threshold or 0.0,
+            },
+        )
 
-        async with self._get_session() as session:
-            result = await session.run(
-                cast(LiteralString, search_query),
-                collection_name=collection_name,
-                tenant_id=self.agent_id,
-                index_name=self._document_vector_index,
-                vector=query_vector,
-                limit=limit,
-                threshold=score_threshold or 0.0,
-            )
-            records = await result.data()
-            
         scored_points = []
         for r in records:
             metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
