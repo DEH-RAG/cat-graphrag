@@ -1157,6 +1157,173 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         except Exception as e:
             log.error(f"Failed to extract entities for {document_id}: {e}")
 
+    async def refresh_technology_entities(self, tenant_id: str) -> None:
+        """
+        Refreshes the Technology-entity subgraph for a single tenant.
+
+        Re-runs ``extract_technologies_regex`` (pure regex — no spaCy NER) over
+        the stored ``Document`` contents of *tenant_id* and reconciles the
+        graph: MERGE Technology entities + MENTIONS edges for newly matched
+        terms, delete MENTIONS edges to Technology entities that are no longer
+        matched, and prune Technology Entity nodes that lost their last MENTION.
+
+        Graph-only: no re-ingest, no re-embed, no full wipe. Idempotent —
+        re-running with the same patterns is a no-op. All queries are filtered
+        by ``tenant_id`` so other agents' graphs are never touched.
+        """
+        if not self._entity_extractor:
+            return
+
+        # 1. Fetch every stored Document of this tenant (content = page_content).
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                result = await session.run(
+                    cast(
+                        LiteralString,
+                        """
+                        MATCH (d:Document {tenant_id: $tenant_id})
+                        RETURN d.id AS id, d.content AS content
+                        """,
+                    ),
+                    tenant_id=tenant_id,
+                )
+                docs = [
+                    (record["id"], record["content"] or "")
+                    async for record in result
+                ]
+
+        if not docs:
+            return
+
+        # 2. Re-run the regex technology extraction per document (no spaCy).
+        #    Terms are deduplicated per doc (a term may match several patterns).
+        doc_terms: Dict[str, List[str]] = {}
+        for doc_id, content in docs:
+            seen: set = set()
+            unique: List[str] = []
+            for term in self._entity_extractor.extract_technologies_regex(content):
+                name = term.name.lower().strip()
+                if name not in seen:
+                    seen.add(name)
+                    unique.append(name)
+            doc_terms[doc_id] = unique
+
+        # 3. Build batch payloads (entity nodes + MENTIONS edges + per-doc
+        #    current entity-id sets for stale-edge removal).
+        entities_batch: List[Dict] = []
+        mentions_batch: List[Dict] = []
+        doc_terms_payload: List[Dict] = []
+        entities_by_id: Dict[str, Dict] = {}
+        mentions_seen: set = set()
+        for doc_id, terms in doc_terms.items():
+            entity_ids: List[str] = []
+            for term in terms:
+                entity_id = self._entity_extractor.get_entity_hash(
+                    term, EntityType.TECHNOLOGY, tenant_id
+                )
+                entity_ids.append(entity_id)
+                entities_by_id.setdefault(entity_id, {
+                    "id":        entity_id,
+                    "name":      term,
+                    "type":      EntityType.TECHNOLOGY.value,
+                    # Serialise to JSON string: Neo4j does not support Map-type
+                    # node properties (only primitives / arrays are allowed).
+                    "metadata":  json.dumps({"source_document": doc_id, "confidence": 0.85}),
+                    "embedding": None,  # no re-embed during a terminology refresh
+                })
+                mention_key = (doc_id, entity_id)
+                if mention_key not in mentions_seen:
+                    mentions_seen.add(mention_key)
+                    mentions_batch.append({
+                        "doc_id":     doc_id,
+                        "entity_id":  entity_id,
+                        "confidence": 0.85,
+                    })
+            doc_terms_payload.append({
+                "doc_id":     doc_id,
+                "entity_ids": sorted(set(entity_ids)),
+            })
+
+        entities_batch = sorted(entities_by_id.values(), key=lambda e: e["id"])
+        mentions_batch.sort(key=lambda m: (m["doc_id"], m["entity_id"]))
+
+        # 4. Write in a single managed write transaction (auto-retried by the
+        #    driver on TransientError), capped by the shared write semaphore.
+        batch_entity_query = """
+        UNWIND $entities AS ent
+        MERGE (e:Entity {id: ent.id, tenant_id: $tenant_id})
+        ON CREATE SET
+            e.name       = ent.name,
+            e.type       = ent.type,
+            e.created_at = datetime(),
+            e.metadata   = ent.metadata,
+            e.embedding  = ent.embedding
+        ON MATCH SET
+            e.last_seen  = datetime(),
+            e.embedding  = CASE WHEN ent.embedding IS NOT NULL THEN ent.embedding ELSE e.embedding END
+        """
+
+        batch_mention_query = """
+        UNWIND $mentions AS m
+        MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+        MERGE (d)-[r:MENTIONS]->(e)
+        ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
+        ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
+        """
+
+        # Remove MENTIONS edges from each doc to Technology entities that are no
+        # longer matched by the current patterns. Only TECHNOLOGY-typed entities
+        # are touched — other entity types (and their MENTIONS) are preserved.
+        delete_stale_mentions_query = """
+        UNWIND $doc_terms AS d
+        MATCH (doc:Document {id: d.doc_id, tenant_id: $tenant_id})
+        MATCH (doc)-[r:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
+        WHERE e.type = 'TECHNOLOGY' AND NOT e.id IN d.entity_ids
+        DELETE r
+        """
+
+        # Prune Technology Entity nodes that lost their last MENTION (mirrors the
+        # orphan logic in _drop_tenant_data_in_session, restricted to TECHNOLOGY).
+        prune_orphan_tech_query = """
+        MATCH (e:Entity {tenant_id: $tenant_id, type: 'TECHNOLOGY'})
+        WHERE NOT (e)<-[:MENTIONS]-()
+        DETACH DELETE e
+        """
+
+        async def _write_refresh(tx):
+            if entities_batch:
+                await tx.run(
+                    cast(LiteralString, batch_entity_query),
+                    entities=entities_batch,
+                    tenant_id=tenant_id,
+                )
+            if mentions_batch:
+                await tx.run(
+                    cast(LiteralString, batch_mention_query),
+                    mentions=mentions_batch,
+                    tenant_id=tenant_id,
+                )
+            await tx.run(
+                cast(LiteralString, delete_stale_mentions_query),
+                doc_terms=doc_terms_payload,
+                tenant_id=tenant_id,
+            )
+            await tx.run(
+                cast(LiteralString, prune_orphan_tech_query),
+                tenant_id=tenant_id,
+            )
+
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                await session.execute_write(_write_refresh)
+
+        log.info(
+            f"[GraphRAG] Refreshed Technology entities for tenant_id={tenant_id} "
+            f"({len(entities_batch)} entities, {len(mentions_batch)} mentions)"
+        )
+
+    @retry_on_generation_change
     async def _create_similarity_relationships(self, point_id: str, vector: List[float], collection_name: str):
         """
         Creates bidirectional SIMILAR_TO relationships between similar documents.
