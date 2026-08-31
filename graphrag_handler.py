@@ -99,6 +99,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # lock is unavailable (see the module-level try/except import).
         self._reembed_lock = asyncio.Lock()
 
+        # Lazy embedder-alignment guard: the embedder is injected by the
+        # plugin hooks AFTER the core bootstrap, so initialize() cannot rely
+        # on it. The first post-hook read/ingestion path performs the
+        # alignment (index-dims fix or shadow re-embed) exactly once.
+        self._alignment_lock = asyncio.Lock()
+        self._alignment_done = False
+
         # Versioned-schema state (todo 11, P4): the generation token read from
         # (:Epoch {tenant_id, generation}), the resolved version-suffixed names,
         # and the per-generation compiled-query cache {query_key: {gen: cypher}}.
@@ -751,6 +758,95 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"Advanced GraphRAG initialized "
             f"(embedder={embedder_name}, dims={embedder_size})"
         )
+
+    async def _align_embedder_lazy(self) -> None:
+        """Align the versioned schema with the current embedder, once per handler.
+
+        The core bootstraps the handler and calls ``initialize()`` BEFORE the
+        plugin hooks inject ``self._embedder``, so any embedder-change detection
+        inside ``initialize()`` cannot run a shadow re-embed (it would skip with
+        "no embedder injected"). This method is invoked from the plugin hooks
+        (first recall / first ingestion) when the embedder IS available, and it
+        is idempotent: it runs at most once per handler instance.
+
+        Two distinct misalignments are repaired:
+
+        - *Index dimension mismatch only* (vectors already at the right size,
+          but the versioned HNSW index was created at an older dimensionality —
+          Neo4j vector indexes are immutable, so `IF NOT EXISTS` is a silent
+          no-op): drop the stale versioned index and recreate it at
+          ``embedder.size``. No re-embed is needed because the vectors are
+          already correct.
+
+        - *Embedder name/size mismatch* (the collections were embedded with a
+          different model, so even right-dimensioned vectors live in the wrong
+          vector space): run the seamless shadow-swap ``reembed_tenant``, which
+          builds ``embedding_v2``/``document_embeddings_v2``/``SIMILAR_TO_v2``
+          first, then flips the Epoch token so readers atomically move from the
+          v1 to the v2 set.
+        """
+        embedder = self._embedder
+        if embedder is None or not getattr(self, "agent_id", None):
+            # Nothing to align against; the build/read paths will lazily ensure
+            # the index exists at initialize()-time defaults.
+            return
+
+        async with self._alignment_lock:
+            if self._alignment_done:
+                return
+            try:
+                gen = await self._read_generation()
+                if gen != self._generation:
+                    self._rebuild_for_generation(gen)
+                names = self._names
+
+                async with self._get_session() as session:
+                    # 1) Versioned index dimension check (the current
+                    #    generation's index is what read paths actually use).
+                    index_dims = await self._get_index_dimensions(session, names["index"])
+                    # 2) Embedder metadata stored on the tenant's collections.
+                    name_mismatch = False
+                    for collection_name in self._collection_names:
+                        stored = await self._get_collection_embedder_config(
+                            session, collection_name
+                        )
+                        if stored is not None:
+                            stored_name, stored_size = stored
+                            if stored_name != embedder.name or stored_size != embedder.size:
+                                name_mismatch = True
+                                break
+
+                if index_dims is not None and index_dims != embedder.size:
+                    log.warning(
+                        f"[GraphRAG] Versioned index {names['index']} has "
+                        f"{index_dims} dims but embedder is {embedder.size}; "
+                        "dropping and recreating it (vectors already correct)."
+                    )
+                    async with self._get_session() as session:
+                        await session.run(
+                            cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                        )
+                        await self._ensure_vector_index_in_session(
+                            session, names["index"], names["embedding_prop"], embedder.size
+                        )
+
+                if name_mismatch:
+                    log.warning(
+                        f"[GraphRAG] Embedder change detected for tenant "
+                        f"{self.agent_id} (collections stored embedder differs "
+                        f"from {embedder.name} @ {embedder.size}); running "
+                        "seamless shadow-swap re-embed."
+                    )
+                    await self.reembed_tenant(self.agent_id, embedder)
+
+            except Exception as e:
+                # Do not block the read/ingestion path on alignment failures;
+                # a subsequent call will retry (the flag stays False).
+                log.error(f"[GraphRAG] Lazy embedder alignment failed: {e}")
+                return
+            finally:
+                if not self._alignment_done:
+                    self._alignment_done = True
 
     async def close(self):
         # Cancel and clean up all pending entity tasks

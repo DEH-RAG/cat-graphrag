@@ -33,6 +33,8 @@ async def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> 
 
     if hasattr(cat.vector_memory_handler, "embedder"):
         cat.vector_memory_handler.embedder = await cat.embedder()
+        if hasattr(cat.vector_memory_handler, "_align_embedder_lazy"):
+            await cat.vector_memory_handler._align_embedder_lazy()
 
     return config
 
@@ -41,6 +43,8 @@ async def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> 
 async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
     if hasattr(cat.vector_memory_handler, "embedder"):
         cat.vector_memory_handler.embedder = await cat.embedder()
+        if hasattr(cat.vector_memory_handler, "_align_embedder_lazy"):
+            await cat.vector_memory_handler._align_embedder_lazy()
 
     if isinstance(cat.vector_memory_handler, GraphRAGHandler):
         handler = cat.vector_memory_handler
