@@ -727,13 +727,34 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if gen != self._generation:
                 self._rebuild_for_generation(gen)
             names = self._names
+            # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
+            # is a silent NO-OP when the index already exists at an OLD
+            # dimensionality. The versioned index is the one all read paths
+            # actually use (find_similar / recall), so repair it synchronously
+            # HERE at boot — before any ingestion worker can race ahead and
+            # hit the dimension mismatch. embedder_size is a plain parameter,
+            # it does not require the embedder object (injected later by hooks).
+            v_index_dims = await self._get_index_dimensions(session, names["index"])
+            if v_index_dims is not None and v_index_dims != embedder_size:
+                log.warning(
+                    f"[GraphRAG] Versioned index {names['index']} has "
+                    f"{v_index_dims} dims but embedder is {embedder_size}; "
+                    "dropping and recreating it at boot (vectors already "
+                    "correct, no re-embed needed)."
+                )
+                await session.run(
+                    cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                )
             await self._ensure_vector_index_in_session(
                 session, names["index"], names["embedding_prop"], embedder_size
             )
             # Backfill: copy the legacy unversioned `embedding` property into the
-            # current generation's property for existing documents that lack it.
-            # (The driver suppresses the 01N52 "property does not exist" GQL
-            # warning on a fresh database, so the IS NOT NULL filter is safe.)
+            # current generation's property for existing documents that lack it,
+            # BUT only when the stored vector already matches the embedder dims
+            # (a stale pre-change vector in the index property would poison the
+            # vector index). (The driver suppresses the 01N52 "property does not
+            # exist" GQL warning on a fresh database, so the IS NOT NULL filter
+            # is safe.)
             await session.run(
                 cast(
                     LiteralString,
@@ -741,10 +762,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     MATCH (d:Document {{tenant_id: $tenant_id}})
                     WHERE d.embedding IS NOT NULL
                       AND d.{names["embedding_prop"]} IS NULL
+                      AND size(d.embedding) = $dims
                     SET d.{names["embedding_prop"]} = d.embedding
                     """,
                 ),
                 tenant_id=self.agent_id,
+                dims=embedder_size,
             )
 
         # Create / update collections — always store current embedder metadata.
