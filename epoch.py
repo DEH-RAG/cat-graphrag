@@ -32,6 +32,7 @@ class EpochMixin:
         an empty string.
         """
         tenant_id = tenant_id or self.agent_id
+        await self._ensure_connected()
         async with self._get_session() as session:
             result = await session.run(
                 cast(
@@ -57,6 +58,7 @@ class EpochMixin:
 
     async def _set_generation(self, tenant_id: str, gen: str) -> None:
         """Atomically set the tenant's generation token (single MERGE SET)."""
+        await self._ensure_connected()
         async with self._get_session() as session:
             await session.run(
                 cast(
@@ -102,6 +104,7 @@ class EpochMixin:
         Returns the full result rows (``result.data()``).
         """
         query = self._compile_query(key, gen)
+        await self._ensure_connected()
         async with self._get_session() as session:
             result = await session.run(cast(LiteralString, query), **params)
             return await result.data()
