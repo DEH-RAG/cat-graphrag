@@ -2262,12 +2262,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def _llm_extract_relations(
         self, text: str, stray_cat
     ) -> List[Dict[str, str]]:
-        safe_text = text.replace("{", "{{").replace("}", "}}")
-
         # Use the per-agent prompt from settings; fall back to the built-in
-        # default when it is not configured (None / empty).
+        # default when it is not configured (None / empty). The document text
+        # is concatenated after the prompt (no {text} placeholder anymore).
+        # Prompts saved while the placeholder still existed are handled too.
         prompt_template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_PROMPT
-        full_prompt = prompt_template.replace("{text}", safe_text)
+        if "{text}" in prompt_template:
+            full_prompt = prompt_template.replace("{text}", text)
+        else:
+            full_prompt = f"{prompt_template}\n{text}"
 
         agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
         agent_output = await stray_cat.agentic_workflow.run(
@@ -2389,8 +2392,7 @@ EVIDENCE_FOR = supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
 Only extract relations that are explicitly stated or clearly implied in the text.
 Return ONLY a valid JSON array of objects, with no additional text. If nothing matches return [].
 
-Text:
-{text}"""
+Text:"""
 
 
 class Neo4jGraphRAGConfig(VectorDatabaseSettings):
@@ -2442,7 +2444,7 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         default=CONCEPT_RELATIONS_EXTRACTION_PROMPT,
         description=(
             "Prompt template sent to the LLM to extract concept relations. "
-            "The '{text}' placeholder is replaced with the ingested document text. "
+            "The ingested document text is appended after the prompt. "
             "Leave empty to use the built-in default."
         ),
     )
