@@ -58,6 +58,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         connection_pool_size: int = 50,
         enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
+        concept_relations_prompt: str | None = None,
         enable_knowledge_graph: bool = False,
         enable_student_knowledge_graph: bool = False,
         save_memory_snapshots: bool = False,
@@ -82,6 +83,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._connection_pool_size=connection_pool_size
         self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
+        self._concept_relations_prompt = concept_relations_prompt
         self._enable_knowledge_graph = enable_knowledge_graph
         self._enable_student_knowledge_graph = enable_student_knowledge_graph
 
@@ -2262,7 +2264,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     ) -> List[Dict[str, str]]:
         safe_text = text.replace("{", "{{").replace("}", "}}")
 
-        full_prompt = CONCEPT_RELATIONS_EXTRACTION_PROMPT.replace("{text}", safe_text)
+        # Use the per-agent prompt from settings; fall back to the built-in
+        # default when it is not configured (None / empty).
+        prompt_template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_PROMPT
+        full_prompt = prompt_template.replace("{text}", safe_text)
 
         agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
         agent_output = await stray_cat.agentic_workflow.run(
@@ -2432,6 +2437,14 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     enable_concept_relations: bool = Field(
         default=False,
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
+    )
+    concept_relations_prompt: str = Field(
+        default=CONCEPT_RELATIONS_EXTRACTION_PROMPT,
+        description=(
+            "Prompt template sent to the LLM to extract concept relations. "
+            "The '{text}' placeholder is replaced with the ingested document text. "
+            "Leave empty to use the built-in default."
+        ),
     )
     enable_knowledge_graph: bool = Field(
         default=False,
