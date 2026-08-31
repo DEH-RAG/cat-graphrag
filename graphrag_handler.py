@@ -782,6 +782,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"(embedder={embedder_name}, dims={embedder_size})"
         )
 
+    # NOTE (2026-08-31): this whole method is a CANDIDATE FOR REMOVAL.
+    # The boot-time repair in initialize() (versioned index dims vs
+    # embedder_size) already covers the dimension-mismatch case this lazy
+    # path was originally built for, and the embedder setting is GLOBAL /
+    # system-level (DEFAULT_SYSTEM_KEY) — so the multi-tenant ping-pong
+    # worry that justified the safety net is unfounded. The only remaining
+    # value would be handling a RUNTIME global embedder change (shadow
+    # re-embed v1->v2), which is arguably better delegated to the core's
+    # BillTheLizard.reembed_all. Keep until that is settled; see Hindsight
+    # "Remove lazy embedder alignment path? — pending decision".
     async def _align_embedder_lazy(self) -> None:
         """Align the versioned schema with the current embedder, once per handler.
 
