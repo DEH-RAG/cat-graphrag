@@ -963,13 +963,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         DETACH DELETE c, d
         """
         # Step 2: delete entities that are now unreferenced (no more MENTIONS
-        # from any document, across all collections for this tenant).
+        # from any document, across all collections for this tenant, and no
+        # remaining PROVENANCE edge — which also covers CONCEPT entities that
+        # never carry MENTIONS edges).
         # DETACH is required because the entity may still carry other
         # relationship types (RELATED_TO, CO_OCCURS_WITH, CONCEPT_RELATION, etc.)
         # that are not captured by the MENTIONS check.
         delete_orphan_entities_query = """
         MATCH (e:Entity {tenant_id: $tenant_id})
-        WHERE NOT (e)<-[:MENTIONS]-()
+        WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
         DETACH DELETE e
         """
         # Step 3: delete orphaned SourceFile nodes with no remaining PART_OF.
@@ -1172,9 +1174,38 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
         MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
         MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
-        ON CREATE SET r.weight = rel.weight, r.created_at = datetime()
-        ON MATCH SET  r.weight = (r.weight + rel.weight) / 2
+        ON CREATE SET
+            r.weight = rel.weight,
+            r.created_at = datetime(),
+            r.source_files = rel.source_files
+        ON MATCH SET
+            r.weight = (r.weight + rel.weight) / 2,
+            r.source_files = CASE
+                WHEN rel.source_files IS NULL THEN r.source_files
+                WHEN r.source_files IS NULL THEN rel.source_files
+                ELSE [x IN r.source_files WHERE NOT x IN rel.source_files] + rel.source_files
+            END
         """
+
+        # File-provenance edges: every entity created from this document's
+        # content gets a (Document)-[:PROVENANCE]->(Entity) edge, so a file
+        # deletion cascade can prune the entity exactly when ALL documents
+        # that referenced it are gone. `tracked_by_provenance` marks the
+        # entity as provenance-managed (legacy entities created before this
+        # migration are left untouched by the prune).
+        batch_provenance_query = """
+        UNWIND $mentions AS m
+        MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
+        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+        MERGE (d)-[:PROVENANCE]->(e)
+        SET e.tracked_by_provenance = true
+        """
+
+        # Which file produced this document? Used for the per-edge provenance
+        # list on RELATED_TO relations (None for non-file memories such as
+        # episodic points, which are never wiped per-source).
+        _doc_source = (metadata or {}).get("source")
+        _source_files = [_doc_source] if _doc_source else None
 
         try:
             extracted = await self._entity_extractor.extract(content, document_id, metadata)
@@ -1244,6 +1275,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         "target_id": target_id,
                         "rel_type":  relation.relation_type,
                         "weight":    relation.weight,
+                        "source_files": _source_files,
                     }
             relations_batch = list(rel_map.values())
 
@@ -1266,6 +1298,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 await tx.run(
                     cast(LiteralString, batch_mention_query),
+                    mentions=mentions_batch,
+                    doc_id=document_id,
+                    tenant_id=self.agent_id,
+                )
+                await tx.run(
+                    cast(LiteralString, batch_provenance_query),
                     mentions=mentions_batch,
                     doc_id=document_id,
                     tenant_id=self.agent_id,
@@ -1403,6 +1441,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
         """
 
+        # File-provenance edges for the (re-)matched Technology entities, so
+        # they participate in the per-source deletion cascade like NER/CONCEPT
+        # entities do.
+        batch_provenance_query = """
+        UNWIND $mentions AS m
+        MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+        MERGE (d)-[:PROVENANCE]->(e)
+        SET e.tracked_by_provenance = true
+        """
+
         # Remove MENTIONS edges from each doc to Technology entities that are no
         # longer matched by the current patterns. Only TECHNOLOGY-typed entities
         # are touched — other entity types (and their MENTIONS) are preserved.
@@ -1435,6 +1484,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     mentions=mentions_batch,
                     tenant_id=tenant_id,
                 )
+                await tx.run(
+                    cast(LiteralString, batch_provenance_query),
+                    mentions=mentions_batch,
+                    tenant_id=tenant_id,
+                )
             await tx.run(
                 cast(LiteralString, delete_stale_mentions_query),
                 doc_terms=doc_terms_payload,
@@ -1453,6 +1507,200 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"[GraphRAG] Refreshed Technology entities for tenant_id={tenant_id} "
             f"({len(entities_batch)} entities, {len(mentions_batch)} mentions)"
         )
+
+    async def recompute_provenance(self, tenant_id: str | None = None) -> None:
+        """One-time backfill of provenance metadata for legacy (pre-migration) data.
+
+        Idempotent migration for tenants whose entities/relations were created
+        before the PROVENANCE / ``source_files`` tracking existed. It derives
+        the missing metadata from the graph itself — NO re-ingest, NO re-embed,
+        NO LLM calls:
+
+          Phase A (one query): create ``(Document)-[:PROVENANCE]->(Entity)``
+            edges from the existing ``MENTIONS`` edges and set
+            ``tracked_by_provenance`` on the entities (legacy documents
+            already carry MENTIONS from the original ingestion).
+          Phase B (python): backfill ``source_files`` on ``RELATED_TO`` edges
+            that lack it, derived from the source files of the documents that
+            MENTION BOTH endpoints (the same co-mention signal that produced
+            the relation).
+          Phase C (one query): unprovenanced ``CONCEPT`` entities (they never
+            receive MENTIONS edges) are linked as provenance of the documents
+            whose content mentions their name (>= 3 chars, to keep the match
+            meaningful).
+
+        Finally sets the ``provenance_reconciled`` marker on every Collection
+        of the tenant, so subsequent boots skip it with a single count query.
+        Safe to run at boot for every agent — self-skips non-legacy tenants.
+        """
+        tenant_id = tenant_id or self.agent_id
+        await self._ensure_connected()
+
+        # ── Fast-path: already reconciled → single cheap count → skip ──
+        async with self._get_session() as session:
+            result = await session.run(
+                cast(
+                    LiteralString,
+                    """
+                    MATCH (c:Collection {tenant_id: $tenant_id})
+                    RETURN count(c) AS total,
+                           sum(CASE WHEN c.provenance_reconciled = true THEN 1 ELSE 0 END) AS done
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            rec = await result.single()
+            total = rec["total"] if rec else 0
+            done = rec["done"] if rec else 0
+            if total == 0:
+                log.debug(f"[GraphRAG] Provenance: no collections for {tenant_id}, skip")
+                return
+            if done == total:
+                log.debug(f"[GraphRAG] Provenance already reconciled for {tenant_id}")
+                return
+
+        # ── Phase A: derive PROVENANCE edges from existing MENTIONS ──────
+        try:
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
+                            MERGE (d)-[:PROVENANCE]->(e)
+                            SET e.tracked_by_provenance = true
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+
+                    # ── Phase C: CONCEPT entities ← documents citing their name ──
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (e:Entity {tenant_id: $tenant_id, type: 'CONCEPT'})
+                            WHERE NOT (e)<-[:PROVENANCE]-()
+                            WITH e, toLower(e.name) AS lname
+                            WHERE size(lname) >= 3
+                            MATCH (d:Document {tenant_id: $tenant_id})
+                            WHERE toLower(d.content) CONTAINS lname
+                            MERGE (d)-[:PROVENANCE]->(e)
+                            SET e.tracked_by_provenance = true
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+
+        except Exception as e:
+            log.error(f"[GraphRAG] Provenance phases A/C failed for {tenant_id}: {e}")
+            return
+
+        # ── Phase B: backfill source_files on legacy RELATED_TO edges ─────
+        try:
+            async with self._get_session() as session:
+                result = await session.run(
+                    cast(
+                        LiteralString,
+                        """
+                        MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
+                        WHERE r.source_files IS NULL
+                        RETURN s.id AS s, t.id AS t
+                        """,
+                    ),
+                    tenant_id=tenant_id,
+                )
+                legacy_edges = [(rec["s"], rec["t"]) async for rec in result]
+
+            if legacy_edges:
+                async with self._get_session() as session:
+                    # Document id → source file (metadata is a JSON string).
+                    result = await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (d:Document {tenant_id: $tenant_id})
+                            RETURN d.id AS id, d.metadata AS metadata
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+                    doc_sources: Dict[str, str] = {}
+                    async for rec in result:
+                        try:
+                            meta = json.loads(rec["metadata"])
+                            src = meta.get("source")
+                            if src:
+                                doc_sources[rec["id"]] = str(src)
+                        except (TypeError, ValueError):
+                            continue  # metadata not a JSON string / unparsable
+
+                    # Entity id → set of documents that MENTION it.
+                    result = await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
+                            RETURN d.id AS did, e.id AS eid
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+                    entity_docs: Dict[str, set] = {}
+                    async for rec in result:
+                        entity_docs.setdefault(rec["eid"], set()).add(rec["did"])
+
+                # Provenance of an edge = files of the docs mentioning both ends.
+                edge_payload = []
+                for s_id, t_id in legacy_edges:
+                    common = entity_docs.get(s_id, set()) & entity_docs.get(t_id, set())
+                    files = sorted({doc_sources[did] for did in common if did in doc_sources})
+                    if files:
+                        edge_payload.append({"s": s_id, "t": t_id, "files": files})
+                edge_payload.sort(key=lambda e: (e["s"], e["t"]))  # lock ordering
+
+                if edge_payload:
+                    async with self._neo4j_write_semaphore:
+                        async with self._get_session() as session:
+                            await session.run(
+                                cast(
+                                    LiteralString,
+                                    """
+                                    UNWIND $edges AS e
+                                    MATCH (s:Entity {id: e.s, tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {id: e.t, tenant_id: $tenant_id})
+                                    WHERE r.source_files IS NULL
+                                    SET r.source_files = e.files
+                                    """,
+                                ),
+                                edges=edge_payload,
+                                tenant_id=tenant_id,
+                            )
+                    log.info(
+                        f"[GraphRAG] Provenance: backfilled source_files on "
+                        f"{len(edge_payload)} RELATED_TO edges for {tenant_id}"
+                    )
+        except Exception as e:
+            log.error(f"[GraphRAG] Provenance phase B failed for {tenant_id}: {e}")
+            return
+
+        # ── Mark the tenant as reconciled ────────────────────────────────
+        try:
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (c:Collection {tenant_id: $tenant_id})
+                            SET c.provenance_reconciled = true
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+            log.info(f"[GraphRAG] Provenance reconciled for tenant_id={tenant_id}")
+        except Exception as e:
+            log.error(f"[GraphRAG] Provenance marker failed for {tenant_id}: {e}")
 
     @retry_on_generation_change
     async def _create_similarity_relationships(self, point_id: str, vector: List[float], collection_name: str):
@@ -1567,8 +1815,42 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         DETACH DELETE d
         """
 
+        # ── File-deletion cascade (provenance-based graph cleanup) ──────────
+        # The core deletes points per-source with metadata {"source": <name>}.
+        # 1. Strip the deleted source from each RELATED_TO edge's provenance
+        #    list, then delete the edges whose list becomes empty (the relation
+        #    existed only because of this file).
+        # 2. Prune entities that lost ALL their provenance edges. Only
+        #    provenance-tracked entities are touched, so legacy entities
+        #    created before this migration are never wiped by mistake.
+        source = (metadata or {}).get("source")
+
         async with self._get_session() as session:
             await (await session.run(cast(LiteralString, query), **params)).consume()
+
+            if source:
+                await session.run(
+                    """
+                    MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
+                    WHERE r.source_files IS NOT NULL AND $source IN r.source_files
+                    SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                    WITH r
+                    WHERE size(r.source_files) = 0
+                    DELETE r
+                    """,
+                    source=source,
+                    tenant_id=self.agent_id,
+                )
+
+            await session.run(
+                """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE e.tracked_by_provenance = true
+                  AND NOT (e)<-[:PROVENANCE]-()
+                DETACH DELETE e
+                """,
+                tenant_id=self.agent_id,
+            )
 
         async with self._get_session() as session:
             await session.run(
@@ -1594,7 +1876,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         orphan_query = """
         MATCH (e:Entity {tenant_id: $tenant_id})
-        WHERE NOT (e)<-[:MENTIONS]-()
+        WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
         DETACH DELETE e
         """
         orphan_sf_query = """
@@ -2383,7 +2665,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not relations:
             return
 
-        await self._store_concept_relations(tenant_id, relations)
+        # Every concept created from this source is provenance-linked to the
+        # documents (the file's chunks) that produced it, so the deletion
+        # cascade can prune it when ALL of them are gone.
+        document_ids = [p.id for p in stored_points if getattr(p, "id", None)]
+
+        await self._store_concept_relations(
+            tenant_id, relations, source=source, document_ids=document_ids
+        )
         log.info(
             f"[GraphRAG] Stored {len(relations)} concept relations for '{source}'"
         )
@@ -2453,10 +2742,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         return result
 
     async def _store_concept_relations(
-        self, tenant_id: str, relations: List[Dict[str, str]]
+        self,
+        tenant_id: str,
+        relations: List[Dict[str, str]],
+        source: str | None = None,
+        document_ids: List[str] | None = None,
     ) -> None:
         if not relations:
             return
+
+        source_files = [source] if source else None
 
         async with self._get_session() as session:
             for rel in relations:
@@ -2481,11 +2776,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         MERGE (s:Entity {tenant_id: $tenant_id, name: $subject})
                         SET s.id = coalesce(s.id, $subject_id)
                         SET s.type = coalesce(s.type, 'CONCEPT')
+                        SET s.tracked_by_provenance = true
                         MERGE (t:Entity {tenant_id: $tenant_id, name: $object})
                         SET t.id = coalesce(t.id, $object_id)
                         SET t.type = coalesce(t.type, 'CONCEPT')
+                        SET t.tracked_by_provenance = true
                         MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                         SET r.weight = coalesce(r.weight, 1.0) + 0.5
+                        SET r.source_files = CASE
+                            WHEN $source_files IS NULL THEN r.source_files
+                            WHEN r.source_files IS NULL THEN $source_files
+                            ELSE [x IN r.source_files WHERE NOT x IN $source_files] + $source_files
+                        END
                         """,
                         tenant_id=tenant_id,
                         subject=subject,
@@ -2493,7 +2795,27 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         object=object_,
                         object_id=object_id,
                         rel_type=rel_type,
+                        source_files=source_files,
                     )
+
+                    # PROVENANCE edges from every producing document to both
+                    # concept entities (concepts carry no MENTIONS edges, so
+                    # the provenance is what makes them deletable).
+                    if document_ids:
+                        await session.run(
+                            """
+                            UNWIND $doc_ids AS did
+                            MATCH (d:Document {id: did, tenant_id: $tenant_id})
+                            MATCH (s:Entity {tenant_id: $tenant_id, name: $subject})
+                            MATCH (t:Entity {tenant_id: $tenant_id, name: $object})
+                            MERGE (d)-[:PROVENANCE]->(s)
+                            MERGE (d)-[:PROVENANCE]->(t)
+                            """,
+                            doc_ids=document_ids,
+                            tenant_id=tenant_id,
+                            subject=subject,
+                            object=object_,
+                        )
                 except Exception as e:
                     log.warning(
                         f"[GraphRAG] Failed to store relation "
