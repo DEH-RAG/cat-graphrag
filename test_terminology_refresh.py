@@ -208,6 +208,7 @@ class _FakeGraph:
         self.documents = {}   # (tenant_id, doc_id) -> content
         self.entities = {}    # (tenant_id, entity_id) -> {"name", "type"}
         self.mentions = set()  # (tenant_id, doc_id, entity_id)
+        self.provenance = set()  # (tenant_id, doc_id, entity_id)
         self.similar_to = set()  # (tenant_id, doc_a, doc_b)
 
     def add_document(self, tenant, doc_id, content):
@@ -291,6 +292,14 @@ class _FakeSession:
         if "MERGE (d)-[r:MENTIONS]->(e)" in q:
             for m in params.get("mentions", []):
                 self.graph.mentions.add((tenant, m["doc_id"], m["entity_id"]))
+            return _FakeResult([])
+
+        # 3b. MERGE PROVENANCE edges (file-deletion tracking, added to the
+        #     same documents/entities as the MENTIONS batch).
+        if "MERGE (d)-[:PROVENANCE]->(e)" in q:
+            for m in params.get("mentions", []):
+                doc_id = m.get("doc_id") or params.get("doc_id")
+                self.graph.provenance.add((tenant, doc_id, m["entity_id"]))
             return _FakeResult([])
 
         # 4. Delete stale MENTIONS edges to Technology entities no longer matched.
