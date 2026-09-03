@@ -1045,13 +1045,23 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector_list = list(vector)
 
         # ── Guard: zero / non-finite embedding vector ─────────────────────────
-        if not self._is_valid_vector(vector_list):
+        # Qdrant (and other dense stores) cannot hold a point without a valid
+        # vector, so they must drop it. The Neo4j graph, instead, CAN: the
+        # versioned schema keeps `embedding_{gen}` OPTIONAL on :Document, the
+        # vector index simply ignores nodes without it, and the graph relations
+        # (MENTIONS / RELATED_TO / PROVENANCE) still make the chunk reachable.
+        # A failed/cold embedder (zero-vector fallback) must therefore NOT lose
+        # the chunk: we store it without the embedding and let the re-embed /
+        # backfill phase set the vector later.
+        vector_valid = self._is_valid_vector(vector_list)
+        if not vector_valid:
             log.warning(
-                f"[GraphRAG] Skipping point {point_id}: embedding vector has zero or "
-                "non-finite L2-norm. The embedder may have returned a fallback zero "
-                "tensor (e.g. empty input, cold-start failure, or unreachable model)."
+                f"[GraphRAG] Storing point {point_id} WITHOUT embedding: "
+                "embedding vector has zero or non-finite L2-norm. The embedder may "
+                "have returned a fallback zero tensor (e.g. empty input, cold-start "
+                "failure, or unreachable model). The chunk is kept (graph relations "
+                "still find it) and the embedding can be backfilled later."
             )
-            return None
 
         metadata = metadata or {}
         metadata["tenant_id"] = self.agent_id
@@ -1072,12 +1082,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             self._rebuild_for_generation(gen)
         embedding_prop = self._names["embedding_prop"]
 
+        # The embedding property is set ONLY when the vector is valid: a node
+        # stored without `embedding_{gen}` is skipped by the vector index but
+        # stays reachable via the graph (entity/relation recall, keywords).
         create_query = f"""
         MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
         CREATE (d:Document {{
             id: $id,
             content: $content,
-            {embedding_prop}: $embedding,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
@@ -1093,7 +1105,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 tenant_id=self.agent_id,
                 id=point_id,
                 content=content,
-                embedding=vector_list,
                 metadata=metadata_json,
             )
             # Consuming the result surfaces any server-side error immediately
@@ -1107,14 +1118,30 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 return None
 
+        # Set the embedding only when valid — a second, conditional write keeps
+        # the CREATE simple and makes the "no embedding" state explicit.
+        if vector_valid:
+            async with self._get_session() as session:
+                await session.run(
+                    cast(
+                        LiteralString,
+                        f"MATCH (d:Document {{id: $id}}) SET d.{embedding_prop} = $embedding",
+                    ),
+                    id=point_id,
+                    embedding=vector_list,
+                )
+
         # Start entity extraction in the background
         if self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
 
         # Create SIMILAR_TO relationships in the background (tracked for clean shutdown)
-        sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
-        self._pending_entity_tasks.append(sim_task)
+        # Only when the vector is valid: a zero/non-finite vector would produce
+        # meaningless (or failing) vector-similarity edges.
+        if vector_valid:
+            sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
+            self._pending_entity_tasks.append(sim_task)
 
         # Clean up completed tasks
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
