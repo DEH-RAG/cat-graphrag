@@ -210,7 +210,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             async with self._driver.session(database=self._neo4j_database) as session:
                 await session.run("RETURN 1")
             await self._backfill_missing_entity_ids()
-            log.info(f"Connected to Neo4j at {self._neo4j_uri}")
+            log.debug(f"Connected to Neo4j at {self._neo4j_uri}")
         except Exception as e:
             log.error(f"Failed to connect to Neo4j: {e}")
             raise
