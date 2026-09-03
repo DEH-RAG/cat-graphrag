@@ -1903,15 +1903,33 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     tenant_id=self.agent_id,
                 )
 
-            await session.run(
-                """
+            # Entity pruning:
+            # - Per-file deletion (source set): keep the provenance-tracked
+            #   filter — only entities that lost ALL their PROVENANCE edges are
+            #   removed; legacy untracked entities are never wiped by mistake.
+            # - Full agent destroy (no source): the whole tenant is being wiped,
+            #   so prune UNCONDITIONALLY — every entity with no remaining
+            #   MENTIONS and no remaining PROVENANCE edge (all relationships
+            #   were detached when the tenant's documents were deleted). Same
+            #   rule as delete_collection / _drop_tenant_data_in_session; this
+            #   is what makes agent destroy actually empty the graph (entities
+            #   created by older plugin versions without tracked_by_provenance
+            #   used to survive forever as ghosts).
+            if source:
+                prune_query = """
                 MATCH (e:Entity {tenant_id: $tenant_id})
                 WHERE e.tracked_by_provenance = true
                   AND NOT (e)<-[:PROVENANCE]-()
                 DETACH DELETE e
-                """,
-                tenant_id=self.agent_id,
-            )
+                """
+            else:
+                prune_query = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                DETACH DELETE e
+                """
+
+            await session.run(prune_query, tenant_id=self.agent_id)
 
         async with self._get_session() as session:
             await session.run(
