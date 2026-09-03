@@ -254,55 +254,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         except Exception as e2:
             log.warning(f"[GraphRAG] Backfill skipped: {e2}")
 
-    async def _ensure_vector_indexes_in_session(self, session, vector_dimensions: int):
-        """Creates vector indexes for Document and Entity, using an already opened session."""
-        # Index for Document
-        doc_index_query = f"""
-        CREATE VECTOR INDEX {self._document_vector_index} IF NOT EXISTS
-        FOR (d:Document) ON d.embedding
-        OPTIONS {{
-            indexConfig: {{
-                `vector.dimensions`: {vector_dimensions},
-                `vector.similarity_function`: 'cosine',
-                `vector.hnsw.ef_construction`: 200,
-                `vector.hnsw.m`: 16
-            }}
-        }}
-        """
-
-        # Index for Entity (optional)
-        entity_index_query = f"""
-        CREATE VECTOR INDEX {self._entity_vector_index} IF NOT EXISTS
-        FOR (e:Entity) ON e.embedding
-        OPTIONS {{
-            indexConfig: {{
-                `vector.dimensions`: {vector_dimensions},
-                `vector.similarity_function`: 'cosine',
-                `vector.hnsw.ef_construction`: 200,
-                `vector.hnsw.m`: 16
-            }}
-        }}
-        """
-
-        # Create document index
-        try:
-            await session.run(doc_index_query)
-            log.info(f"Document vector index ensured: {self._document_vector_index}")
-        except Exception as e:
-            if "already exists" not in str(e):
-                log.error(f"Document index creation warning: {e}")
-                raise e
-
-        # Create an entity index (if enabled)
-        if self._enable_entity_embeddings:
-            try:
-                await session.run(entity_index_query)
-                log.info(f"Entity vector index ensured: {self._entity_vector_index}")
-            except Exception as e:
-                if "already exists" not in str(e):
-                    log.error(f"Entity index creation warning: {e}")
-                    raise e
-
     @staticmethod
     async def _ensure_constraints_in_session(session):
         """Creates integrity constraints using an already opened session."""
@@ -362,13 +313,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return record["embedder_name"], int(record["embedder_size"])
         return None
 
-    async def _drop_vector_indexes_in_session(self, session) -> None:
+    async def _drop_vector_indexes_in_session(self, session, names: Dict[str, str] | None = None) -> None:
         """Drops the document (and optional entity) vector index so they can be
-        recreated with the new embedder dimensions."""
-        for index_name in [
-            self._document_vector_index,
-            self._entity_vector_index,
-        ]:
+        recreated with the new embedder dimensions.
+
+        Drops both the legacy unversioned indexes (``document_embeddings`` /
+        ``entity_embeddings``, kept for backward cleanup of pre-P4 installs) and,
+        when ``names`` is provided, the CURRENT generation's versioned indexes.
+        """
+        index_names = [self._document_vector_index, self._entity_vector_index]
+        if names:
+            index_names += [names["index"], names["entity_index"]]
+        for index_name in index_names:
             try:
                 # noinspection SqlNoDataSourceInspection
                 await session.run(f"DROP INDEX {index_name} IF EXISTS")
@@ -420,16 +376,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
         log.info(f"[GraphRAG] Tenant data wiped for agent_id={self.agent_id}")
 
-    async def _ensure_vector_index_in_session(self, session, index_name: str, embedding_prop: str, vector_dimensions: int) -> None:
-        """Creates a single Document vector index at the given (versioned) name.
+    async def _ensure_vector_index_in_session(self, session, index_name: str, embedding_prop: str, vector_dimensions: int, node_label: str = "Document") -> None:
+        """Creates a single vector index at the given (versioned) name.
 
-        Mirror of ``_ensure_vector_indexes_in_session`` scoped to one index,
-        used by the shadow-build phase of ``reembed_tenant`` to create
-        ``document_embeddings_{gen}`` on ``embedding_{gen}``.
+        Scoped to one index, used by the shadow-build phase of ``reembed_tenant``
+        to create ``document_embeddings_{gen}`` on ``embedding_{gen}`` (Document)
+        or ``entity_embeddings_{gen}`` on ``entity_embedding_{gen}`` (Entity).
         """
         query = f"""
         CREATE VECTOR INDEX {index_name} IF NOT EXISTS
-        FOR (d:Document) ON d.{embedding_prop}
+        FOR (n:{node_label}) ON n.{embedding_prop}
         OPTIONS {{
             indexConfig: {{
                 `vector.dimensions`: {vector_dimensions},
@@ -441,10 +397,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         try:
             await session.run(query)
-            log.info(f"Document vector index ensured: {index_name}")
+            log.info(f"{node_label} vector index ensured: {index_name}")
         except Exception as e:
             if "already exists" not in str(e):
-                log.error(f"Document index creation warning: {e}")
+                log.error(f"{node_label} index creation warning: {e}")
                 raise e
 
     async def _create_similarity_relationships_for_gen(
@@ -501,6 +457,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Drop the old vector index (Neo4j vector indexes are immutable —
             # the new generation carries its own index at the new dims).
             await session.run(cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS"))
+            await session.run(cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS"))
             # Delete the old SIMILAR_TO edges (both endpoints tenant-filtered).
             await session.run(
                 cast(
@@ -519,6 +476,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     f"""
                     MATCH (d:Document {{tenant_id: $tenant_id}})
                     REMOVE d.{names['embedding_prop']}
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            # Remove the old entity embedding property from every tenant Entity.
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (e:Entity {{tenant_id: $tenant_id}})
+                    REMOVE e.{names['entity_embedding_prop']}
                     """,
                 ),
                 tenant_id=tenant_id,
@@ -635,6 +603,32 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 new_embedder.size,
             )
 
+        # 4b. Entity embeddings: doc embeddings are recomputed above, but entity
+        #     embeddings are NOT recomputed on a swap — carry them forward from
+        #     the old generation into the new one (same vectors, new property),
+        #     and create the new entity vector index.
+        old_names = self._versioned_names(old_gen)
+        async with self._get_session() as session:
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (e:Entity {{tenant_id: $tenant_id}})
+                    WHERE e.{old_names["entity_embedding_prop"]} IS NOT NULL
+                    SET e.{new_names["entity_embedding_prop"]} =
+                        e.{old_names["entity_embedding_prop"]}
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            await self._ensure_vector_index_in_session(
+                session,
+                new_names["entity_index"],
+                new_names["entity_embedding_prop"],
+                new_embedder.size,
+                node_label="Entity",
+            )
+
         # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
         #    _create_similarity_relationships against the new index/relation).
         for doc_id, vector, collection_name in valid_pairs:
@@ -709,31 +703,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if index_needs_rebuild:
                     await self._drop_vector_indexes_in_session(session)
 
-            # Always ensure indexes exist with the correct dimensions.
-            # If they were just dropped, this recreates them;
-            # if they already match, IF NOT EXISTS is a no-op.
-            await self._ensure_vector_indexes_in_session(session, embedder_size)
-
-            # ── Versioned-schema bootstrap (todo 11, P4) ─────────────────────
-            # The decorated read paths query the versioned index/property for
-            # the current generation (e.g. document_embeddings_v1 / embedding_v1).
-            # On a fresh install — or on pre-P4 data that only carries the
-            # unversioned `embedding` property — that versioned schema does not
-            # exist yet, so the first memory recall would target a missing index
-            # and fail. Ensure the versioned index for the current generation and
-            # backfill the legacy unversioned embedding into it, so reads never
-            # hit a missing index.
+            # Always ensure indexes exist with the correct dimensions (versioned
+            # schema, todo 11 P4): the read paths query the CURRENT generation's
+            # vector indexes (document_embeddings_{gen} / entity_embeddings_{gen}
+            # on embedding_{gen} / entity_embedding_{gen}). No legacy unversioned
+            # index is created anymore — the legacy `embedding` / `e.embedding`
+            # properties only feed the one-time backfill below.
             gen = await self._read_generation()
             if gen != self._generation:
                 self._rebuild_for_generation(gen)
             names = self._names
+
+            if index_needs_rebuild:
+                await self._drop_vector_indexes_in_session(session, names)
+
             # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
             # is a silent NO-OP when the index already exists at an OLD
-            # dimensionality. The versioned index is the one all read paths
-            # actually use (find_similar / recall), so repair it synchronously
+            # dimensionality. The versioned indexes are the ones all read paths
+            # actually use (find_similar / recall), so repair them synchronously
             # HERE at boot — before any ingestion worker can race ahead and
             # hit the dimension mismatch. embedder_size is a plain parameter,
             # it does not require the embedder object (injected later by hooks).
+            # — Document index
             v_index_dims = await self._get_index_dimensions(session, names["index"])
             if v_index_dims is not None and v_index_dims != embedder_size:
                 log.warning(
@@ -747,6 +738,21 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
             await self._ensure_vector_index_in_session(
                 session, names["index"], names["embedding_prop"], embedder_size
+            )
+            # — Entity index (same generation scheme)
+            ev_index_dims = await self._get_index_dimensions(session, names["entity_index"])
+            if ev_index_dims is not None and ev_index_dims != embedder_size:
+                log.warning(
+                    f"[GraphRAG] Versioned index {names['entity_index']} has "
+                    f"{ev_index_dims} dims but embedder is {embedder_size}; "
+                    "dropping and recreating it at boot (vectors already "
+                    "correct, no re-embed needed)."
+                )
+                await session.run(
+                    cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS")
+                )
+            await self._ensure_vector_index_in_session(
+                session, names["entity_index"], names["entity_embedding_prop"], embedder_size, node_label="Entity"
             )
             # Backfill: copy the legacy unversioned `embedding` property into the
             # current generation's property for existing documents that lack it,
@@ -764,6 +770,21 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                       AND d.{names["embedding_prop"]} IS NULL
                       AND size(d.embedding) = $dims
                     SET d.{names["embedding_prop"]} = d.embedding
+                    """,
+                ),
+                tenant_id=self.agent_id,
+                dims=embedder_size,
+            )
+            # Same one-time backfill for Entity nodes.
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (e:Entity {{tenant_id: $tenant_id}})
+                    WHERE e.embedding IS NOT NULL
+                      AND e.{names["entity_embedding_prop"]} IS NULL
+                      AND size(e.embedding) = $dims
+                    SET e.{names["entity_embedding_prop"]} = e.embedding
                     """,
                 ),
                 tenant_id=self.agent_id,
@@ -1172,18 +1193,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Relations with the same (source, target, type) key are deduplicated
         in Python before being sent, averaging their weights.
         """
-        batch_entity_query = """
+        entity_embedding_prop = self._names["entity_embedding_prop"]
+        batch_entity_query = f"""
         UNWIND $entities AS ent
-        MERGE (e:Entity {id: ent.id, tenant_id: $tenant_id})
+        MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
         ON CREATE SET
             e.name       = ent.name,
             e.type       = ent.type,
             e.created_at = datetime(),
             e.metadata   = ent.metadata,
-            e.embedding  = ent.embedding
+            e.{entity_embedding_prop} = ent.embedding
         ON MATCH SET
             e.last_seen  = datetime(),
-            e.embedding  = CASE WHEN ent.embedding IS NOT NULL THEN ent.embedding ELSE e.embedding END
+            e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
+                THEN ent.embedding ELSE e.{entity_embedding_prop} END
         """
 
         batch_mention_query = """
@@ -1370,6 +1393,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not self._entity_extractor:
             return
 
+        # Sync the versioned names with the CURRENT generation before writing
+        # the entity embedding property (a concurrent re-embed swap may have
+        # flipped the Epoch token since __init__).
+        gen = await self._read_generation(tenant_id)
+        if gen != self._generation:
+            self._rebuild_for_generation(gen)
+
         # 1. Fetch every stored Document of this tenant (content = page_content).
         async with self._neo4j_write_semaphore:
             async with self._get_session() as session:
@@ -1445,18 +1475,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         # 4. Write in a single managed write transaction (auto-retried by the
         #    driver on TransientError), capped by the shared write semaphore.
-        batch_entity_query = """
+        batch_entity_query = f"""
         UNWIND $entities AS ent
-        MERGE (e:Entity {id: ent.id, tenant_id: $tenant_id})
+        MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
         ON CREATE SET
             e.name       = ent.name,
             e.type       = ent.type,
             e.created_at = datetime(),
             e.metadata   = ent.metadata,
-            e.embedding  = ent.embedding
+            e.{self._names["entity_embedding_prop"]} = ent.embedding
         ON MATCH SET
             e.last_seen  = datetime(),
-            e.embedding  = CASE WHEN ent.embedding IS NOT NULL THEN ent.embedding ELSE e.embedding END
+            e.{self._names["entity_embedding_prop"]} = CASE WHEN ent.embedding IS NOT NULL
+                THEN ent.embedding ELSE e.{self._names["entity_embedding_prop"]} END
         """
 
         batch_mention_query = """
