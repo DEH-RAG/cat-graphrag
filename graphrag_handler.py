@@ -758,9 +758,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # current generation's property for existing documents that lack it,
             # BUT only when the stored vector already matches the embedder dims
             # (a stale pre-change vector in the index property would poison the
-            # vector index). (The driver suppresses the 01N52 "property does not
-            # exist" GQL warning on a fresh database, so the IS NOT NULL filter
-            # is safe.)
+            # vector index). Once migrated, the legacy property is REMOVED so
+            # the schema converges to the versioned-only shape. (The driver
+            # suppresses the 01N52 "property does not exist" GQL warning on a
+            # fresh database, so the IS NOT NULL filter is safe.)
             await session.run(
                 cast(
                     LiteralString,
@@ -770,6 +771,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                       AND d.{names["embedding_prop"]} IS NULL
                       AND size(d.embedding) = $dims
                     SET d.{names["embedding_prop"]} = d.embedding
+                    REMOVE d.embedding
                     """,
                 ),
                 tenant_id=self.agent_id,
@@ -785,6 +787,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                       AND e.{names["entity_embedding_prop"]} IS NULL
                       AND size(e.embedding) = $dims
                     SET e.{names["entity_embedding_prop"]} = e.embedding
+                    REMOVE e.embedding
                     """,
                 ),
                 tenant_id=self.agent_id,
