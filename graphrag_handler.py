@@ -2,6 +2,7 @@ import random
 import math
 import uuid
 import json
+import hashlib
 import asyncio
 from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager, cast, LiteralString, Type
 from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession
@@ -59,6 +60,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
         concept_relations_prompt: str | None = None,
+        concept_definitions: str | None = None,
+        relation_definitions: str | None = None,
         enable_knowledge_graph: bool = False,
         enable_student_knowledge_graph: bool = False,
         save_memory_snapshots: bool = False,
@@ -84,6 +87,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
         self._concept_relations_prompt = concept_relations_prompt
+        self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
+        self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
         self._enable_knowledge_graph = enable_knowledge_graph
         self._enable_student_knowledge_graph = enable_student_knowledge_graph
 
@@ -2178,7 +2183,21 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Versioned (todo 11, P4): the embedding property read is suffixed with
         the current generation token (depth is part of the cache key since it
         is inlined into the compiled Cypher).
+
+        Concept-generation gate (todo 11, concurrency lifecycle): every
+        RELATED_TO edge and Entity node on the traversed path must be either
+        untagged (spaCy: ``concept_gen IS NULL``) or tagged with the ACTIVE
+        generation. The active gen is read from the PERSISTED marker per
+        request (``_read_concept_gen``) — the marker flip is what atomically
+        hides superseded concept generations. When no marker exists yet (no
+        flip has ever run), the effective active gen is the CURRENT config
+        fingerprint, which is what ingestion tags with: pre-feature and
+        freshly-ingested content stays visible, and a config save hides the
+        old generation as soon as the background recompute lands.
         """
+        active_gen = await self._read_concept_gen(self.agent_id)
+        if active_gen is None:
+            active_gen = self._concept_fingerprint()
         return await self._run_cached(
             f"recall_entity_related:{depth}",
             self._generation,
@@ -2188,6 +2207,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 "collection_name": collection_name,
                 "decay": decay,
                 "k": k,
+                "active_concept_gen": active_gen,
             },
         )
 
@@ -2716,7 +2736,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
 
     async def _extract_concept_relations(
-        self, source: str, stored_points: List["PointStruct"], stray_cat
+        self,
+        source: str,
+        stored_points: List["PointStruct"],
+        stray_cat,
+        gen: str | None = None,
     ) -> None:
         tenant_id = self.agent_id
 
@@ -2749,8 +2773,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # cascade can prune it when ALL of them are gone.
         document_ids = [p.id for p in stored_points if getattr(p, "id", None)]
 
+        # The store tags every node/edge with the config generation: the
+        # recompute path (todo 12) passes its target gen explicitly, while the
+        # ingestion path (todo 9) falls back to the current config fingerprint.
         await self._store_concept_relations(
-            tenant_id, relations, source=source, document_ids=document_ids
+            tenant_id,
+            relations,
+            source=source,
+            document_ids=document_ids,
+            concept_gen=gen or self._concept_fingerprint(),
         )
         log.info(
             f"[GraphRAG] Stored {len(relations)} concept relations for '{source}'"
@@ -2763,11 +2794,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # default when it is not configured (None / empty). The document text
         # is concatenated after the prompt (no {text} placeholder anymore).
         # Prompts saved while the placeholder still existed are handled too.
-        prompt_template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_PROMPT
-        if "{text}" in prompt_template:
-            full_prompt = prompt_template.replace("{text}", text)
+        template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_TEMPLATE
+        # Definitions blocks (preserve insertion order of the parsed dicts).
+        concept_block = "\n".join(f"{k}: {v}" for k, v in self._concept_definitions.items())
+        relation_block = "\n".join(f"{k}: {v}" for k, v in self._relation_definitions.items())
+        full_prompt = template.replace("{concept_definitions}", concept_block).replace("{relation_definitions}", relation_block)
+        if "{text}" in full_prompt:
+            full_prompt = full_prompt.replace("{text}", text)
         else:
-            full_prompt = f"{prompt_template}\n{text}"
+            full_prompt = f"{full_prompt}\n{text}"
 
         agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
         agent_output = await stray_cat.agentic_workflow.run(
@@ -2777,8 +2812,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         raw = agent_output.output
         return self._parse_concept_relations(raw)
 
-    @staticmethod
-    def _parse_concept_relations(raw: str) -> List[Dict[str, str]]:
+    def _parse_concept_relations(self, raw: str) -> List[Dict[str, str]]:
         import re
         import json
 
@@ -2803,11 +2837,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not isinstance(data, list):
             return []
 
-        valid = {
-            "IS_A", "PART_OF", "EXAMPLE_OF", "PREREQUISITE_FOR",
-            "BUILDS_UPON", "CONTRASTS_WITH", "APPLIES_TO",
-            "LEADS_TO", "EVIDENCE_FOR",
-        }
+        valid = set(self._relation_definitions.keys())
 
         result: List[Dict[str, str]] = []
         for item in data:
@@ -2816,9 +2846,280 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             s = str(item.get("subject", "")).strip()
             o = str(item.get("object", "")).strip()
             r = str(item.get("relation_type", "")).strip().upper()
+            st = str(item.get("subject_type", "") or "").strip().upper()
+            ot = str(item.get("object_type", "") or "").strip().upper()
             if s and o and r in valid:
-                result.append({"subject": s, "relation_type": r, "object": o})
+                entry = {"subject": s, "relation_type": r, "object": o}
+                if st:
+                    entry["subject_type"] = st
+                if ot:
+                    entry["object_type"] = ot
+                result.append(entry)
         return result
+
+    # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
+
+    def _concept_fingerprint(self) -> str:
+        """Stable SHA-256 fingerprint of the effective concept-relations config.
+
+        Normalizes the PARSED definition dicts (``sort_keys=True``) and the
+        whitespace-stripped prompt, so cosmetic edits (line order, indentation,
+        trailing whitespace) do NOT produce a spurious generation change. The
+        resulting token tags every concept node/edge written by
+        ``_store_concept_relations`` (the ``concept_gen`` property) and is what
+        the save-trigger recompute (todo 12) flips to.
+        """
+        payload = (
+            "CONCEPT:" + json.dumps(self._concept_definitions, sort_keys=True)
+            + "|REL:" + json.dumps(self._relation_definitions, sort_keys=True)
+            + "|PROMPT:" + (self._concept_relations_prompt or "").strip()
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def _read_concept_gen(self, tenant_id: str | None = None) -> str | None:
+        """Read the tenant's active concept-generation marker.
+
+        ``concept_gen_active`` on the tenant's Collection node is the PERSISTED
+        source of truth for which ``concept_gen`` is currently visible to the
+        retrieval gate (``_recall_entity_related``). Plain ``session.run``, no
+        transaction — EpochMixin style. Returns None when no marker exists yet
+        (no flip has ever run for this tenant).
+        """
+        tenant_id = tenant_id or self.agent_id
+        await self._ensure_connected()
+        async with self._get_session() as session:
+            result = await session.run(
+                cast(
+                    LiteralString,
+                    "MATCH (c:Collection {tenant_id: $tenant_id}) "
+                    "RETURN c.concept_gen_active AS gen LIMIT 1",
+                ),
+                tenant_id=tenant_id,
+            )
+            record = await result.single()
+            if record is not None and record["gen"] is not None:
+                return str(record["gen"])
+            return None
+
+    async def _write_concept_gen(self, tenant_id: str, gen: str) -> None:
+        """Persist the tenant's active concept-generation marker.
+
+        ``MERGE`` guarantees the Collection node exists even when the tenant has
+        no stored documents yet (mirrors the Epoch node pattern). Plain
+        ``session.run``, no transaction.
+        """
+        await self._ensure_connected()
+        async with self._get_session() as session:
+            await session.run(
+                cast(
+                    LiteralString,
+                    "MERGE (c:Collection {tenant_id: $tenant_id}) "
+                    "SET c.concept_gen_active = $gen",
+                ),
+                tenant_id=tenant_id,
+                gen=gen,
+            )
+
+    async def _flip_concept_gen(
+        self, tenant_id: str, expected_prev_gen: str | None, new_gen: str
+    ) -> bool:
+        """Atomically deactivate every non-``new_gen`` concept tag and switch
+        the tenant's ``concept_gen_active`` marker to ``new_gen``.
+
+        All four statements run in ONE managed write transaction (capped by the
+        shared write semaphore), so the flip is all-or-nothing:
+
+        1. Gen-guard read: the current marker must still be in the expected
+           state (``expected_prev_gen``). If ``expected_prev_gen`` is a string,
+           the marker must equal it; if None, the marker must be absent/empty
+           (a ``MATCH`` for CONFLICTING markers — any row means an occupied
+           marker from a newer flip). When a newer save flipped the marker in
+           the meantime, the guard finds the conflict and raises
+           ``_ConceptGenGuardAbort``: the whole transaction rolls back and the
+           method returns False, so concurrent recompute jobs stay
+           single-flight — the persisted marker IS the lock.
+        2. Nodes: every Entity tagged with a ``concept_gen`` other than
+           ``new_gen`` gets ``concept_gen_active = false`` bookkeeping ONLY.
+           The retrieval gate never reads this boolean (Metis M1).
+        3. Edges: the same for RELATED_TO relationships.
+        4. Marker: MERGE the Collection node and SET ``concept_gen_active``.
+
+        Nodes/edges freshly written with ``concept_gen = new_gen`` keep
+        ``concept_gen_active`` UNSET, so they pass the tag-based gate. Every
+        MATCH is tenant-scoped; no other tenant's graph is touched.
+
+        Note: the ``expected_prev_gen is None`` guard uses the complement idiom
+        (match CONFLICTING markers) instead of ``IS NULL OR NOT coalesce(...)``
+        so that a tenant with NO Collection node yet still reads as "marker
+        absent" and the flip can proceed — the task's literal predicate would
+        abort on that legitimate case (a fresh tenant configuring the plugin
+        before any ingestion) and would loop forever in the recompute job.
+        """
+
+        class _ConceptGenGuardAbort(Exception):
+            pass
+
+        async def _flip(tx):
+            if expected_prev_gen is None:
+                # Guard succeeds when there is NO conflicting marker (absent
+                # marker / no Collection node yet) -> abort only on a hit.
+                result = await tx.run(
+                    cast(LiteralString, CONCEPT_FLIP_GUARD_ABSENT_QUERY),
+                    tenant_id=tenant_id,
+                )
+                guard_ok = await result.single() is None
+            else:
+                # Guard succeeds when the marker STILL equals the expected
+                # previous generation -> abort when it no longer does.
+                result = await tx.run(
+                    cast(LiteralString, CONCEPT_FLIP_GUARD_QUERY),
+                    tenant_id=tenant_id,
+                    expected_prev=expected_prev_gen,
+                )
+                guard_ok = await result.single() is not None
+
+            if not guard_ok:
+                # A newer flip won the race (or the marker is occupied) ->
+                # abort the whole transaction and report the loss.
+                raise _ConceptGenGuardAbort()
+
+            await tx.run(
+                cast(LiteralString, CONCEPT_FLIP_NODES_QUERY),
+                tenant_id=tenant_id,
+                new_gen=new_gen,
+            )
+            await tx.run(
+                cast(LiteralString, CONCEPT_FLIP_EDGES_QUERY),
+                tenant_id=tenant_id,
+                new_gen=new_gen,
+            )
+            await tx.run(
+                cast(LiteralString, CONCEPT_FLIP_MARKER_QUERY),
+                tenant_id=tenant_id,
+                new_gen=new_gen,
+            )
+
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                try:
+                    await session.execute_write(_flip)
+                except _ConceptGenGuardAbort:
+                    return False
+        return True
+
+    async def _gc_stale_concept_nodes(self, tenant_id: str) -> None:
+        """Deferred GC of concept nodes superseded by a generation flip.
+
+        Removes Entity nodes that ``_flip_concept_gen`` marked
+        ``concept_gen_active = false`` AND that no Document MENTIONS anymore.
+        The ``NOT (e)<-[:MENTIONS]-()`` guard protects shared spaCy nodes: an
+        entity that ``_store_concept_relations`` tagged and that NER later
+        picked up keeps its MENTIONS edge and is never deleted (Metis B2).
+        Runs in one plain ``session.run`` under the write semaphore — safe to
+        schedule right after the flip, never blocks the read path.
+        """
+        await self._ensure_connected()
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                await session.run(
+                    cast(LiteralString, CONCEPT_GC_STALE_QUERY),
+                    tenant_id=tenant_id,
+                )
+
+    async def recompute_concept_relations(
+        self,
+        stray_cat,
+        source_group: str | None = None,
+        gen: str | None = None,
+    ) -> None:
+        """Re-walk the tenant's stored Documents and re-extract concept
+        relations from every source, tagging the writes with ``gen``.
+
+        Mirrors ``refresh_technology_entities`` step 1 (fetch every stored
+        Document of the tenant), groups them by ``metadata.source`` and feeds
+        each source's content to the existing ``_extract_concept_relations`` —
+        the LLM re-runs on the concatenated section texts and
+        ``_store_concept_relations`` tags the resulting nodes/edges with
+        ``gen``. After this completes, ``_flip_concept_gen`` deactivates every
+        OTHER generation. No re-ingest, no re-embed, no full wipe; every query
+        is tenant-scoped and the walk is serialized by the write semaphore.
+        """
+        if not self._enable_concept_relations:
+            return
+        tenant_id = self.agent_id
+        if gen is None:
+            gen = self._concept_fingerprint()
+
+        await self._ensure_connected()
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                result = await session.run(
+                    cast(
+                        LiteralString,
+                        "MATCH (d:Document {tenant_id: $tenant_id}) "
+                        "RETURN d.id AS id, d.content AS content, d.metadata AS metadata",
+                    ),
+                    tenant_id=tenant_id,
+                )
+                docs = [record async for record in result]
+
+        by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for doc in docs:
+            raw_meta = doc["metadata"]
+            try:
+                meta = (
+                    json.loads(raw_meta)
+                    if isinstance(raw_meta, str)
+                    else (raw_meta or {})
+                )
+            except (TypeError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            source = str(meta.get("source") or "unknown")
+            if source_group is not None and source != source_group:
+                continue
+            by_source.setdefault(source, []).append(
+                {
+                    "id": doc["id"],
+                    "page_content": doc["content"] or "",
+                    "metadata": meta,
+                }
+            )
+
+        for source in sorted(by_source):
+            payloads = [
+                PointStruct(
+                    id=p["id"],
+                    payload={
+                        "id": p["id"],
+                        "page_content": p["page_content"],
+                        "metadata": p["metadata"],
+                    },
+                    vector=None,
+                )
+                for p in by_source[source]
+            ]
+            await self._extract_concept_relations(source, payloads, stray_cat, gen=gen)
+
+    def _resolve_concept_entity_type(self, type_str: str | None) -> Tuple[str, EntityType]:
+        """Resolve an LLM-provided concept type against the settings whitelist.
+
+        Returns (node_type, enum_for_hashing). node_type is uppercased.
+        A1: unknown/absent/unmapped types fall back to ('CONCEPT', EntityType.CONCEPT).
+        A whitelisted type that is a real EntityType enum member uses that enum;
+        a custom type not in the enum hashes with EntityType.CONCEPT (shared
+        name-space dedup preserved) while storing the custom node_type string.
+        """
+        if type_str:
+            t = type_str.strip().upper()
+            if t in self._concept_definitions:
+                try:
+                    enum = EntityType[t]
+                except KeyError:
+                    enum = EntityType.CONCEPT
+                return t, enum
+        return "CONCEPT", EntityType.CONCEPT
 
     async def _store_concept_relations(
         self,
@@ -2826,6 +3127,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         relations: List[Dict[str, str]],
         source: str | None = None,
         document_ids: List[str] | None = None,
+        concept_gen: str | None = None,
     ) -> None:
         if not relations:
             return
@@ -2839,28 +3141,36 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     object_ = rel["object"]
                     rel_type = rel["relation_type"]
 
+                    s_type, s_enum = self._resolve_concept_entity_type(rel.get("subject_type"))
+                    o_type, o_enum = self._resolve_concept_entity_type(rel.get("object_type"))
+
                     # Generate stable entity IDs using the same hash strategy
                     # as the entity extractor, so concept entities have a
                     # non-null `id` property and the frontend visualisation
                     # can map them correctly in D3.
                     subject_id = EntityExtractor.get_entity_hash(
-                        subject, EntityType.CONCEPT, tenant_id
+                        subject, s_enum, tenant_id
                     )
                     object_id = EntityExtractor.get_entity_hash(
-                        object_, EntityType.CONCEPT, tenant_id
+                        object_, o_enum, tenant_id
                     )
 
                     await session.run(
                         """
                         MERGE (s:Entity {tenant_id: $tenant_id, name: $subject})
                         SET s.id = coalesce(s.id, $subject_id)
-                        SET s.type = coalesce(s.type, 'CONCEPT')
+                        SET s.type = CASE WHEN $s_type IS NOT NULL THEN coalesce(s.type, $s_type) ELSE s.type END
+                        SET s.concept_gen = CASE WHEN $s_gen IS NOT NULL THEN $s_gen ELSE s.concept_gen END
+                        SET s.concept_gen_active = CASE WHEN $s_gen IS NULL THEN s.concept_gen_active END
                         SET s.tracked_by_provenance = true
                         MERGE (t:Entity {tenant_id: $tenant_id, name: $object})
                         SET t.id = coalesce(t.id, $object_id)
-                        SET t.type = coalesce(t.type, 'CONCEPT')
+                        SET t.type = CASE WHEN $o_type IS NOT NULL THEN coalesce(t.type, $o_type) ELSE t.type END
+                        SET t.concept_gen = CASE WHEN $t_gen IS NOT NULL THEN $t_gen ELSE t.concept_gen END
+                        SET t.concept_gen_active = CASE WHEN $t_gen IS NULL THEN t.concept_gen_active END
                         SET t.tracked_by_provenance = true
                         MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
+                        SET r.concept_gen = CASE WHEN $r_gen IS NOT NULL THEN $r_gen ELSE r.concept_gen END
                         SET r.weight = coalesce(r.weight, 1.0) + 0.5
                         SET r.source_files = CASE
                             WHEN $source_files IS NULL THEN r.source_files
@@ -2871,6 +3181,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         tenant_id=tenant_id,
                         subject=subject,
                         subject_id=subject_id,
+                        s_type=s_type,
+                        o_type=o_type,
+                        s_gen=concept_gen,
+                        t_gen=concept_gen,
+                        r_gen=concept_gen,
                         object=object_,
                         object_id=object_id,
                         rel_type=rel_type,
@@ -2902,12 +3217,27 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     )
 
 
-CONCEPT_RELATIONS_EXTRACTION_PROMPT = """You are a concept extraction system for educational content. Analyse the text below and extract meaningful conceptual relationships.
+DEFAULT_CONCEPT_DEFINITIONS = "CONCEPT: general knowledge concept\n"
+DEFAULT_RELATION_DEFINITIONS = """IS_A: specialisation / hierarchy  (e.g. Python IS_A programming language)
+PART_OF: composition / containment  (e.g. CPU PART_OF computer)
+EXAMPLE_OF: concrete instance  (e.g. Django EXAMPLE_OF web framework)
+PREREQUISITE_FOR: learning dependency  (e.g. Algebra PREREQUISITE_FOR Calculus)
+BUILDS_UPON: conceptual foundation  (e.g. OOP BUILDS_UPON procedural programming)
+CONTRASTS_WITH: comparative distinction  (e.g. REST CONTRASTS_WITH GraphQL)
+APPLIES_TO: practical application  (e.g. Bayes theorem APPLIES_TO spam filtering)
+LEADS_TO: causal chain  (e.g. Global warming LEADS_TO sea level rise)
+EVIDENCE_FOR: supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
+"""
+
+CONCEPT_RELATIONS_EXTRACTION_TEMPLATE = """You are a concept extraction system for educational content. Analyse the text below and extract meaningful conceptual relationships.
 
 For each pair of related concepts return a JSON object with:
 - "subject": the source concept (short noun phrase, max 3 words)
-- "relation_type": one of IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, BUILDS_UPON, CONTRASTS_WITH, APPLIES_TO, LEADS_TO, EVIDENCE_FOR
+- "relation_type": one of {relation_definitions}
 - "object": the target concept (short noun phrase, max 3 words)
+
+Concept types:
+{concept_definitions}
 
 IS_A = specialisation / hierarchy  (e.g. Python IS_A programming language)
 PART_OF = composition / containment  (e.g. CPU PART_OF computer)
@@ -2923,6 +3253,60 @@ Only extract relations that are explicitly stated or clearly implied in the text
 Return ONLY a valid JSON array of objects, with no additional text. If nothing matches return [].
 
 Text:"""
+
+
+def parse_definitions(text: str) -> Dict[str, str]:
+    definitions: Dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            log.warning(f"[GraphRAG] parse_definitions: skipping line without ':' separator: {line!r}")
+            continue
+        key, _, value = stripped.partition(":")
+        definitions[key.strip().upper()] = value.strip()
+    return definitions
+
+
+# ── Concept-generation lifecycle Cypher (todos 10/13, concurrency lifecycle) ──
+# Module-level constants so the QA harness can assert on the exact query text
+# (tenant-scoping, gate semantics, GC guard) without a live Neo4j instance. The
+# flip statements are all executed inside ONE managed write transaction.
+CONCEPT_FLIP_GUARD_QUERY = """
+MATCH (c:Collection {tenant_id: $tenant_id})
+WHERE coalesce(c.concept_gen_active, null) = $expected_prev
+RETURN c.concept_gen_active AS gen
+LIMIT 1
+"""
+# expected_prev is None: match CONFLICTING (non-empty) markers — any row means
+# a newer flip already occupied the marker, so the flip must abort. Absent
+# marker / no Collection node -> no rows -> proceed (Metis M2, complement form).
+CONCEPT_FLIP_GUARD_ABSENT_QUERY = """
+MATCH (c:Collection {tenant_id: $tenant_id})
+WHERE coalesce(c.concept_gen_active, '') <> ''
+RETURN c.concept_gen_active AS gen
+LIMIT 1
+"""
+CONCEPT_FLIP_NODES_QUERY = """
+MATCH (e:Entity {tenant_id: $tenant_id})
+WHERE e.concept_gen IS NOT NULL AND e.concept_gen <> $new_gen
+SET e.concept_gen_active = false
+"""
+CONCEPT_FLIP_EDGES_QUERY = """
+MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+WHERE r.concept_gen IS NOT NULL AND r.concept_gen <> $new_gen
+SET r.concept_gen_active = false
+"""
+CONCEPT_FLIP_MARKER_QUERY = """
+MERGE (c:Collection {tenant_id: $tenant_id})
+SET c.concept_gen_active = $new_gen
+"""
+CONCEPT_GC_STALE_QUERY = """
+MATCH (e:Entity {tenant_id: $tenant_id})
+WHERE e.concept_gen_active = false AND NOT (e)<-[:MENTIONS]-()
+DETACH DELETE e
+"""
 
 
 class Neo4jGraphRAGConfig(VectorDatabaseSettings):
@@ -2971,11 +3355,29 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
     )
     concept_relations_prompt: str = Field(
-        default=CONCEPT_RELATIONS_EXTRACTION_PROMPT,
+        default=CONCEPT_RELATIONS_EXTRACTION_TEMPLATE,
         description=(
             "Prompt template sent to the LLM to extract concept relations. "
             "The ingested document text is appended after the prompt. "
+            "May contain {concept_definitions} and {relation_definitions} placeholders. "
             "Leave empty to use the built-in default."
+        ),
+    )
+    concept_definitions: str = Field(
+        default=DEFAULT_CONCEPT_DEFINITIONS,
+        description=(
+            "One 'TYPE: definition' per line. Each key becomes an admissible "
+            "concept node type (Entity.type), uppercased; shown to the LLM via "
+            "the {concept_definitions} placeholder."
+        ),
+    )
+    relation_definitions: str = Field(
+        default=DEFAULT_RELATION_DEFINITIONS,
+        description=(
+            "One 'TYPE: definition' per line. Each key becomes an admissible "
+            "relation type (RELATED_TO.type), uppercased; interpolated into the "
+            "prompt via the {relation_definitions} placeholder. Relation "
+            "definitions may mention concept names in their example text."
         ),
     )
     enable_knowledge_graph: bool = Field(

@@ -10,6 +10,15 @@ from cat.services.memory.models import PointStruct
 from .graphrag_handler import Neo4jGraphRAGConfig, GraphRAGHandler
 from .entity_extractor import EntityExtractor
 
+# Concept-recompute guard state (todo 12, concurrency lifecycle). Module-level
+# (not per-handler) because the handler is re-instantiated across settings
+# saves — the PERSISTED ``concept_gen_active`` marker is the real source of
+# truth for single-flight; the lock only serializes access to the pending map
+# and the dict holds the LATEST-WINS target generation per tenant. Both are
+# harmless at import time (no side effects) and therefore import-safe.
+_concept_recompute_lock = asyncio.Lock()
+_concept_recompute_pending: Dict[str, str] = {}
+
 
 @hook(priority=10)
 def factory_allowed_vector_databases(allowed: List[VectorDatabaseSettings], cat) -> List:
@@ -106,32 +115,113 @@ async def after_vector_database_settings_update(
     cat,
 ) -> None:
     """
-    Refreshes the Technology-entity subgraph for the given agent when its
-    ``extra_technology_patterns`` change.
+    Reacts to ``Neo4jGraphRAGConfig`` saves with two INDEPENDENT refresh paths
+    (neither sits behind the other's early return):
 
-    Fired by the core's ``upsert_vector_database_setting`` (todo 9) with the
-    vector-DB config name and the previous/new config payloads. Only reacts to
-    ``Neo4jGraphRAGConfig`` and only when the technology patterns actually
-    changed. Rebuilds the handler's EntityExtractor with the new patterns and
-    re-runs the pure-regex technology extraction over the existing stored
-    Documents of this agent — no re-ingest, no re-embed, no full wipe, and no
-    other agent's graph is touched.
+    1. Technology terminology: when ``extra_technology_patterns`` changed,
+       rebuild the handler's EntityExtractor with the new patterns and re-run
+       the pure-regex technology extraction over the stored Documents.
+    2. Concept relations: when ``concept_definitions`` / ``relation_definitions``
+       / ``concept_relations_prompt`` changed, compute the new config
+       fingerprint and launch a single-flight background recompute that
+       re-extracts concept relations from EVERY source of this agent tagging
+       with the new generation, then atomically flips the tenant's
+       ``concept_gen_active`` marker (``GraphRAGHandler._flip_concept_gen``).
+       Retrieval (_recall_entity_related) gates on that marker, so old
+       concepts disappear exactly when the new ones are in place.
+
+    Idempotence/single-flight comes from the persisted marker + the latest-
+    wins pending map + the gen-guard inside the flip — NOT from any in-memory
+    handler state (handlers are re-instantiated on every save).
     """
     if vector_database_name != "Neo4jGraphRAGConfig":
-        return
-    if new_config.get("extra_technology_patterns") == previous_config.get("extra_technology_patterns"):
         return
 
     handler = cat.vector_memory_handler
     if not isinstance(handler, GraphRAGHandler):
         return
-    if not handler.entity_extractor:
+
+    # 1 — Technology terminology refresh (unchanged semantics).
+    if new_config.get("extra_technology_patterns") != previous_config.get("extra_technology_patterns"):
+        if handler.entity_extractor:
+            handler._entity_extractor = EntityExtractor(
+                models=handler._spacy_models,
+                extra_technology_patterns=new_config.get("extra_technology_patterns") or None,
+            )
+            await handler.refresh_technology_entities(tenant_id=cat.agent_key)
+
+    # 2 — Concept-relation generation flip (todos 9-13).
+    concept_changed = any(
+        new_config.get(k) != previous_config.get(k)
+        for k in ("concept_definitions", "relation_definitions", "concept_relations_prompt")
+    )
+    if not concept_changed:
         return
 
-    # Rebuild the extractor with the new patterns (mirrors __init__:87-90).
-    handler._entity_extractor = EntityExtractor(
-        models=handler._spacy_models,
-        extra_technology_patterns=new_config.get("extra_technology_patterns") or None,
+    new_gen = handler._concept_fingerprint()
+    active = await handler._read_concept_gen(cat.agent_key)
+    if active == new_gen:
+        return  # the marker already enforces this generation: no-op
+
+    async with _concept_recompute_lock:
+        _concept_recompute_pending[cat.agent_key] = new_gen
+
+    task = asyncio.create_task(
+        _concept_recompute_job(handler, cat, cat.agent_key, new_gen)
+    )
+    # Tracked so the handler's close() can await it during agent shutdown
+    # (pattern from after_cheshire_cat_creation) and so it is not GC'd.
+    handler._pending_entity_tasks.append(task)
+    log.info(
+        f"[GraphRAG] Concept-relation config changed for {cat.agent_key}: "
+        f"scheduled recompute to generation {new_gen[:12]}"
     )
 
-    await handler.refresh_technology_entities(tenant_id=cat.agent_key)
+
+async def _concept_recompute_job(
+    handler: GraphRAGHandler, cat: StrayCat, tenant: str, new_gen: str
+) -> None:
+    """
+    Single-flight concept recompute for one tenant.
+
+    Latest-wins: every pass re-reads ``_concept_recompute_pending`` and the
+    persisted marker. The in-process lock only serializes pending-map access;
+    single-flight ACROSS handler re-instantiations holds because a losing flip
+    (gen-guard inside ``_flip_concept_gen``) aborts and this loop re-derives
+    from the marker read and the newest pending generation. A flip that commits
+    is followed by the deferred GC of stale old-generation concept nodes.
+    """
+    attempts = 0
+    while attempts < 4:
+        attempts += 1
+        async with _concept_recompute_lock:
+            pending = _concept_recompute_pending.get(tenant)
+        if pending is None:
+            return  # superseded work: a newer job took over
+        active = await handler._read_concept_gen(tenant)
+        if active == pending:
+            async with _concept_recompute_lock:
+                if _concept_recompute_pending.get(tenant) == pending:
+                    _concept_recompute_pending.pop(tenant, None)
+            return
+
+        try:
+            await handler.recompute_concept_relations(cat, gen=pending)
+            flipped = await handler._flip_concept_gen(tenant, active, pending)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"[GraphRAG] Concept recompute failed for {tenant}: {e}")
+            return  # keep pending: the next settings save re-triggers it
+
+        if flipped:
+            await handler._gc_stale_concept_nodes(tenant)
+            async with _concept_recompute_lock:
+                if _concept_recompute_pending.get(tenant) == pending:
+                    _concept_recompute_pending.pop(tenant, None)
+            return
+
+        # Gen-guard aborted: a newer save won the race -> loop re-reads the
+        # latest pending generation (latest-wins).
+    log.error(
+        f"[GraphRAG] Concept recompute for {tenant} gave up after repeated "
+        "gen-guard aborts (newer saves keep winning)"
+    )
