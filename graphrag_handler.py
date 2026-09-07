@@ -4,11 +4,11 @@ import uuid
 import json
 import hashlib
 import asyncio
-from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager, cast, LiteralString, Type
+from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager, cast, LiteralString, Type, Annotated, Literal
 from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession
 from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
-from pydantic import Field, ConfigDict
+from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
 from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
 from cat.services.memory.models import (
@@ -29,6 +29,16 @@ from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
 from .versioning import ensure_version, retry_on_generation_change
+
+
+def _upper_str(value: Any) -> str:
+    """Strip + uppercase a value before Literal validation.
+
+    Used by ``_build_llm_output_model`` so the LLM may emit lowercase or
+    mixed-case concept/relation types and still validate against the
+    UPPERCASED whitelist keys (Metis M1, case normalization).
+    """
+    return str(value).strip().upper()
 
 
 class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
@@ -3101,6 +3111,46 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 for p in by_source[source]
             ]
             await self._extract_concept_relations(source, payloads, stray_cat, gen=gen)
+
+    def _build_llm_output_model(self) -> type[BaseModel]:
+        """Dynamically build the Pydantic output model for structured LLM
+        concept/relation extraction (todo 2, mygraph-structured-llm-extraction).
+
+        The ``type`` fields are Literal unions over the configured
+        concept/relation definition keys (uppercased by ``parse_definitions``),
+        so the LLM output is whitelist-enforced at validation time. Values are
+        case-normalized (strip + upper) BEFORE Literal validation, so the LLM
+        may emit lowercase/mixed-case types. If a parsed definitions dict is
+        empty (e.g. an all-comment settings field), the built-in defaults are
+        used for the model build ONLY — the stored dicts are left untouched.
+        """
+        concept_keys = sorted(self._concept_definitions.keys()) or sorted(
+            parse_definitions(DEFAULT_CONCEPT_DEFINITIONS).keys()
+        )
+        relation_keys = sorted(self._relation_definitions.keys()) or sorted(
+            parse_definitions(DEFAULT_RELATION_DEFINITIONS).keys()
+        )
+
+        ConceptType = Annotated[Literal[*concept_keys], BeforeValidator(_upper_str)]
+        RelationType = Annotated[Literal[*relation_keys], BeforeValidator(_upper_str)]
+
+        Concept = create_model(
+            "Concept",
+            type=(ConceptType, ...),
+            text=(str, ...),
+        )
+        Relation = create_model(
+            "Relation",
+            type=(RelationType, ...),
+            origin=(str, ...),
+            destination=(str, ...),
+            text=(str, ...),
+        )
+        return create_model(
+            "ExtractionResult",
+            concepts=(List[Concept], ...),
+            relations=(List[Relation], ...),
+        )
 
     def _resolve_concept_entity_type(self, type_str: str | None) -> Tuple[str, EntityType]:
         """Resolve an LLM-provided concept type against the settings whitelist.
