@@ -28,6 +28,7 @@ except ImportError:
 from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
+from .structured_llm import StructuredLLM, StructuredLLMError
 from .versioning import ensure_version, retry_on_generation_change
 
 
@@ -2804,28 +2805,49 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
     async def _llm_extract_relations(
         self, text: str, stray_cat
-    ) -> List[Dict[str, str]]:
+    ) -> Dict[str, list]:
         # Use the per-agent prompt from settings; fall back to the built-in
         # default when it is not configured (None / empty). The document text
         # is concatenated after the prompt (no {text} placeholder anymore).
         # Prompts saved while the placeholder still existed are handled too.
         template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_TEMPLATE
-        # Definitions blocks (preserve insertion order of the parsed dicts).
-        concept_block = "\n".join(f"{k}: {v}" for k, v in self._concept_definitions.items())
-        relation_block = "\n".join(f"{k}: {v}" for k, v in self._relation_definitions.items())
-        full_prompt = template.replace("{concept_definitions}", concept_block).replace("{relation_definitions}", relation_block)
+        # RAW definition strings (comments + formatting preserved verbatim,
+        # todo 3) are interpolated into the prompt placeholders.
+        full_prompt = template.replace("{concept_definitions}", self._raw_concept_definitions).replace("{relation_definitions}", self._raw_relation_definitions)
         if "{text}" in full_prompt:
             full_prompt = full_prompt.replace("{text}", text)
         else:
             full_prompt = f"{full_prompt}\n{text}"
 
-        agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
-        agent_output = await stray_cat.agentic_workflow.run(
-            task=agent_input,
-            llm=stray_cat.large_language_model,
-        )
-        raw = agent_output.output
-        return self._parse_concept_relations(raw)
+        # Structured extraction via the plugin's own StructuredLLM utility
+        # (todo 1): native with_structured_output when the LLM supports it,
+        # JSON-schema prompt fallback otherwise. The dynamic Pydantic output
+        # model (todo 2) whitelist-enforces concept/relation types at
+        # validation time.
+        output_model = self._build_llm_output_model()
+        try:
+            result = await StructuredLLM().run(
+                full_prompt, stray_cat.large_language_model, output_model
+            )
+            model = result.model
+            if hasattr(model, "model_dump"):
+                data = model.model_dump()
+            else:
+                data = model or {}
+            return {
+                "concepts": data.get("concepts", []),
+                "relations": data.get("relations", []),
+            }
+        except StructuredLLMError as e:
+            log.warning(
+                f"[GraphRAG] Structured LLM extraction failed, falling back to "
+                f"lenient parsing: {e}"
+            )
+            parsed = self._parse_concept_relations(e.raw_text)
+            # TEMPORARY bridge: the current parser returns the old list shape;
+            # todo 5 reworks it to return the {"concepts","relations"} dict
+            # natively and adapts this call site.
+            return {"concepts": [], "relations": parsed}
 
     def _parse_concept_relations(self, raw: str) -> List[Dict[str, str]]:
         import re
