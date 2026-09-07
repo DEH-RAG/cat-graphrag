@@ -3419,28 +3419,27 @@ EVIDENCE_FOR: supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
 
 CONCEPT_RELATIONS_EXTRACTION_TEMPLATE = """You are a concept extraction system for educational content. Analyse the text below and extract meaningful conceptual relationships.
 
-For each pair of related concepts return a JSON object with:
-- "subject": the source concept (short noun phrase, max 3 words)
-- "relation_type": one of {relation_definitions}
-- "object": the target concept (short noun phrase, max 3 words)
+Return ONLY a single JSON object with two keys:
+- "concepts": a list of objects, each with "type" and "text"
+- "relations": a list of objects, each with "type", "origin", "destination", and "text"
+
+A concept has:
+- "type": one of the concept types listed under "Concept types" below (choose ONLY from {concept_definitions})
+- "text": the concept itself, a short noun phrase (max 3 words)
+
+A relation has:
+- "type": one of {relation_definitions}
+- "origin": the "text" of the source concept, matching exactly one concept in the "concepts" list (short noun phrase, max 3 words)
+- "destination": the "text" of the target concept, matching exactly one concept in the "concepts" list (short noun phrase, max 3 words)
+- "text": a short sentence describing the relationship between the two concepts
 
 Concept types:
 {concept_definitions}
 
-IS_A = specialisation / hierarchy  (e.g. Python IS_A programming language)
-PART_OF = composition / containment  (e.g. CPU PART_OF computer)
-EXAMPLE_OF = concrete instance  (e.g. Django EXAMPLE_OF web framework)
-PREREQUISITE_FOR = learning dependency  (e.g. Algebra PREREQUISITE_FOR Calculus)
-BUILDS_UPON = conceptual foundation  (e.g. OOP BUILDS_UPON procedural programming)
-CONTRASTS_WITH = comparative distinction  (e.g. REST CONTRASTS_WITH GraphQL)
-APPLIES_TO = practical application  (e.g. Bayes theorem APPLIES_TO spam filtering)
-LEADS_TO = causal chain  (e.g. Global warming LEADS_TO sea level rise)
-EVIDENCE_FOR = supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
-
 Only extract relations that are explicitly stated or clearly implied in the text.
-Return ONLY a valid JSON array of objects, with no additional text. If nothing matches return [].
+Return ONLY a valid JSON object, with no additional text. If nothing matches return {"concepts": [], "relations": []}.
 
-Text:"""
+Text: {text}"""
 
 
 def parse_definitions(text: str) -> Dict[str, str]:
