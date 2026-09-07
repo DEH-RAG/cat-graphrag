@@ -99,6 +99,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
         self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
+        # Raw (unparsed) definition strings: comments + formatting preserved
+        # verbatim, same ``or DEFAULT_*`` fallback as the parsed-dict block above.
+        # Interpolated into the LLM extraction prompt (todo 4).
+        self._raw_concept_definitions = concept_definitions or DEFAULT_CONCEPT_DEFINITIONS
+        self._raw_relation_definitions = relation_definitions or DEFAULT_RELATION_DEFINITIONS
         self._enable_knowledge_graph = enable_knowledge_graph
         self._enable_student_knowledge_graph = enable_student_knowledge_graph
 
