@@ -2845,11 +2845,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
             # Lenient fallback: the parser now returns the {"concepts","relations"}
             # dict natively (todo 5), so the result feeds straight into the store.
-            return self._parse_concept_relations(e.raw_text, lenient=True)
+            return self._parse_concept_relations(e.raw_text)
 
-    def _parse_concept_relations(
-        self, raw: str, lenient: bool = False
-    ) -> Dict[str, list]:
+    def _parse_concept_relations(self, raw: str) -> Dict[str, list]:
         """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
 
         New contract: ``{"concepts": [{"type","text"}], "relations":
@@ -3320,8 +3318,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     # concepts index (via the parser's _norm keys); a relation
                     # endpoint that is not in the concepts list falls back to
                     # its raw text and the CONCEPT type (A1).
-                    s_concept = concept_index.get(rel.get("_norm_origin")) or {}
-                    t_concept = concept_index.get(rel.get("_norm_destination")) or {}
+                    # Strict-path relations (model_dump output) carry no
+                    # _norm_* keys, so fall back to the casefolded raw text to
+                    # resolve endpoint types from the concepts index.
+                    s_concept = concept_index.get(
+                        rel.get("_norm_origin") or rel.get("origin", "").casefold()
+                    ) or {}
+                    t_concept = concept_index.get(
+                        rel.get("_norm_destination") or rel.get("destination", "").casefold()
+                    ) or {}
                     subject = s_concept.get("text") or rel.get("origin")
                     object_ = t_concept.get("text") or rel.get("destination")
                     rel_type = rel.get("type")
