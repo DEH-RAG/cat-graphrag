@@ -2843,13 +2843,29 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 f"[GraphRAG] Structured LLM extraction failed, falling back to "
                 f"lenient parsing: {e}"
             )
-            parsed = self._parse_concept_relations(e.raw_text)
-            # TEMPORARY bridge: the current parser returns the old list shape;
-            # todo 5 reworks it to return the {"concepts","relations"} dict
-            # natively and adapts this call site.
-            return {"concepts": [], "relations": parsed}
+            # Lenient fallback: the parser now returns the {"concepts","relations"}
+            # dict natively (todo 5), so the result feeds straight into the store.
+            return self._parse_concept_relations(e.raw_text, lenient=True)
 
-    def _parse_concept_relations(self, raw: str) -> List[Dict[str, str]]:
+    def _parse_concept_relations(
+        self, raw: str, lenient: bool = False
+    ) -> Dict[str, list]:
+        """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
+
+        New contract: ``{"concepts": [{"type","text"}], "relations":
+        [{"type","origin","destination","text"}]}``. ``type`` values are
+        uppercased and whitelist-enforced against ``self._concept_definitions``
+        / ``self._relation_definitions``; a concept whose type is absent or not
+        whitelisted falls back to ``CONCEPT`` (A1), while a non-whitelisted
+        relation is dropped entirely.
+
+        Legacy (M18): a bare LIST of ``{subject, relation_type, object,
+        [subject_type], [object_type]}`` is normalized into the new shape, with
+        ``concepts`` derived from the unique subjects/objects.
+
+        Never raises: malformed JSON / non-dict payloads yield
+        ``{"concepts": [], "relations": []}``.
+        """
         import re
         import json
 
@@ -2862,37 +2878,87 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
+            # Lenient: pull a bare JSON array (legacy shape) out of prose.
             match = re.search(r"\[[\s\S]*\]", text)
             if match:
                 try:
                     data = json.loads(match.group())
                 except json.JSONDecodeError:
-                    return []
+                    return {"concepts": [], "relations": []}
             else:
-                return []
+                return {"concepts": [], "relations": []}
 
-        if not isinstance(data, list):
-            return []
+        # Legacy (M18): bare list of {subject, relation_type, object, ...}.
+        if isinstance(data, list):
+            valid = set(self._relation_definitions.keys())
+            relations = []
+            concepts: Dict[str, Dict[str, str]] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                s = str(item.get("subject", "")).strip()
+                o = str(item.get("object", "")).strip()
+                r = str(item.get("relation_type", "")).strip().upper()
+                if not (s and o) or r not in valid:
+                    continue
+                relations.append(
+                    {"type": r, "origin": s, "destination": o, "text": ""}
+                )
+                st = str(item.get("subject_type", "") or "").strip().upper()
+                ot = str(item.get("object_type", "") or "").strip().upper()
+                if st not in self._concept_definitions:
+                    st = "CONCEPT"
+                if ot not in self._concept_definitions:
+                    ot = "CONCEPT"
+                concepts.setdefault(
+                    s.casefold(), {"type": st, "text": s, "_norm": s.casefold()}
+                )
+                concepts.setdefault(
+                    o.casefold(), {"type": ot, "text": o, "_norm": o.casefold()}
+                )
+            return {"concepts": list(concepts.values()), "relations": relations}
 
-        valid = set(self._relation_definitions.keys())
+        # New contract: {"concepts": [...], "relations": [...]}.
+        if not isinstance(data, dict):
+            return {"concepts": [], "relations": []}
 
-        result: List[Dict[str, str]] = []
-        for item in data:
+        concepts = []
+        for item in data.get("concepts", []):
             if not isinstance(item, dict):
                 continue
-            s = str(item.get("subject", "")).strip()
-            o = str(item.get("object", "")).strip()
-            r = str(item.get("relation_type", "")).strip().upper()
-            st = str(item.get("subject_type", "") or "").strip().upper()
-            ot = str(item.get("object_type", "") or "").strip().upper()
-            if s and o and r in valid:
-                entry = {"subject": s, "relation_type": r, "object": o}
-                if st:
-                    entry["subject_type"] = st
-                if ot:
-                    entry["object_type"] = ot
-                result.append(entry)
-        return result
+            ctype = str(item.get("type", "")).strip().upper()
+            if ctype not in self._concept_definitions:
+                ctype = "CONCEPT"  # A1 fallback
+            ctext = str(item.get("text", "")).strip()
+            if not ctext:
+                continue
+            concepts.append(
+                {"type": ctype, "text": ctext, "_norm": ctext.casefold()}
+            )
+
+        relations = []
+        for item in data.get("relations", []):
+            if not isinstance(item, dict):
+                continue
+            rtype = str(item.get("type", "")).strip().upper()
+            if rtype not in self._relation_definitions:
+                continue  # drop non-whitelisted
+            origin = str(item.get("origin", "")).strip()
+            destination = str(item.get("destination", "")).strip()
+            if not (origin and destination):
+                continue  # drop relations with empty endpoints
+            relations.append(
+                {
+                    "type": rtype,
+                    "origin": origin,
+                    "destination": destination,
+                    "text": str(item.get("text", "")).strip(),
+                    "_norm_origin": origin.casefold(),
+                    "_norm_destination": destination.casefold(),
+                }
+            )
+
+        return {"concepts": concepts, "relations": relations}
 
     # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
 
