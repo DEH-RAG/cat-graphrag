@@ -2781,7 +2781,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             combined = combined[:max_chars] + " [truncated]"
 
         relations = await self._llm_extract_relations(combined, stray_cat)
-        if not relations:
+        if not relations.get("concepts") and not relations.get("relations"):
             return
 
         # Every concept created from this source is provenance-linked to the
@@ -2800,7 +2800,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             concept_gen=gen or self._concept_fingerprint(),
         )
         log.info(
-            f"[GraphRAG] Stored {len(relations)} concept relations for '{source}'"
+            f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
         )
 
     async def _llm_extract_relations(
@@ -3267,25 +3267,68 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def _store_concept_relations(
         self,
         tenant_id: str,
-        relations: List[Dict[str, str]],
+        relations: Dict[str, list],
         source: str | None = None,
         document_ids: List[str] | None = None,
         concept_gen: str | None = None,
     ) -> None:
-        if not relations:
+        concepts = relations.get("concepts", [])
+        rels = relations.get("relations", [])
+        if not concepts and not rels:
             return
 
         source_files = [source] if source else None
 
-        async with self._get_session() as session:
-            for rel in relations:
-                try:
-                    subject = rel["subject"]
-                    object_ = rel["object"]
-                    rel_type = rel["relation_type"]
+        # Index concepts by their normalized text (the ``_norm`` keys the
+        # parser stored) so relations can resolve origin/destination node
+        # text + type from the concept list. Fall back to casefolded text
+        # when ``_norm`` is missing.
+        concept_index: Dict[str, Dict[str, Any]] = {}
+        for c in concepts:
+            key = c.get("_norm")
+            if not key and c.get("text"):
+                key = c["text"].casefold()
+            if key:
+                concept_index[key] = c
 
-                    s_type, s_enum = self._resolve_concept_entity_type(rel.get("subject_type"))
-                    o_type, o_enum = self._resolve_concept_entity_type(rel.get("object_type"))
+        async with self._get_session() as session:
+            # Concepts first: MERGE an Entity node per concept (name is the
+            # identity), type coalesce first-wins, tagged with the generation
+            # and provenance-tracked so the deletion cascade can prune them.
+            for c in concepts:
+                ctext = c.get("text")
+                if not ctext:
+                    continue
+                ctype = self._resolve_concept_entity_type(c.get("type"))[0]
+                await session.run(
+                    """
+                    MERGE (s:Entity {tenant_id: $tenant_id, name: $name})
+                    SET s.type = coalesce(s.type, $type)
+                    SET s.concept_gen = CASE WHEN $s_gen IS NOT NULL THEN $s_gen ELSE s.concept_gen END
+                    SET s.concept_gen_active = CASE WHEN $s_gen IS NULL THEN s.concept_gen_active END
+                    SET s.tracked_by_provenance = true
+                    """,
+                    tenant_id=tenant_id,
+                    name=ctext,
+                    type=ctype,
+                    s_gen=concept_gen,
+                )
+
+            for rel in rels:
+                try:
+                    # Resolve the origin/destination node text + type from the
+                    # concepts index (via the parser's _norm keys); a relation
+                    # endpoint that is not in the concepts list falls back to
+                    # its raw text and the CONCEPT type (A1).
+                    s_concept = concept_index.get(rel.get("_norm_origin")) or {}
+                    t_concept = concept_index.get(rel.get("_norm_destination")) or {}
+                    subject = s_concept.get("text") or rel.get("origin")
+                    object_ = t_concept.get("text") or rel.get("destination")
+                    rel_type = rel.get("type")
+                    rel_text = rel.get("text") or ""
+
+                    s_type, s_enum = self._resolve_concept_entity_type(s_concept.get("type"))
+                    o_type, o_enum = self._resolve_concept_entity_type(t_concept.get("type"))
 
                     # Generate stable entity IDs using the same hash strategy
                     # as the entity extractor, so concept entities have a
@@ -3315,6 +3358,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                         SET r.concept_gen = CASE WHEN $r_gen IS NOT NULL THEN $r_gen ELSE r.concept_gen END
                         SET r.weight = coalesce(r.weight, 1.0) + 0.5
+                        SET r.text = $rel_text
                         SET r.source_files = CASE
                             WHEN $source_files IS NULL THEN r.source_files
                             WHEN r.source_files IS NULL THEN $source_files
@@ -3332,6 +3376,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         object=object_,
                         object_id=object_id,
                         rel_type=rel_type,
+                        rel_text=rel_text,
                         source_files=source_files,
                     )
 
@@ -3356,7 +3401,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 except Exception as e:
                     log.warning(
                         f"[GraphRAG] Failed to store relation "
-                        f"'{rel['subject']} -[{rel['relation_type']}]-> {rel['object']}': {e}"
+                        f"'{rel.get('origin')} -[{rel.get('type')}]-> {rel.get('destination')}': {e}"
                     )
 
 
