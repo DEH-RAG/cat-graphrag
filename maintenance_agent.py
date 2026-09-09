@@ -377,15 +377,83 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
     return (ccat, handler, None)
 
 
-async def _run_agent(agent_id: str, ops: list[str]) -> bool:
+async def _resolve_ingestion_engine(ccat, op: str = "reembed") -> str | None:
+    """Resolve the active ingestion engine; refuse anything but the efficient one.
+
+    Reads the ``ingestion`` settings category (the saved config name) and
+    resolves it against the allowed classes via ``cat.services.factory.ingestion``
+    (``resolved_config_name``: saved entry, else first plugin class, else the
+    base). Only the efficient engine (``EfficientIngestionConfiguration`` /
+    ``EfficientIngestionEngine``) is supported by ``--reembed``/``--reingest``:
+    the base engine's re-embed path (``embed_all_in_cheshire_cats``) is
+    destructive and out of scope, so it is refused with a message naming the
+    active engine (Metis #23).
+
+    Returns the active config name when the efficient engine is active, else
+    None (the caller marks the op failed → exit 1).
+    """
+    from cat.services.factory.ingestion import resolved_config_name
+
+    agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+    name = await resolved_config_name(ccat)
+    if name != "EfficientIngestionConfiguration":
+        print(
+            f"[maintenance] agent={agent_id} op={op} result=fail "
+            f"detail=engine-not-efficient active={name}"
+        )
+        return None
+    return name
+
+
+async def _op_reembed(ccat, handler, collection: str) -> bool:
+    """Re-embed only: delete the status docs, then run the embedding phase.
+
+    ``reembed_sources`` decides the phase per source from the status doc: no
+    doc + points exist → ``PHASE_EMBEDDING`` (chunk reuse, Metis #9). Deleting
+    the status doc per source therefore forces the embedding phase when the
+    source's points exist — chunks are reused, nothing is re-parsed. Status
+    docs whose source is absent from the enumeration are warned
+    (``detail=file-missing``, Metis #10). ``handler`` is accepted for signature
+    symmetry with the other ops (todo 5+).
+    """
+    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
+    from cat.core_plugins.ingestion_status.registry import delete_status, list_statuses
+    from cat.services.memory.models import VectorMemoryType
+
+    agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+
+    all_sources = await ccat.get_stored_sources_with_metadata()
+    sources = all_sources.get(VectorMemoryType(collection), [])
+
+    # Metis #10: status docs whose source is absent from the enumeration.
+    statuses = await list_statuses(agent_id)
+    known = {s.name for s in sources}
+    for doc in statuses:
+        src = doc.get("source")
+        if src and src not in known:
+            print(
+                f"[maintenance] agent={agent_id} op=reembed result=warn "
+                f"detail=file-missing source={src}"
+            )
+
+    # Metis #9: no doc + points exist → PHASE_EMBEDDING (chunk reuse).
+    for source in sources:
+        await delete_status(agent_id, "agent", source.name)
+
+    await reembed_sources(ccat, VectorMemoryType(collection), sources)
+    return True
+
+
+async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarative") -> bool:
     """Run the requested ops for one agent.
 
     Bootstraps the agent (``CheshireCat.create`` + handler checks +
-    ``initialize``) and dispatches each op. The real op implementations are
-    todos 4-7; for now every runnable op logs ``result=ok detail=bootstrapped``.
-    Skip reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
-    ``graphrag-not-enabled`` (the ``--graph`` op requires the
-    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
+    ``initialize``) and dispatches each op. ``--reembed`` resolves the active
+    ingestion engine first (refusing the base engine, Metis #23) and then runs
+    the embedding phase via ``_op_reembed``; ``--reingest`` and ``--graph`` are
+    todos 5-7 (stub log for now). Skip reasons: ``handler-not-graphrag`` (no
+    GraphRAG handler) and ``graphrag-not-enabled`` (the ``--graph`` op requires
+    the ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
@@ -405,7 +473,21 @@ async def _run_agent(agent_id: str, ops: list[str]) -> bool:
                 f"reason=graphrag-not-enabled"
             )
             continue
-        # TODO(todos 4-7): real op implementations.
+        if op in ("reembed", "reingest"):
+            engine = await _resolve_ingestion_engine(ccat, op=op)
+            if engine is None:
+                ok = False
+                continue
+        if op == "reembed":
+            try:
+                await _op_reembed(ccat, handler, collection)
+            except Exception as exc:  # noqa: BLE001 - per-op isolation
+                print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
+                ok = False
+                continue
+            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reembedded")
+            continue
+        # TODO(todos 5-7): real op implementations.
         print(f"[maintenance] agent={agent_id} op={op} result=ok detail=bootstrapped")
     return ok
 
@@ -451,7 +533,9 @@ async def main() -> None:
     results = []
     for entry in runnable:
         try:
-            ok = await _run_agent(entry["agent_id"], entry["ops"])
+            ok = await _run_agent(
+                entry["agent_id"], entry["ops"], entry["collection"]
+            )
         except Exception as exc:  # noqa: BLE001 - per-agent isolation
             print(f"[maintenance] agent={entry['agent_id']} result=fail detail={exc}")
             ok = False
