@@ -22,10 +22,17 @@ Usage (inside the Cat container):
     # Show the plan without touching anything (exits 2)
     docker exec cheshire_cat_core python /app/maintenance_agent.py --all --graph --dry-run
 
+    # Run the acceptance checks after the ops (read-only)
+    docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --reembed --yes --verify
+
 Exit codes:
-    0 = all agents/ops ok
-    1 = partial failure (some agent/op failed, logged)
-    2 = aborted (dry-run plan printed, or --yes missing for a destructive op)
+    0 = all agents/ops ok (and verify ok when --verify)
+    1 = partial failure (some agent/op failed, or a --verify check failed)
+    2 = aborted (dry-run plan printed, or --yes missing for a destructive step)
+
+Every op requires --yes: --reembed deletes the status docs per source,
+--reingest additionally deletes the source's points and re-ingests, and
+--graph wipes the tenant's graph edges + orphan entities (A0 Cypher).
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. It must have ZERO top-level side
@@ -41,10 +48,26 @@ import sys
 import types  # noqa: F401  (used by the --graph LLM part in a later todo)
 from typing import Any, NotRequired, TypedDict
 
-# Ops that delete or rewrite stored data. `--reingest` wipes points per
-# source; `--graph` wipes the tenant's graph edges + orphan entities.
-# `--reembed` only recomputes vectors (chunk reuse) — not destructive.
-DESTRUCTIVE_OPS = frozenset({"reingest", "graph"})
+# Destructive steps per op — what `--yes` confirms. `--reembed` deletes the
+# status docs per source (forces the embedding phase, Metis #9); `--reingest`
+# deletes the source's points FIRST (points-first wipe) and re-ingests;
+# `--graph` wipes the tenant's graph edges + orphan entities via the A0
+# Cypher. Every op therefore requires `--yes`; the missing-`--yes` message
+# lists these steps per agent+op.
+_DESTRUCTIVE_STEPS: dict[str, list[str]] = {
+    "reingest": [
+        "delete_tenant_points per source (points-first wipe)",
+        "delete_status per source",
+        "reembed_sources re-ingest (re-parse + re-embed)",
+    ],
+    "graph": [
+        "A0 wipe Cypher (5 tenant-filtered statements: RELATED_TO, MENTIONS, "
+        "PROVENANCE, SIMILAR_TO_<gen>, orphan entities)",
+    ],
+    "reembed": [
+        "delete_status per source (forces the embedding phase)",
+    ],
+}
 
 # Batch size for the --graph fixed-part walk: after each batch the Epoch
 # token is re-read (Metis #16 drift re-check) and the batch re-run on drift.
@@ -102,8 +125,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reembed",
         action="store_true",
-        help="Re-embed only: reuse stored chunks, recompute vectors. "
-             "Not destructive.",
+        help="Re-embed only: reuse stored chunks, recompute vectors. Deletes "
+             "status docs per source (requires --yes).",
     )
     parser.add_argument(
         "--graph",
@@ -127,12 +150,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Confirm destructive steps (required for --reingest / --graph).",
+        help="Confirm destructive steps (required for every op: status/point "
+             "deletes, the graph wipe, re-ingest).",
     )
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Run acceptance assertions after the ops (todo 8).",
+        help="Run acceptance assertions after the ops (read-only; never "
+             "against the system agent).",
     )
 
     args = parser.parse_args()
@@ -284,7 +309,14 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
 
 
 def _print_plan(plan: list[_PlanEntry]) -> None:
-    """Print the dry-run plan: per agent+op the concrete steps."""
+    """Print the dry-run plan: per agent+op the concrete steps.
+
+    Pure plan (Metis #26): NO bootstrap, NO writes, NO ``CheshireCat.create``.
+    The A0 wipe statements are printed verbatim (with a ``<gen>`` placeholder
+    for the run-time generation); the per-source wipe/status-delete steps are
+    printed as templates — the actual source names are only known after
+    bootstrap, which dry-run must NOT do.
+    """
     print("DRY-RUN PLAN (no writes performed)")
     for entry in plan:
         agent_id = entry["agent_id"]
@@ -293,27 +325,44 @@ def _print_plan(plan: list[_PlanEntry]) -> None:
             continue
         collection = entry["collection"]
         for op in entry["ops"]:
-            destructive = "yes" if op in DESTRUCTIVE_OPS else "no"
+            destructive = "yes" if op in _DESTRUCTIVE_STEPS else "no"
             print(
                 f"  agent={agent_id} op={op} collection={collection} "
                 f"destructive={destructive}"
             )
             if op == "reingest":
+                print("    steps:")
                 print(
-                    "    steps: delete points per source -> delete status -> "
-                    "reembed_sources (clean re-parse + re-embed)"
+                    "      1. for each source <name>: delete_tenant_points("
+                    f"'{collection}', metadata={{'source': <name>}})"
+                )
+                print(
+                    "      2. for each source <name>: delete_status("
+                    "agent, 'agent', <name>)"
+                )
+                print(
+                    "      3. reembed_sources(ccat, collection, sources)  "
+                    "# re-parse + re-embed (PHASE_PARSING_CHUNKING)"
                 )
             elif op == "reembed":
+                print("    steps:")
                 print(
-                    "    steps: delete status per source -> reembed_sources "
-                    "(chunk reuse, embedding phase only)"
+                    "      1. for each source <name>: delete_status("
+                    "agent, 'agent', <name>)"
+                )
+                print(
+                    "      2. reembed_sources(ccat, collection, sources)  "
+                    "# embedding phase, chunk reuse (PHASE_EMBEDDING)"
                 )
             elif op == "graph":
+                print("    steps:")
+                print("      1. A0 wipe Cypher (5 tenant-filtered statements):")
+                for stmt in _graph_wipe_statements("<gen>"):
+                    print(f"         {stmt}")
                 print(
-                    "    steps: wipe tenant graph edges + orphan entities -> "
-                    "re-walk documents (NER + similarity + derived) -> LLM "
-                    "concept relations (if enabled)"
+                    "      2. re-walk documents (NER + similarity + derived)"
                 )
+                print("      3. LLM concept relations (if enabled)")
     print("(dry-run: exiting 2, nothing was written)")
 
 
@@ -494,20 +543,17 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     return True
 
 
-async def _graph_wipe(handler, tenant_id, gen) -> None:
-    """Phase A0: wipe the tenant's fixed-graph edges + orphan entities.
+def _graph_wipe_statements(gen) -> list[str]:
+    """The 5 tenant-filtered A0 wipe statements (single source of truth).
 
-    The fixed part is additive-only (``_extract_and_link_entities`` MERGEs,
-    never deletes stale edges), so a plain re-walk would accumulate ghost
-    entities and stale relations (Metis #1). No handler helper exists for
-    this — the Cypher is defined HERE, tenant-filtered on every statement
-    (no ``MATCH (e:Entity)`` without ``{tenant_id}``). The
-    Document/SourceFile/Collection structure is kept: only edges and orphan
-    entities are deleted. The SIMILAR_TO relation name is the versioned one
-    of the walk generation (``SIMILAR_TO_<gen>``).
+    Shared by ``_graph_wipe`` (execution) and the dry-run plan printer
+    (``_print_plan``, which passes the literal ``"<gen>"`` placeholder — the
+    real generation is only known after bootstrap, which dry-run must NOT
+    do, Metis #26). Every statement is tenant-filtered; no ``MATCH
+    (e:Entity)`` without ``{tenant_id}``.
     """
     similar_rel = f"SIMILAR_TO_{gen}"
-    statements = [
+    return [
         # 1. RELATED_TO edges — undirected match catches both directions.
         "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]-() DELETE r",
         # 2. MENTIONS edges (Document -> Entity).
@@ -523,8 +569,22 @@ async def _graph_wipe(handler, tenant_id, gen) -> None:
         #    Metis #7).
         "MATCH (e:Entity {tenant_id: $tenant_id}) WHERE NOT (e)--() DELETE e",
     ]
+
+
+async def _graph_wipe(handler, tenant_id, gen) -> None:
+    """Phase A0: wipe the tenant's fixed-graph edges + orphan entities.
+
+    The fixed part is additive-only (``_extract_and_link_entities`` MERGEs,
+    never deletes stale edges), so a plain re-walk would accumulate ghost
+    entities and stale relations (Metis #1). No handler helper exists for
+    this — the Cypher is defined HERE (``_graph_wipe_statements``),
+    tenant-filtered on every statement. The Document/SourceFile/Collection
+    structure is kept: only edges and orphan entities are deleted. The
+    SIMILAR_TO relation name is the versioned one of the walk generation
+    (``SIMILAR_TO_<gen>``).
+    """
     async with handler._get_session() as session:
-        for stmt in statements:
+        for stmt in _graph_wipe_statements(gen):
             await session.run(stmt, tenant_id=tenant_id)
 
 
@@ -805,6 +865,105 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     return ok
 
 
+async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) -> list[tuple[str, bool]]:
+    """Run the acceptance checks (plan Success criteria, Metis #25).
+
+    Read-only assertions against the agent's status docs and the Neo4j
+    graph (via ``handler._get_session()``):
+
+      1. status docs completed with the active embedder/chunker;
+      2. zero ``Document.embedding_<gen> IS NULL``;
+      3. ``MENTIONS`` edge count > 0 and ``SIMILAR_TO_<gen>`` edge count > 0;
+      4. ``Collection.concept_gen_active == handler._concept_fingerprint()``
+         (same read as ``_read_concept_gen``, graphrag_handler.py:2995);
+      5. no orphan entities (no MENTIONS/PROVENANCE) — count == 0;
+      6. ``SourceFile`` count == source count.
+
+    Returns a list of ``(check_name, ok)`` tuples; the caller prints the
+    ``result=verify-ok|verify-fail`` summary. Never destructive.
+    """
+    from cat.core_plugins.ingestion_status.registry import list_statuses
+    from cat.services.memory.models import VectorMemoryType
+
+    tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+    if gen is None:
+        gen = getattr(handler, "_walk_gen", None) or await handler._read_generation(
+            tenant_id
+        )
+
+    checks: list[tuple[str, bool]] = []
+
+    # 1. status docs completed with the active embedder/chunker.
+    embedder = await ccat.embedder()
+    chunker = ccat.chunker
+    statuses = await list_statuses(tenant_id)
+    checks.append(
+        (
+            "status-completed-active-embedder-chunker",
+            bool(statuses)
+            and all(
+                doc.get("status") == "completed"
+                and doc.get("embedder_name") == embedder.name
+                and doc.get("chunker_name") == chunker.name
+                for doc in statuses
+            ),
+        )
+    )
+
+    async def _scalar(query: str) -> Any:
+        async with handler._get_session() as session:
+            result = await session.run(query, tenant_id=tenant_id)
+            record = await result.single()
+            return record["n"] if record is not None else None
+
+    embedding_prop = f"embedding_{gen}"
+    similar_rel = f"SIMILAR_TO_{gen}"
+
+    # 2. zero Document.embedding_<gen> IS NULL.
+    null_emb = await _scalar(
+        f"MATCH (d:Document {{tenant_id: $tenant_id}}) "
+        f"WHERE d.{embedding_prop} IS NULL RETURN count(d) AS n"
+    )
+    checks.append(("no-null-embeddings", null_emb == 0))
+
+    # 3. MENTIONS > 0 and SIMILAR_TO_<gen> > 0.
+    mentions = await _scalar(
+        "MATCH (:Document {tenant_id: $tenant_id})-[r:MENTIONS]->() "
+        "RETURN count(r) AS n"
+    )
+    similar = await _scalar(
+        f"MATCH (:Document {{tenant_id: $tenant_id}})-[r:{similar_rel}]-"
+        f">(:Document {{tenant_id: $tenant_id}}) RETURN count(r) AS n"
+    )
+    checks.append(("mentions-edges", mentions > 0))
+    checks.append(("similar-to-edges", similar > 0))
+
+    # 4. Collection.concept_gen_active == fingerprint.
+    active_gen = await _scalar(
+        "MATCH (c:Collection {tenant_id: $tenant_id}) "
+        "RETURN c.concept_gen_active AS n LIMIT 1"
+    )
+    checks.append(("concept-gen-active", active_gen == handler._concept_fingerprint()))
+
+    # 5. no orphan entities (no MENTIONS/PROVENANCE) — count == 0.
+    orphans = await _scalar(
+        "MATCH (e:Entity {tenant_id: $tenant_id}) "
+        "WHERE NOT (e)-[:MENTIONS]-() AND NOT (e)-[:PROVENANCE]-() "
+        "RETURN count(e) AS n"
+    )
+    checks.append(("no-orphan-entities", orphans == 0))
+
+    # 6. SourceFile count == source count.
+    all_sources = await ccat.get_stored_sources_with_metadata()
+    sources = all_sources.get(VectorMemoryType(collection), [])
+    source_files = await _scalar(
+        "MATCH (s:SourceFile {tenant_id: $tenant_id}) RETURN count(s) AS n"
+    )
+    checks.append(("sourcefile-count", source_files == len(sources)))
+
+    return checks
+
+
 async def main() -> None:
     """CLI entrypoint: parse -> runtime guard -> plan -> dry-run/yes gates -> run."""
     args = _parse_args()
@@ -834,17 +993,22 @@ async def main() -> None:
             (entry["agent_id"], op)
             for entry in runnable
             for op in entry["ops"]
-            if op in DESTRUCTIVE_OPS
+            if op in _DESTRUCTIVE_STEPS
         ]
         if destructive:
             print("ABORTED: destructive operations require --yes:")
             for agent_id, op in destructive:
-                print(f"  agent={agent_id} op={op}")
+                print(f"  agent={agent_id} op={op} steps:")
+                for step in _DESTRUCTIVE_STEPS[op]:
+                    print(f"    - {step}")
             print("Re-run with --yes to confirm (or --dry-run to preview).")
             sys.exit(2)
 
     results = []
     for entry in runnable:
+        # Sequential per-agent execution (Metis #18): agents are processed one
+        # at a time, so no two ops ever run concurrently on the same agent.
+        print(f"[maintenance] agent={entry['agent_id']} progress=start")
         try:
             ok = await _run_agent(
                 entry["agent_id"], entry["ops"], entry["collection"]
@@ -852,9 +1016,46 @@ async def main() -> None:
         except Exception as exc:  # noqa: BLE001 - per-agent isolation
             print(f"[maintenance] agent={entry['agent_id']} result=fail detail={exc}")
             ok = False
+        print(f"[maintenance] agent={entry['agent_id']} progress=done")
         results.append(ok)
 
-    if all(results):
+    # --verify: acceptance checks per agent (read-only; the system agent is
+    # never in the plan, so it can never be verified either).
+    verify_ok = True
+    if args.verify:
+        for entry in runnable:
+            try:
+                ccat, handler, reason = await _bootstrap_agent(entry["agent_id"])
+                if reason is not None:
+                    print(
+                        f"[maintenance] agent={entry['agent_id']} "
+                        f"result=verify-skip reason={reason}"
+                    )
+                    continue
+                checks = await _verify_agent(ccat, handler, entry["collection"])
+            except Exception as exc:  # noqa: BLE001 - per-agent isolation
+                print(
+                    f"[maintenance] agent={entry['agent_id']} "
+                    f"result=verify-fail detail={exc}"
+                )
+                verify_ok = False
+                continue
+            failed = [name for name, ok_ in checks if not ok_]
+            if failed:
+                verify_ok = False
+                print(
+                    f"[maintenance] agent={entry['agent_id']} result=verify-fail "
+                    f"checks={len(checks) - len(failed)}/{len(checks)} "
+                    f"failed={','.join(failed)}"
+                )
+            else:
+                print(
+                    f"[maintenance] agent={entry['agent_id']} result=verify-ok "
+                    f"checks={len(checks)}/{len(checks)}"
+                )
+        print(f"[maintenance] result=verify-{'ok' if verify_ok else 'fail'}")
+
+    if all(results) and verify_ok:
         sys.exit(0)
     sys.exit(1)
 
