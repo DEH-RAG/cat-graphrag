@@ -309,17 +309,104 @@ def _print_plan(plan: list[_PlanEntry]) -> None:
     print("(dry-run: exiting 2, nothing was written)")
 
 
+async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | None]:
+    """Bootstrap one agent for the maintenance ops.
+
+    Creates the agent's ``CheshireCat`` (NOT ``BillTheLizard`` — the lizard
+    fires the resume-sweep hooks we want to skip), checks that the vector
+    memory handler is the plugin's ``GraphRAGHandler``, connects it, and runs
+    ``initialize`` (required for the vector index; on an embedder change it
+    launches the seamless shadow-swap ``reembed_tenant``, which flips the
+    Epoch token — the flip is logged). Snapshots the current generation on
+    the handler as ``_walk_gen`` (consumed by the ``--graph`` A-helper) and
+    records the GraphRAG detection (``_graphrag_detected`` /
+    ``_concept_relations_enabled``) from the ``Neo4jGraphRAGConfig``
+    vector-db setting entry.
+
+    Returns ``(ccat, handler, None)`` on success, or
+    ``(ccat, None, "handler-not-graphrag")`` when the agent's vector memory
+    handler is not a ``GraphRAGHandler``.
+    """
+    from cat.looking_glass.cheshire_cat import CheshireCat
+
+    ccat = await CheshireCat.create(agent_id)
+    handler = ccat.vector_memory_handler
+
+    # The deployed plugin id is resolved at runtime (never hardcoded); the
+    # handler class is imported from the plugin module so isinstance checks
+    # the deployed code, not this script's copy.
+    plugin_id = _resolve_plugin_id()
+    if plugin_id is None:
+        return (ccat, None, "handler-not-graphrag")
+    graphrag_module = importlib.import_module(f"cat.plugins.{plugin_id}.graphrag_handler")
+    if not isinstance(handler, graphrag_module.GraphRAGHandler):
+        return (ccat, None, "handler-not-graphrag")
+
+    # The versioned decorators probe _get_session() BEFORE the decorated body
+    # runs, so the driver must be connected first (AGENTS.md known pitfall).
+    await handler._ensure_connected()
+
+    # Generation baseline: initialize() may detect an embedder change and run
+    # the shadow-swap reembed_tenant, which flips the Epoch token — the flip
+    # is the observable side effect we log (Metis #3).
+    gen_before = await handler._read_generation(agent_id)
+
+    embedder = await ccat.embedder()
+    await handler.initialize(embedder.name, embedder.size)
+
+    gen = await handler._read_generation(agent_id)
+    handler._walk_gen = gen
+    if gen != gen_before:
+        print(
+            f"[maintenance] agent={agent_id} detail=initialize-triggered-reembed "
+            f"gen={gen_before}->{gen}"
+        )
+
+    # GraphRAG detection: the vector-db setting entry named after the config
+    # class (same semantics as main.py:137). The --graph op additionally
+    # requires enable_concept_relations; the per-op skip is decided in
+    # _run_agent.
+    from cat.db.cruds import settings as crud_settings
+
+    entry = await crud_settings.get_setting_by_name(agent_id, "Neo4jGraphRAGConfig")
+    handler._graphrag_detected = entry is not None
+    handler._concept_relations_enabled = bool(
+        (entry or {}).get("value", {}).get("enable_concept_relations", False)
+    )
+
+    return (ccat, handler, None)
+
+
 async def _run_agent(agent_id: str, ops: list[str]) -> bool:
     """Run the requested ops for one agent.
 
-    STUB — todo 3+ implements the real work (bootstrap, engine, graph walk).
-    Logs one grep-able summary line per op. Returns True when every op
-    succeeded, False otherwise.
+    Bootstraps the agent (``CheshireCat.create`` + handler checks +
+    ``initialize``) and dispatches each op. The real op implementations are
+    todos 4-7; for now every runnable op logs ``result=ok detail=bootstrapped``.
+    Skip reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
+    ``graphrag-not-enabled`` (the ``--graph`` op requires the
+    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
+    Returns True when every op succeeded or was skipped, False otherwise.
     """
+    ccat, handler, reason = await _bootstrap_agent(agent_id)
+    if reason is not None:
+        for op in ops:
+            print(f"[maintenance] agent={agent_id} op={op} result=skip reason={reason}")
+        return True
+
     ok = True
     for op in ops:
-        # TODO(todo 3+): real implementation.
-        print(f"[maintenance] agent={agent_id} op={op} result=ok detail=stub")
+        if op == "graph" and not (
+            getattr(handler, "_graphrag_detected", False)
+            and getattr(handler, "_concept_relations_enabled", False)
+        ):
+            print(
+                f"[maintenance] agent={agent_id} op={op} result=skip "
+                f"reason=graphrag-not-enabled"
+            )
+            continue
+        # TODO(todos 4-7): real op implementations.
+        print(f"[maintenance] agent={agent_id} op={op} result=ok detail=bootstrapped")
     return ok
 
 
