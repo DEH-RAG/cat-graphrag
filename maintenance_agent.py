@@ -36,14 +36,22 @@ import happens inside functions.
 import argparse
 import asyncio
 import importlib.util
+import json
 import sys
 import types  # noqa: F401  (used by the --graph LLM part in a later todo)
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 # Ops that delete or rewrite stored data. `--reingest` wipes points per
 # source; `--graph` wipes the tenant's graph edges + orphan entities.
 # `--reembed` only recomputes vectors (chunk reuse) — not destructive.
 DESTRUCTIVE_OPS = frozenset({"reingest", "graph"})
+
+# Batch size for the --graph fixed-part walk: after each batch the Epoch
+# token is re-read (Metis #16 drift re-check) and the batch re-run on drift.
+_GRAPH_WALK_BATCH_SIZE = 50
+# Upper bound for per-batch re-runs after a generation drift; beyond it the
+# batch is logged as unstable and the walk continues with the new generation.
+_GRAPH_WALK_MAX_RERUNS = 3
 
 # The admin's default agent (cat.db.database.DEFAULT_SYSTEM_KEY) is always
 # skipped by the enumeration; the legacy `default` agent is kept with a
@@ -486,6 +494,200 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     return True
 
 
+async def _graph_wipe(handler, tenant_id, gen) -> None:
+    """Phase A0: wipe the tenant's fixed-graph edges + orphan entities.
+
+    The fixed part is additive-only (``_extract_and_link_entities`` MERGEs,
+    never deletes stale edges), so a plain re-walk would accumulate ghost
+    entities and stale relations (Metis #1). No handler helper exists for
+    this — the Cypher is defined HERE, tenant-filtered on every statement
+    (no ``MATCH (e:Entity)`` without ``{tenant_id}``). The
+    Document/SourceFile/Collection structure is kept: only edges and orphan
+    entities are deleted. The SIMILAR_TO relation name is the versioned one
+    of the walk generation (``SIMILAR_TO_<gen>``).
+    """
+    similar_rel = f"SIMILAR_TO_{gen}"
+    statements = [
+        # 1. RELATED_TO edges — undirected match catches both directions.
+        "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]-() DELETE r",
+        # 2. MENTIONS edges (Document -> Entity).
+        "MATCH (:Document {tenant_id: $tenant_id})-[r:MENTIONS]->() DELETE r",
+        # 3. PROVENANCE edges (Document -> Entity).
+        "MATCH (:Document {tenant_id: $tenant_id})-[r:PROVENANCE]->() DELETE r",
+        # 4. SIMILAR_TO edges of the walk generation (Document <-> Document).
+        f"MATCH (:Document {{tenant_id: $tenant_id}})-[r:{similar_rel}]->"
+        f"(:Document {{tenant_id: $tenant_id}}) DELETE r",
+        # 5. Orphan entities: once the edges above are gone, entities with NO
+        #    edges at all are orphans — including stale ones (PROVENANCE was
+        #    deleted in step 3, so the cascade-prune condition matches,
+        #    Metis #7).
+        "MATCH (e:Entity {tenant_id: $tenant_id}) WHERE NOT (e)--() DELETE e",
+    ]
+    async with handler._get_session() as session:
+        for stmt in statements:
+            await session.run(stmt, tenant_id=tenant_id)
+
+
+async def _graph_fetch_docs(handler, tenant_id, gen) -> list[dict[str, Any]]:
+    """Phase A1: fetch the tenant's stored Documents with their embeddings.
+
+    Same fetch pattern as ``recompute_concept_relations``
+    (graphrag_handler.py:3157-3164) plus the versioned embedding property
+    ``embedding_<gen>`` of the walk generation. Metadata is stored as a JSON
+    string in Neo4j and parsed back to a dict here (same handling as the
+    handler's own walk).
+    """
+    embedding_prop = f"embedding_{gen}"
+    query = (
+        "MATCH (d:Document {tenant_id: $tenant_id}) "
+        f"RETURN d.id AS id, d.content AS content, d.metadata AS metadata, "
+        f"d.{embedding_prop} AS embedding"
+    )
+    async with handler._get_session() as session:
+        result = await session.run(query, tenant_id=tenant_id)
+        rows = [record async for record in result]
+
+    docs: list[dict[str, Any]] = []
+    for row in rows:
+        raw_meta = row["metadata"]
+        try:
+            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+        except (TypeError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        docs.append(
+            {
+                "id": row["id"],
+                "content": row["content"] or "",
+                "metadata": meta,
+                "embedding": row["embedding"],
+            }
+        )
+    return docs
+
+
+async def _graph_walk_batch(handler, batch: list[dict[str, Any]], collection: str) -> None:
+    """Phase A2: re-walk one batch of documents INLINE.
+
+    Per doc: ``_extract_and_link_entities`` then
+    ``_create_similarity_relationships`` — both awaited synchronously (Metis
+    #8: NEVER ``add_point_to_tenant`` — its Document CREATE is not
+    idempotent — and NEVER ``create_task`` fire-and-forget). The vector for
+    similarity is the doc's ``embedding_<gen>`` property; docs without one
+    are skipped (the handler's own guard rejects zero/non-finite vectors,
+    but a missing property must not even reach it).
+    """
+    for doc in batch:
+        doc_id = doc["id"]
+        await handler._extract_and_link_entities(doc_id, doc["content"], doc["metadata"])
+        vector = doc["embedding"]
+        if vector:
+            await handler._create_similarity_relationships(doc_id, vector, collection)
+
+
+async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
+    """Rebuild the FIXED graph part: wipe-then-re-walk (NER + similarity + derived).
+
+    Phases:
+      A0 wipe — tenant-filtered Cypher defined here (no handler helper
+         exists, Metis #1): RELATED_TO / MENTIONS / PROVENANCE /
+         SIMILAR_TO_<gen> edges + orphan entities;
+      A1 fetch — stored Documents with their ``embedding_<gen>`` (same fetch
+         as ``recompute_concept_relations``), grouped by ``metadata.source``;
+      A2 re-walk — per doc, ``_extract_and_link_entities`` +
+         ``_create_similarity_relationships`` INLINE (Metis #8);
+      A3 derived — per source, ``create_derived_graph_for_source`` WITHOUT
+         ``stray_cat`` (Metis #6: passing it would double-run the LLM part B
+         and inflate ``RELATED_TO.weight`` by +0.5 per run); warns when a
+         point lacks ``chunk_index`` (derived structure not rebuildable,
+         Metis #5);
+      A4 gen re-check — per batch, re-read the Epoch token; on drift from
+         ``handler._walk_gen``, ``_rebuild_for_generation`` + re-run the
+         batch (bounded: max 3 re-runs per batch, then log error, Metis #16).
+
+    Part B (LLM concept relations) is todo 7 — this op never touches it.
+    """
+    tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+
+    gen = getattr(handler, "_walk_gen", None)
+    if gen is None:
+        gen = await handler._read_generation(tenant_id)
+        handler._walk_gen = gen
+
+    # ── Phase A0: wipe ────────────────────────────────────────────────────
+    await _graph_wipe(handler, tenant_id, gen)
+
+    # ── Phase A1: fetch ───────────────────────────────────────────────────
+    docs = await _graph_fetch_docs(handler, tenant_id, gen)
+
+    # ── Phase A2 + A4: walk in batches with per-batch generation re-check ─
+    for start in range(0, len(docs), _GRAPH_WALK_BATCH_SIZE):
+        batch = docs[start : start + _GRAPH_WALK_BATCH_SIZE]
+        await _graph_walk_batch(handler, batch, collection)
+
+        gen_now = await handler._read_generation(tenant_id)
+        if gen_now == gen:
+            continue
+
+        print(
+            f"[maintenance] agent={tenant_id} op=graph result=warn "
+            f"detail=generation-drift gen={gen}->{gen_now}"
+        )
+        handler._rebuild_for_generation(gen_now)
+        gen = gen_now
+        handler._walk_gen = gen
+        docs = await _graph_fetch_docs(handler, tenant_id, gen)
+        batch_ids = {d["id"] for d in batch}
+        rerun_docs = [d for d in docs if d["id"] in batch_ids]
+        for _attempt in range(1, _GRAPH_WALK_MAX_RERUNS + 1):
+            await _graph_walk_batch(handler, rerun_docs, collection)
+            gen_now = await handler._read_generation(tenant_id)
+            if gen_now == gen:
+                break
+            handler._rebuild_for_generation(gen_now)
+            gen = gen_now
+            handler._walk_gen = gen
+            docs = await _graph_fetch_docs(handler, tenant_id, gen)
+            rerun_docs = [d for d in docs if d["id"] in batch_ids]
+        else:
+            print(
+                f"[maintenance] agent={tenant_id} op=graph result=error "
+                f"detail=generation-drift-unstable gen={gen}"
+            )
+
+    # ── Phase A3: derived structure per source (no stray_cat — Metis #6) ──
+    from cat.services.memory.models import PointStruct
+
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for doc in docs:
+        source = str(doc["metadata"].get("source") or "unknown")
+        by_source.setdefault(source, []).append(doc)
+
+    for source in sorted(by_source):
+        src_docs = by_source[source]
+        missing_ci = [d for d in src_docs if d["metadata"].get("chunk_index") is None]
+        if missing_ci:
+            print(
+                f"[maintenance] agent={tenant_id} op=graph result=warn "
+                f"detail=missing-chunk-index source={source} docs={len(missing_ci)}"
+            )
+        points = [
+            PointStruct(
+                id=d["id"],
+                payload={
+                    "id": d["id"],
+                    "page_content": d["content"],
+                    "metadata": d["metadata"],
+                },
+            )
+            for d in src_docs
+        ]
+        await handler.create_derived_graph_for_source(source, points)
+
+    return True
+
+
 async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarative") -> bool:
     """Run the requested ops for one agent.
 
@@ -493,11 +695,13 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     ``initialize``) and dispatches each op. ``--reembed`` and ``--reingest``
     resolve the active ingestion engine first (refusing the base engine, Metis
     #23) and then run the embedding phase via ``_op_reembed`` / the points-
-    first wipe + clean re-parse via ``_op_reingest``; ``--graph`` is todos 6-7
-    (stub log for now). Skip reasons: ``handler-not-graphrag`` (no GraphRAG
-    handler) and ``graphrag-not-enabled`` (the ``--graph`` op requires the
-    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
-    Returns True when every op succeeded or was skipped, False otherwise.
+    first wipe + clean re-parse via ``_op_reingest``; ``--graph`` runs Part A
+    (fixed graph wipe-then-rebuild, ``_op_graph_part_a``) — Part B (LLM
+    concept relations) is todo 7. Skip reasons: ``handler-not-graphrag`` (no
+    GraphRAG handler) and ``graphrag-not-enabled`` (the ``--graph`` op
+    requires the ``Neo4jGraphRAGConfig`` setting with
+    ``enable_concept_relations``). Returns True when every op succeeded or
+    was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
     if reason is not None:
@@ -539,8 +743,15 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 continue
             print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reingested")
             continue
-        # TODO(todos 6-7): real op implementations.
-        print(f"[maintenance] agent={agent_id} op={op} result=ok detail=bootstrapped")
+        if op == "graph":
+            try:
+                await _op_graph_part_a(ccat, handler, collection)
+            except Exception as exc:  # noqa: BLE001 - per-op isolation
+                print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
+                ok = False
+                continue
+            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=graph-part-a")
+            continue
     return ok
 
 
