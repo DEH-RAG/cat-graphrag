@@ -38,24 +38,28 @@ import asyncio
 import importlib.util
 import sys
 import types  # noqa: F401  (used by the --graph LLM part in a later todo)
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 # Ops that delete or rewrite stored data. `--reingest` wipes points per
 # source; `--graph` wipes the tenant's graph edges + orphan entities.
 # `--reembed` only recomputes vectors (chunk reuse) — not destructive.
 DESTRUCTIVE_OPS = frozenset({"reingest", "graph"})
 
-# Placeholder agent id used by `--all` until todo 2 implements the real
-# enumeration (get_agents_main_keys minus `system`).
-ALL_AGENTS_PLACEHOLDER = "__ALL__"
+# The admin's default agent (cat.db.database.DEFAULT_SYSTEM_KEY) is always
+# skipped by the enumeration; the legacy `default` agent is kept with a
+# one-time warning (module-level flag: warn once per process, not per call).
+_default_agent_warned = False
 
 
 class _PlanEntry(TypedDict):
-    """One per-agent plan entry: target, ops, collection."""
+    """One per-agent plan entry: target, ops, collection, optional skip."""
 
     agent_id: str
     ops: list[str]
     collection: str
+    # Present when the agent is excluded from the run (e.g. the GraphRAG
+    # plugin is not active for it while `--graph` was requested).
+    skip_reason: NotRequired[str]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -158,26 +162,117 @@ def _runtime_guard() -> bool:
     return True
 
 
-def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
+async def _list_agents() -> list[str]:
+    """Enumerate agent ids from Redis (read-only).
+
+    ``get_agents_main_keys()`` scans ``agents:*`` and returns the unique
+    second key segment. The ``system`` agent (the admin's default,
+    ``cat.db.database.DEFAULT_SYSTEM_KEY``) is always skipped; the legacy
+    ``default`` agent is kept with a one-time warning.
+    """
+    global _default_agent_warned
+
+    from cat.db.cruds import settings as crud_settings
+
+    ids = await crud_settings.get_agents_main_keys()
+
+    agents: list[str] = []
+    for agent_id in ids:
+        if agent_id == "system":
+            continue
+        if agent_id == "default" and not _default_agent_warned:
+            print(
+                "[maintenance] warn: agent 'default' is the legacy default "
+                "agent — included in the plan"
+            )
+            _default_agent_warned = True
+        agents.append(agent_id)
+    return agents
+
+
+def _resolve_plugin_id() -> str | None:
+    """Resolve the deployed GraphRAG plugin folder name at runtime.
+
+    Scans the Cat plugins dir (``cat/plugins``) plus the optional
+    ``CAT_PLUGINS_DIR`` override for a folder containing a
+    ``graphrag_handler.py`` that defines ``GraphRAGHandler``. Returns the
+    folder name (the deployed plugin id, e.g. ``cat_graphrag``) or None when
+    the plugin is not deployed. Never hardcoded: the repo folder is
+    ``cat-graphrag.my`` but the deployed id is ``cat_graphrag``.
+    """
+    import os
+
+    from cat.env import get_env
+    from cat.utils import get_plugins_path
+
+    candidates = []
+    try:
+        candidates.append(get_plugins_path())
+    except Exception:  # noqa: BLE001 - a broken cat.utils must not kill the scan
+        pass
+    env_dir = get_env("CAT_PLUGINS_DIR")
+    if env_dir:
+        candidates.append(env_dir)
+
+    for plugins_dir in candidates:
+        if not os.path.isdir(plugins_dir):
+            continue
+        for folder in sorted(os.listdir(plugins_dir)):
+            handler_path = os.path.join(plugins_dir, folder, "graphrag_handler.py")
+            if not os.path.isfile(handler_path):
+                continue
+            try:
+                with open(handler_path, encoding="utf-8", errors="ignore") as fh:
+                    if "class GraphRAGHandler" in fh.read():
+                        return folder
+            except OSError:
+                continue
+    return None
+
+
+async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
     """Build the per-agent ops plan.
 
-    Each entry: ``{"agent_id": ..., "ops": [...], "collection": ...}``.
-    ``--agent <id>`` yields one entry; ``--all`` yields the placeholder
-    ``["__ALL__"]`` that todo 2 expands into the real agent list (minus
-    ``system``).
+    ``--agent <id>`` validates the id against the live agent list (aborts
+    with exit 2 when unknown); ``--all`` expands to every agent minus
+    ``system``. When ``--graph`` is requested, the agent set is intersected
+    with the agents that have the GraphRAG plugin active; the others get a
+    ``skip_reason="plugin-not-active"`` entry.
     """
+    agents = await _list_agents()
+
     if args.agent:
+        if args.agent not in agents:
+            print(f"ABORTED: unknown agent {args.agent}")
+            sys.exit(2)
         agent_ids = [args.agent]
     else:
-        agent_ids = [ALL_AGENTS_PLACEHOLDER]
-    return [
-        {
+        agent_ids = agents
+
+    active: set[str] = set()
+    if "graph" in args.ops:
+        plugin_id = _resolve_plugin_id()
+        if plugin_id is None:
+            print(
+                "ABORTED: GraphRAG plugin not found in the plugins dir "
+                "(--graph requires it)"
+            )
+            sys.exit(2)
+        from cat.db.cruds import plugins as crud_plugins
+
+        active = set(await crud_plugins.get_agents_plugin_keys(plugin_id))
+
+    plan: list[_PlanEntry] = []
+    for agent_id in agent_ids:
+        entry: _PlanEntry = {
             "agent_id": agent_id,
             "ops": list(args.ops),
             "collection": args.collection,
         }
-        for agent_id in agent_ids
-    ]
+        if "graph" in args.ops and agent_id not in active:
+            entry["skip_reason"] = "plugin-not-active"
+        plan.append(entry)
+    return plan
 
 
 def _print_plan(plan: list[_PlanEntry]) -> None:
@@ -185,6 +280,9 @@ def _print_plan(plan: list[_PlanEntry]) -> None:
     print("DRY-RUN PLAN (no writes performed)")
     for entry in plan:
         agent_id = entry["agent_id"]
+        if entry.get("skip_reason"):
+            print(f"  agent={agent_id} SKIPPED (reason={entry.get('skip_reason')})")
+            continue
         collection = entry["collection"]
         for op in entry["ops"]:
             destructive = "yes" if op in DESTRUCTIVE_OPS else "no"
@@ -232,16 +330,27 @@ async def main() -> None:
     if not _runtime_guard():
         sys.exit(2)
 
-    plan = _build_ops_plan(args)
+    plan = await _build_ops_plan(args)
 
     if args.dry_run:
         _print_plan(plan)
         sys.exit(2)
 
+    # Skipped agents (e.g. plugin-not-active) are reported, not run.
+    runnable = []
+    for entry in plan:
+        if entry.get("skip_reason"):
+            print(
+                f"[maintenance] agent={entry['agent_id']} result=skip "
+                f"reason={entry.get('skip_reason')}"
+            )
+        else:
+            runnable.append(entry)
+
     if not args.yes:
         destructive = [
             (entry["agent_id"], op)
-            for entry in plan
+            for entry in runnable
             for op in entry["ops"]
             if op in DESTRUCTIVE_OPS
         ]
@@ -253,7 +362,7 @@ async def main() -> None:
             sys.exit(2)
 
     results = []
-    for entry in plan:
+    for entry in runnable:
         try:
             ok = await _run_agent(entry["agent_id"], entry["ops"])
         except Exception as exc:  # noqa: BLE001 - per-agent isolation
