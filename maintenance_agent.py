@@ -606,7 +606,8 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
          ``handler._walk_gen``, ``_rebuild_for_generation`` + re-run the
          batch (bounded: max 3 re-runs per batch, then log error, Metis #16).
 
-    Part B (LLM concept relations) is todo 7 — this op never touches it.
+    Part B (LLM concept relations) is ``_op_graph_part_b`` — this op never
+    touches it.
     """
     tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
 
@@ -688,6 +689,50 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
     return True
 
 
+async def _op_graph_part_b(ccat, handler) -> bool:
+    """Rebuild the LLM concept-relations part with a latest-wins flip loop.
+
+    Runs ONLY when GraphRAG is detected AND ``enable_concept_relations``
+    (enforced in ``_run_agent``). The LLM re-extraction needs only
+    ``ccat.large_language_model`` — a ``SimpleNamespace`` duck suffices (Metis
+    #19, verified ``_llm_extract_relations`` graphrag_handler.py:2830 touches
+    only that attr).
+
+    Latest-wins loop (Metis #14): the in-process single-flight in main.py does
+    NOT coordinate with this separate process — the persisted
+    ``concept_gen_active`` marker IS the cross-process guard. Each pass:
+    fingerprint -> read the active marker -> recompute with the new gen ->
+    ``_flip_concept_gen(expected_prev=active)``; a False flip means a newer
+    save won the race, so the loop re-reads the marker and retries (max 3
+    attempts). After a successful flip, the deferred GC of stale
+    old-generation concept nodes runs. Returns True on a committed flip,
+    False when the gen-guard aborted on every attempt.
+    """
+    tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+    stray_duck = types.SimpleNamespace(large_language_model=ccat.large_language_model)
+
+    for attempt in range(1, 4):
+        gen = handler._concept_fingerprint()
+        active = await handler._read_concept_gen(tenant_id)
+        await handler.recompute_concept_relations(stray_duck, gen=gen)
+        flipped = await handler._flip_concept_gen(
+            tenant_id, expected_prev=active, new_gen=gen
+        )
+        if flipped:
+            await handler._gc_stale_concept_nodes(tenant_id)
+            return True
+        print(
+            f"[maintenance] agent={tenant_id} op=graph result=warn "
+            f"detail=flip-conflict retry={attempt}"
+        )
+
+    print(
+        f"[maintenance] agent={tenant_id} op=graph result=fail "
+        f"detail=flip-conflict-exhausted"
+    )
+    return False
+
+
 async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarative") -> bool:
     """Run the requested ops for one agent.
 
@@ -696,12 +741,12 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     resolve the active ingestion engine first (refusing the base engine, Metis
     #23) and then run the embedding phase via ``_op_reembed`` / the points-
     first wipe + clean re-parse via ``_op_reingest``; ``--graph`` runs Part A
-    (fixed graph wipe-then-rebuild, ``_op_graph_part_a``) — Part B (LLM
-    concept relations) is todo 7. Skip reasons: ``handler-not-graphrag`` (no
-    GraphRAG handler) and ``graphrag-not-enabled`` (the ``--graph`` op
-    requires the ``Neo4jGraphRAGConfig`` setting with
-    ``enable_concept_relations``). Returns True when every op succeeded or
-    was skipped, False otherwise.
+    (fixed graph wipe-then-rebuild, ``_op_graph_part_a``) then Part B (LLM
+    concept relations with the latest-wins flip, ``_op_graph_part_b``). Skip
+    reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
+    ``graphrag-not-enabled`` (the ``--graph`` op requires the
+    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
+    Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
     if reason is not None:
@@ -746,11 +791,16 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
         if op == "graph":
             try:
                 await _op_graph_part_a(ccat, handler, collection)
+                part_b_ok = await _op_graph_part_b(ccat, handler)
             except Exception as exc:  # noqa: BLE001 - per-op isolation
                 print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
                 ok = False
                 continue
-            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=graph-part-a")
+            if not part_b_ok:
+                # Part B already logged result=fail detail=flip-conflict-exhausted.
+                ok = False
+                continue
+            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=graph")
             continue
     return ok
 
