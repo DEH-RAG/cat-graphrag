@@ -444,16 +444,59 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     return True
 
 
+async def _op_reingest(ccat, handler, collection: str) -> bool:
+    """Re-ingest from scratch: delete points per source, then re-parse + re-embed.
+
+    ``reembed_sources`` decides the phase per source from the status doc: no
+    doc + no points → ``PHASE_PARSING_CHUNKING`` (clean re-parse, Metis #9).
+    Deleting the status doc ALONE would leave the source's points in place and
+    silently chunk-reuse (``PHASE_EMBEDDING``) — so the points MUST be deleted
+    FIRST, per source, via ``handler.delete_tenant_points(str(collection),
+    metadata={"source": name})`` (which also triggers the provenance-cascade
+    graph cleanup), and only THEN the status doc. URL sources are passed
+    through as-is: the engine re-downloads them (the ``content=None`` path in
+    ``_source_from_entry``), so their points are NOT deleted by source name —
+    each pass-through is logged (``detail=url-pass-through``).
+    """
+    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
+    from cat.core_plugins.ingestion_status.registry import delete_status
+    from cat.services.memory.models import VectorMemoryType
+    from cat.utils import is_url
+
+    agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+
+    all_sources = await ccat.get_stored_sources_with_metadata()
+    sources = all_sources.get(VectorMemoryType(collection), [])
+
+    # Metis #9 points-first: delete the source's points, THEN the status doc,
+    # so reembed_sources sees no doc + no points → PHASE_PARSING_CHUNKING.
+    for source in sources:
+        if is_url(source.name):
+            print(
+                f"[maintenance] agent={agent_id} op=reingest result=warn "
+                f"detail=url-pass-through source={source.name}"
+            )
+            continue
+        await handler.delete_tenant_points(
+            str(collection), metadata={"source": source.name}
+        )
+        await delete_status(agent_id, "agent", source.name)
+
+    await reembed_sources(ccat, VectorMemoryType(collection), sources)
+    return True
+
+
 async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarative") -> bool:
     """Run the requested ops for one agent.
 
     Bootstraps the agent (``CheshireCat.create`` + handler checks +
-    ``initialize``) and dispatches each op. ``--reembed`` resolves the active
-    ingestion engine first (refusing the base engine, Metis #23) and then runs
-    the embedding phase via ``_op_reembed``; ``--reingest`` and ``--graph`` are
-    todos 5-7 (stub log for now). Skip reasons: ``handler-not-graphrag`` (no
-    GraphRAG handler) and ``graphrag-not-enabled`` (the ``--graph`` op requires
-    the ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
+    ``initialize``) and dispatches each op. ``--reembed`` and ``--reingest``
+    resolve the active ingestion engine first (refusing the base engine, Metis
+    #23) and then run the embedding phase via ``_op_reembed`` / the points-
+    first wipe + clean re-parse via ``_op_reingest``; ``--graph`` is todos 6-7
+    (stub log for now). Skip reasons: ``handler-not-graphrag`` (no GraphRAG
+    handler) and ``graphrag-not-enabled`` (the ``--graph`` op requires the
+    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
@@ -487,7 +530,16 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 continue
             print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reembedded")
             continue
-        # TODO(todos 5-7): real op implementations.
+        if op == "reingest":
+            try:
+                await _op_reingest(ccat, handler, collection)
+            except Exception as exc:  # noqa: BLE001 - per-op isolation
+                print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
+                ok = False
+                continue
+            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reingested")
+            continue
+        # TODO(todos 6-7): real op implementations.
         print(f"[maintenance] agent={agent_id} op={op} result=ok detail=bootstrapped")
     return ok
 
