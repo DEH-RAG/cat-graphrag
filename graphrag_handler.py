@@ -3410,41 +3410,51 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     )
 
 
-DEFAULT_CONCEPT_DEFINITIONS = "CONCEPT: general knowledge concept\n"
-DEFAULT_RELATION_DEFINITIONS = """IS_A: specialisation / hierarchy  (e.g. Python IS_A programming language)
-PART_OF: composition / containment  (e.g. CPU PART_OF computer)
-EXAMPLE_OF: concrete instance  (e.g. Django EXAMPLE_OF web framework)
-PREREQUISITE_FOR: learning dependency  (e.g. Algebra PREREQUISITE_FOR Calculus)
-BUILDS_UPON: conceptual foundation  (e.g. OOP BUILDS_UPON procedural programming)
-CONTRASTS_WITH: comparative distinction  (e.g. REST CONTRASTS_WITH GraphQL)
-APPLIES_TO: practical application  (e.g. Bayes theorem APPLIES_TO spam filtering)
-LEADS_TO: causal chain  (e.g. Global warming LEADS_TO sea level rise)
-EVIDENCE_FOR: supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
-"""
+DEFAULT_CONCEPT_DEFINITIONS = """## Concept types (assign each extracted concept exactly one type)
+DEFINITION: a term or idea formally defined in the text (e.g. "Overfitting")
+ENTITY: a concrete object, actor, tool, technology, or organization (e.g. "Transformer architecture")
+PROCESS: an action, method, procedure, or mechanism unfolding over steps or time (e.g. "Backpropagation")
+PROPERTY_OR_METRIC: a measurable or qualitative attribute of another concept (e.g. "Model accuracy")
+EXAMPLE_OR_CASE: a specific instance, dataset, experiment, or case study (e.g. "ImageNet dataset")
+PRINCIPLE_OR_THEORY: a general rule, law, or theoretical framework (e.g. "Bayes' theorem")
+CONTEXT_OR_ACTOR: historical, biographical, or institutional context (e.g. "Geoffrey Hinton")"""
 
-CONCEPT_RELATIONS_EXTRACTION_TEMPLATE = """You are a concept extraction system for educational content. Analyse the text below and extract meaningful conceptual relationships.
+DEFAULT_RELATION_DEFINITIONS = """## Relation types — Tier 1: pedagogical/navigational (search for and prioritize these first)
+PREREQUISITE_FOR: learning dependency (e.g. Algebra PREREQUISITE_FOR Calculus)
+BUILDS_UPON: conceptual foundation (e.g. OOP BUILDS_UPON procedural programming)
+APPLIES_TO: practical application (e.g. Bayes theorem APPLIES_TO spam filtering)
 
-Return ONLY a single JSON object with two keys:
-- "concepts": a list of objects, each with "type" and "text"
-- "relations": a list of objects, each with "type", "origin", "destination", and "text"
+## Relation types — Tier 2: descriptive/semantic
+IS_A: specialisation / hierarchy (e.g. Python IS_A programming language)
+PART_OF: composition / containment (e.g. CPU PART_OF computer)
+EXAMPLE_OF: concrete instance (e.g. Django EXAMPLE_OF web framework)
+CONTRASTS_WITH: comparative distinction (e.g. REST CONTRASTS_WITH GraphQL)
+CAUSES: direct causal mechanism (e.g. Overfitting CAUSES poor generalization)
+LEADS_TO: longer causal/consequential chain (e.g. Global warming LEADS_TO sea level rise)
+EVIDENCE_FOR: supporting evidence (e.g. Study results EVIDENCE_FOR hypothesis)"""
 
-A concept has:
-- "type": one of the concept types listed under "Concept types" below (choose ONLY from {concept_definitions})
-- "text": the concept itself, a short noun phrase (max 3 words)
+CONCEPT_RELATIONS_EXTRACTION_TEMPLATE = """# Prompt main schema
+You are a concept extraction system for educational content. Analyse the text below and extract meaningful concepts and conceptual relationships that would help a student navigate the material and understand its structure. When multiple relation types could apply to the same pair, prefer PREREQUISITE_FOR or BUILDS_UPON if a learning-order or foundational dependency is present.
 
-A relation has:
-- "type": one of {relation_definitions}
-- "origin": the "text" of the source concept, matching exactly one concept in the "concepts" list (short noun phrase, max 3 words)
-- "destination": the "text" of the target concept, matching exactly one concept in the "concepts" list (short noun phrase, max 3 words)
-- "text": a short sentence describing the relationship between the two concepts
-
-Concept types:
 {concept_definitions}
 
-Only extract relations that are explicitly stated or clearly implied in the text.
-Return ONLY a valid JSON object, with no additional text. If nothing matches return {"concepts": [], "relations": []}.
+{relation_definitions}
 
-Text: {text}"""
+For each concept, return a JSON object with:
+- "text": short noun phrase, max 3 words
+- "type": one of the defined concept types above
+
+For each pair of related concepts, return a JSON object with:
+- "origin": the source concept (short noun phrase, max 3 words)
+- "type": one of the defined relation types above (Tier 1 or Tier 2)
+- "destination": the target concept (short noun phrase, max 3 words)
+- "text": a short sentence describing the relationship between the two concepts
+
+Only extract concepts and relations that are explicitly stated or clearly implied in the text. Do not invent concepts absent from the text.
+Return ONLY a valid JSON object with two arrays, "concepts" and "relations", and no additional text. If nothing matches return {"concepts": [], "relations": []}.
+
+Text:
+{text}"""
 
 
 def parse_definitions(text: str) -> Dict[str, str]:
