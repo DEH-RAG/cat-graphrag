@@ -95,8 +95,10 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     handler = cat.vector_memory_handler
     if not isinstance(handler, GraphRAGHandler):
         return
-    settings = await cat.mad_hatter.get_plugin().load_settings()
-    if not settings.get("enable_derived_graph", True):
+    # Single source of truth: the handler's config (vector-DB settings), NOT the
+    # plugin settings store (which is empty unless explicitly saved — a stale
+    # default there silently disabled the whole derived-graph + LLM path, FX-1).
+    if not getattr(handler, "_enable_derived_graph", False):
         return
     await handler.create_derived_graph_for_source(source, stored_points, cat)
 
