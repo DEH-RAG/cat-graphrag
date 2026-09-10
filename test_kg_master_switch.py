@@ -20,7 +20,11 @@ for LLM concept/relation extraction):
 - the AND gate also holds from the other side: ``enable_knowledge_graph=True``
   with ``enable_concept_relations=False`` still skips the LLM call;
 - ``recompute_concept_relations`` returns early (no LLM call) when
-  ``enable_knowledge_graph=False`` even if ``enable_concept_relations=True``.
+  ``enable_knowledge_graph=False`` even if ``enable_concept_relations=True``;
+- points WITHOUT ``chunk_index`` (e.g. the efficient_ingestion engine) fall
+  back to arrival order, so the derived graph still runs and step 8 still
+  reaches the LLM call when both flags are True (and still skips it when
+  ``enable_knowledge_graph=False``); the CATALOG card stays excluded.
 """
 
 import asyncio
@@ -286,6 +290,14 @@ def _stored_points():
     ]
 
 
+def _stored_points_no_chunk_index():
+    """Points as produced by efficient_ingestion: no chunk_index in metadata."""
+    return [
+        _Point("doc1", chunk_index=None, chunk_level="section"),
+        _Point("doc2", chunk_index=None, chunk_level="paragraph"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -333,6 +345,50 @@ def test_derived_graph_skips_llm_when_cr_off():
     extract.assert_not_awaited()
 
 
+def test_derived_graph_calls_llm_without_chunk_index():
+    """No chunk_index (efficient_ingestion) + KG on + CR on: fallback to
+    arrival order must still reach step 8 and call _extract_concept_relations;
+    the CATALOG card stays excluded from the derived graph."""
+    handler = _make_handler(kg=True, cr=True)
+    session = _FakeSession()
+    handler._get_session = lambda: session
+
+    points = [
+        _Point("doc1", chunk_index=None, chunk_level="section"),
+        _Point("doc2", chunk_index=None, chunk_level="paragraph"),
+        _Point("card1", chunk_index=None, is_catalogue_card=True),
+    ]
+
+    with patch.object(
+        type(handler), "_extract_concept_relations", new=AsyncMock()
+    ) as extract:
+        asyncio.run(handler.create_derived_graph_for_source(
+            "file.pdf", points, stray_cat=object()
+        ))
+
+    extract.assert_awaited_once()
+
+    # The CATALOG card must not be part of the derived graph (PART_OF links).
+    part_of_params = [params for q, params in session.queries if "PART_OF" in q]
+    assert part_of_params, "expected a PART_OF query"
+    assert "card1" not in part_of_params[0]["point_ids"]
+
+
+def test_derived_graph_skips_llm_without_chunk_index_when_kg_off():
+    """No chunk_index (efficient_ingestion) + KG off + CR on: the fallback
+    still must NOT call _extract_concept_relations."""
+    handler = _make_handler(kg=False, cr=True)
+
+    with patch.object(
+        type(handler), "_extract_concept_relations", new=AsyncMock()
+    ) as extract:
+        asyncio.run(handler.create_derived_graph_for_source(
+            "file.pdf", _stored_points_no_chunk_index(), stray_cat=object()
+        ))
+
+    extract.assert_not_awaited()
+
+
 def test_recompute_returns_early_when_kg_off():
     """KG off + CR on: recompute_concept_relations must return before any LLM call."""
     handler = _make_handler(kg=False, cr=True)
@@ -363,6 +419,8 @@ def main():
         test_derived_graph_skips_llm_when_kg_off,
         test_derived_graph_calls_llm_when_kg_and_cr_on,
         test_derived_graph_skips_llm_when_cr_off,
+        test_derived_graph_calls_llm_without_chunk_index,
+        test_derived_graph_skips_llm_without_chunk_index_when_kg_off,
         test_recompute_returns_early_when_kg_off,
     ]
     for test in tests:

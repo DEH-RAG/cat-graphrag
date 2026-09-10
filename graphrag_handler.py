@@ -2590,7 +2590,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         profiles gracefully — only creates structure that the available metadata
         supports.
 
-        Always created (require only chunk_index + source):
+        Always created (require only source; chunk_index is used when present,
+        otherwise derived from the arrival order of the points):
           - :SourceFile node + [:PART_OF] from each document
           - [:NEXT] edges between consecutive chunks (ordered by chunk_index)
 
@@ -2626,7 +2627,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 })
 
         if not regular_points:
-            return
+            # Fallback: some ingestion engines (e.g. efficient_ingestion) do not
+            # set chunk_index on point metadata.  Derive chunk order from the
+            # arrival order of the points instead, so the derived graph (and the
+            # LLM concept/relation extraction in step 8) still runs.  The CATALOG
+            # card stays excluded.
+            for p in stored_points:
+                meta = (p.payload or {}).get("metadata", {}) or {}
+                if meta.get("is_catalogue_card"):
+                    continue
+                regular_points.append({
+                    "id": p.id,
+                    "chunk_index": len(regular_points),
+                    "chunk_level": meta.get("chunk_level"),
+                    "parent_id": meta.get("parent_id"),
+                    "has_formula": meta.get("has_formula", False),
+                })
+            if not regular_points:
+                return
 
         regular_points.sort(key=lambda x: x["chunk_index"])
         point_ids = [rp["id"] for rp in regular_points]
