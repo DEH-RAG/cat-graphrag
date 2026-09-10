@@ -106,6 +106,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._raw_concept_definitions = concept_definitions or DEFAULT_CONCEPT_DEFINITIONS
         self._raw_relation_definitions = relation_definitions or DEFAULT_RELATION_DEFINITIONS
         self._enable_knowledge_graph = enable_knowledge_graph
+        # Visualization-only flag (D2): never gates backend extraction/retrieval.
         self._enable_student_knowledge_graph = enable_student_knowledge_graph
 
         self._driver: Optional[AsyncDriver] = None
@@ -3588,7 +3589,7 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
     enable_student_knowledge_graph: bool = Field(
         default=False,
-        description="Enable knowledge graph features for students",
+        description="Used only by the frontend visualisation; no backend extraction/retrieval gating.",
     )
 
     # Performance
