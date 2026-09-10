@@ -421,15 +421,16 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
 
     # GraphRAG detection: the vector-db setting entry named after the config
     # class (same semantics as main.py:137). The --graph op additionally
-    # requires enable_concept_relations; the per-op skip is decided in
-    # _run_agent.
+    # requires enable_knowledge_graph AND enable_concept_relations (D1: the
+    # knowledge-graph flag is the master switch for LLM concept extraction);
+    # the per-op skip is decided in _run_agent.
     from cat.db.cruds import settings as crud_settings
 
     entry = await crud_settings.get_setting_by_name(agent_id, "Neo4jGraphRAGConfig")
     handler._graphrag_detected = entry is not None
-    handler._concept_relations_enabled = bool(
-        (entry or {}).get("value", {}).get("enable_concept_relations", False)
-    )
+    kg = bool((entry or {}).get("value", {}).get("enable_knowledge_graph", False))
+    cr = bool((entry or {}).get("value", {}).get("enable_concept_relations", False))
+    handler._concept_relations_enabled = bool(kg and cr)
 
     return (ccat, handler, None)
 
@@ -805,7 +806,8 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     concept relations with the latest-wins flip, ``_op_graph_part_b``). Skip
     reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
     ``graphrag-not-enabled`` (the ``--graph`` op requires the
-    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
+    ``Neo4jGraphRAGConfig`` setting with ``enable_knowledge_graph`` AND
+    ``enable_concept_relations``).
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)

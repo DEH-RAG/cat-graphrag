@@ -2745,8 +2745,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction
-        if self._enable_concept_relations and stray_cat:
+        # 8 — LLM-based concept relation extraction (gated on the
+        # enable_knowledge_graph master switch, D1)
+        if self._enable_knowledge_graph and self._enable_concept_relations and stray_cat:
             try:
                 await self._extract_concept_relations(source, stored_points, stray_cat)
             except Exception as e:
@@ -3146,7 +3147,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         OTHER generation. No re-ingest, no re-embed, no full wipe; every query
         is tenant-scoped and the walk is serialized by the write semaphore.
         """
-        if not self._enable_concept_relations:
+        if not (self._enable_knowledge_graph and self._enable_concept_relations):
             return
         tenant_id = self.agent_id
         if gen is None:
