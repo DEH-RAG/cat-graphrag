@@ -75,6 +75,12 @@ class StructuredLLM:
             else:
                 text = str(res)
                 model = None
+                # lazy import (import-safe plugin rule): top level stays stdlib-only
+                from cat.log import log
+
+                log.warning(
+                    f"[GraphRAG] Structured LLM returned non-structured result: {str(res)[:200]}"
+                )
         except Exception as e:
             raw = getattr(e, "raw_text", "")
             raise StructuredLLMError(f"Native structured output failed: {e}", raw)

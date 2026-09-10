@@ -2836,6 +2836,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 data = model.model_dump()
             else:
                 data = model or {}
+            if not data.get("concepts") and not data.get("relations"):
+                log.warning(
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
+                    f"raw={result.text[:300]!r}"
+                )
             return {
                 "concepts": data.get("concepts", []),
                 "relations": data.get("relations", []),
@@ -2847,7 +2852,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
             # Lenient fallback: the parser now returns the {"concepts","relations"}
             # dict natively (todo 5), so the result feeds straight into the store.
-            return self._parse_concept_relations(e.raw_text)
+            data = self._parse_concept_relations(e.raw_text)
+            if not data.get("concepts") and not data.get("relations"):
+                log.warning(
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
+                    f"raw={e.raw_text[:300]!r}"
+                )
+            return data
 
     def _parse_concept_relations(self, raw: str) -> Dict[str, list]:
         """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
