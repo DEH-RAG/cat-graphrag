@@ -180,9 +180,18 @@ def _install_pydantic_stub():
             for name, value in kwargs.items():
                 setattr(self, name, value)
 
+    def BeforeValidator(fn):
+        # Identity is enough for the stub: the real one wraps a validator fn.
+        return fn
+
+    def create_model(name, **kwargs):
+        return type(name, (BaseModel,), {})
+
     setattr(pydantic_mod, "Field", Field)
     setattr(pydantic_mod, "ConfigDict", ConfigDict)
     setattr(pydantic_mod, "BaseModel", BaseModel)
+    setattr(pydantic_mod, "BeforeValidator", BeforeValidator)
+    setattr(pydantic_mod, "create_model", create_model)
     sys.modules["pydantic"] = pydantic_mod
 
 
@@ -205,6 +214,7 @@ class _FakeGraph:
     """Minimal in-memory graph: Document/Entity nodes, MENTIONS + SIMILAR_TO."""
 
     def __init__(self):
+        self.epochs = {}      # tenant_id -> generation token
         self.documents = {}   # (tenant_id, doc_id) -> content
         self.entities = {}    # (tenant_id, entity_id) -> {"name", "type"}
         self.mentions = set()  # (tenant_id, doc_id, entity_id)
@@ -246,6 +256,9 @@ class _FakeResult:
         for r in self._records:
             yield r
 
+    async def single(self):
+        return self._records[0] if self._records else None
+
 
 class _FakeTx:
     def __init__(self, session):
@@ -270,6 +283,18 @@ class _FakeSession:
         self.queries.append((query, params))
         q = query
         tenant = params.get("tenant_id")
+
+        # 0. Epoch queries (refresh_technology_entities syncs the versioned
+        #    names with the current generation before writing).
+        if "RETURN e.generation AS gen" in q:
+            gen = self.graph.epochs.get(tenant)
+            if gen is None:
+                return _FakeResult([])
+            return _FakeResult([{"gen": gen}])
+
+        if "ON CREATE SET e.generation = 'v1'" in q:
+            self.graph.epochs.setdefault(tenant, "v1")
+            return _FakeResult([])
 
         # 1. Fetch stored documents of the tenant.
         if "RETURN d.id AS id, d.content AS content" in q:

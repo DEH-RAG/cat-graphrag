@@ -198,9 +198,18 @@ def _install_pydantic_stub():
             for name, value in kwargs.items():
                 setattr(self, name, value)
 
+    def BeforeValidator(fn):
+        # Identity is enough for the stub: the real one wraps a validator fn.
+        return fn
+
+    def create_model(name, **kwargs):
+        return type(name, (BaseModel,), {})
+
     setattr(pydantic_mod, "Field", Field)
     setattr(pydantic_mod, "ConfigDict", ConfigDict)
     setattr(pydantic_mod, "BaseModel", BaseModel)
+    setattr(pydantic_mod, "BeforeValidator", BeforeValidator)
+    setattr(pydantic_mod, "create_model", create_model)
     sys.modules["pydantic"] = pydantic_mod
 
 
@@ -311,26 +320,33 @@ class _FakeSession:
             self.graph.indexes.add(name)
             return _FakeResult([])
 
+        # ── Conditional embedding write (add_point_to_tenant) ─────────────
+        if "SET d.embedding_" in q and "$embedding" in q:
+            prop = re.search(r"SET d\.(\w+) = \$embedding", q).group(1)
+            doc = self.graph.docs.get(params["id"])
+            if doc is not None:
+                doc[prop] = params["embedding"]
+            return _FakeResult([])
+
         # ── Backfill: copy legacy unversioned embedding -> embedding_{gen} ─
-        if "SET d.embedding_" in q and "d.embedding" in q:
+        if "SET d.embedding_" in q and "= d.embedding" in q:
             prop = re.search(r"SET d\.(\w+) = d\.embedding", q).group(1)
             for doc in self.graph.docs.values():
                 if doc["tenant_id"] == tenant and "embedding" in doc and prop not in doc:
                     doc[prop] = doc["embedding"]
             return _FakeResult([])
 
+        # ── Backfill: copy legacy unversioned entity embedding -> entity_embedding_{gen} ─
+        if "SET e.entity_embedding_" in q and "e.embedding" in q:
+            return _FakeResult([])
+
         # ── CREATE Document (add_point_to_tenant) ─────────────────────────
         if "CREATE (d:Document {" in q:
-            prop = re.search(
-                r"CREATE \(d:Document \{\s*id: \$id,\s*content: \$content,\s*(\w+): \$embedding",
-                q,
-            ).group(1)
             self.graph.docs[params["id"]] = {
                 "id": params["id"],
                 "tenant_id": tenant,
                 "content": params["content"],
                 "collection": params["collection_name"],
-                prop: params["embedding"],
             }
             return _FakeResult([{"id": params["id"]}])
 
@@ -468,7 +484,9 @@ def test_versioned_names_suffixes():
         "embedding_prop": "embedding_v2",
         "index": "document_embeddings_v2",
         "relation": "SIMILAR_TO_v2",
-    }, "all three schema names must be version-suffixed"
+        "entity_embedding_prop": "entity_embedding_v2",
+        "entity_index": "entity_embeddings_v2",
+    }, "all five schema names must be version-suffixed"
 
 
 def test_ensure_version_probes_rebuilds_and_runs_once():

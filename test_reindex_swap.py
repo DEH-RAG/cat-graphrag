@@ -213,9 +213,18 @@ def _install_pydantic_stub():
             for name, value in kwargs.items():
                 setattr(self, name, value)
 
+    def BeforeValidator(fn):
+        # Identity is enough for the stub: the real one wraps a validator fn.
+        return fn
+
+    def create_model(name, **kwargs):
+        return type(name, (BaseModel,), {})
+
     setattr(pydantic_mod, "Field", Field)
     setattr(pydantic_mod, "ConfigDict", ConfigDict)
     setattr(pydantic_mod, "BaseModel", BaseModel)
+    setattr(pydantic_mod, "BeforeValidator", BeforeValidator)
+    setattr(pydantic_mod, "create_model", create_model)
     sys.modules["pydantic"] = pydantic_mod
 
 
@@ -329,6 +338,10 @@ class _FakeSession:
                     doc[prop] = d["vector"]
             return _FakeResult([])
 
+        # ── Shadow-build: carry entity embeddings forward (v1 -> v2) ───────
+        if "MATCH (e:Entity" in q and "SET e.entity_embedding_" in q:
+            return _FakeResult([])
+
         # ── Shadow-build: create the versioned vector index ────────────────
         if "CREATE VECTOR INDEX" in q:
             name = re.search(r"CREATE VECTOR INDEX (\S+) IF NOT EXISTS", q).group(1)
@@ -377,6 +390,10 @@ class _FakeSession:
             for doc in self.graph.docs.values():
                 if doc["tenant_id"] == tenant:
                     doc.pop(prop, None)
+            return _FakeResult([])
+
+        # ── GC: remove the old entity embedding property ───────────────────
+        if "REMOVE e.entity_embedding_" in q:
             return _FakeResult([])
 
         raise AssertionError(f"Unhandled query in fake session:\n{q}")
