@@ -92,8 +92,15 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
 
 @hook
 async def after_rabbithole_stored_documents(source: str, stored_points: List[PointStruct], cat) -> None:
+    # Lazy import (FX-7): the plugin loader reloads each file in glob order and
+    # main.py comes BEFORE graphrag_handler.py, so a module-level import binds
+    # the PRE-reload class and isinstance() below ALWAYS fails (the factory
+    # instantiates the handler from the CURRENT, post-reload class). Import at
+    # call time, when graphrag_handler is the current module, so the check
+    # matches the class the factory actually created.
+    from .graphrag_handler import GraphRAGHandler as _GH
     handler = cat.vector_memory_handler
-    if not isinstance(handler, GraphRAGHandler):
+    if not isinstance(handler, _GH):
         return
     # Single source of truth: the handler's config (vector-DB settings), NOT the
     # plugin settings store (which is empty unless explicitly saved — a stale
