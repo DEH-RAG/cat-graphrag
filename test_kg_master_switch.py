@@ -19,6 +19,11 @@ for LLM concept/relation extraction):
 - the same step DOES call it when both flags are True;
 - the AND gate also holds from the other side: ``enable_knowledge_graph=True``
   with ``enable_concept_relations=False`` still skips the LLM call;
+- the vector-db path is SELF-CONTAINED: with both flags True and NO ``stray_cat``
+  (e.g. the ``add_points_to_tenant`` trigger, where plugin hooks are unreliable),
+  step 8 resolves the agent LLM via ``_resolve_agent_llm()`` and still calls
+  ``_extract_concept_relations``; with ``enable_knowledge_graph=False`` it skips
+  both the resolution and the call;
 - ``recompute_concept_relations`` returns early (no LLM call) when
   ``enable_knowledge_graph=False`` even if ``enable_concept_relations=True``;
 - points WITHOUT ``chunk_index`` (e.g. the efficient_ingestion engine) fall
@@ -402,6 +407,54 @@ def test_recompute_returns_early_when_kg_off():
     extract.assert_not_awaited()
 
 
+class _FakeLLM:
+    """Minimal stand-in for the agent LLM returned by _resolve_agent_llm."""
+
+    def __init__(self, name="fake-llm"):
+        self.name = name
+
+
+def test_derived_graph_calls_llm_without_stray_cat():
+    """KG on + CR on, NO stray_cat (vector-db path, e.g. add_points_to_tenant):
+    step 8 must resolve the agent LLM via _resolve_agent_llm and call
+    _extract_concept_relations, passing the resolved LLM."""
+    handler = _make_handler(kg=True, cr=True)
+    fake_llm = _FakeLLM()
+
+    with patch.object(
+        type(handler), "_extract_concept_relations", new=AsyncMock()
+    ) as extract, patch.object(
+        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=fake_llm)
+    ) as resolve:
+        asyncio.run(handler.create_derived_graph_for_source(
+            "file.pdf", _stored_points()
+        ))
+
+    resolve.assert_awaited_once()
+    extract.assert_awaited_once()
+    # the resolved LLM must flow into the extraction call
+    _, kwargs = extract.await_args
+    assert kwargs.get("llm") is fake_llm
+
+
+def test_derived_graph_skips_llm_without_stray_cat_when_kg_off():
+    """KG off + CR on, NO stray_cat: step 8 must NOT resolve the LLM and must
+    NOT call _extract_concept_relations."""
+    handler = _make_handler(kg=False, cr=True)
+
+    with patch.object(
+        type(handler), "_extract_concept_relations", new=AsyncMock()
+    ) as extract, patch.object(
+        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=_FakeLLM())
+    ) as resolve:
+        asyncio.run(handler.create_derived_graph_for_source(
+            "file.pdf", _stored_points()
+        ))
+
+    resolve.assert_not_awaited()
+    extract.assert_not_awaited()
+
+
 def main():
     _install_stubs()
 
@@ -422,6 +475,8 @@ def main():
         test_derived_graph_calls_llm_without_chunk_index,
         test_derived_graph_skips_llm_without_chunk_index_when_kg_off,
         test_recompute_returns_early_when_kg_off,
+        test_derived_graph_calls_llm_without_stray_cat,
+        test_derived_graph_skips_llm_without_stray_cat_when_kg_off,
     ]
     for test in tests:
         test()

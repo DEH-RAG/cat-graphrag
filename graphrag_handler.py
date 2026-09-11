@@ -2764,21 +2764,83 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
 
         # 8 — LLM-based concept relation extraction (gated on the
-        # enable_knowledge_graph master switch, D1)
-        if self._enable_knowledge_graph and self._enable_concept_relations and stray_cat:
+        # enable_knowledge_graph master switch, D1). Self-contained: when no
+        # stray_cat is available (vector-db path via add_points_to_tenant — the
+        # plugin hooks are unreliable under the multi-worker toggle race, so
+        # they cannot be the trigger), the agent LLM is resolved directly from
+        # the saved agent config via _resolve_agent_llm().
+        if self._enable_knowledge_graph and self._enable_concept_relations:
             try:
-                await self._extract_concept_relations(source, stored_points, stray_cat)
+                if stray_cat is not None:
+                    await self._extract_concept_relations(source, stored_points, stray_cat)
+                else:
+                    llm = await self._resolve_agent_llm()
+                    if llm is not None:
+                        await self._extract_concept_relations(source, stored_points, llm=llm)
             except Exception as e:
                 log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
+
+    async def _resolve_agent_llm(self) -> Optional[Any]:
+        """Resolve the agent's configured LLM without a ``StrayCat`` reference.
+
+        Self-contained vector-db path: step 8 of ``create_derived_graph_for_source``
+        also runs from ``add_points_to_tenant``, where no ``stray_cat`` is passed
+        and the plugin hooks are unreliable (multi-worker toggle race). The LLM
+        is resolved through the official ``ServiceProvider`` against the agent's
+        saved ``llm`` config — the same mechanism ``CheshireCat.create`` uses — so
+        any configured LLM class works (not just the probe's OpenRouterLLM). The
+        plugin manager is taken from the running ``BillTheLizard`` singleton:
+        ``base_plugin`` always registers ``factory_allowed_llms``, so the hook is
+        always present in its registry. Imports are lazy (plugin import-safe rule).
+
+        Returns None when the agent has no LLM or resolution fails (step 8
+        degrades to a no-op); the resolved LLM is cached on the handler so a
+        multi-file ingestion resolves it once.
+        """
+        cached = getattr(self, "_llm", None)
+        if cached is not None:
+            return cached
+        agent_id = getattr(self, "agent_id", None)
+        if not agent_id:
+            return None
+        try:
+            # lazy imports (plugin import-safe rule)
+            from cat.looking_glass.bill_the_lizard import BillTheLizard
+            from cat.services.service_provider import ServiceProvider
+
+            plugin_manager = getattr(BillTheLizard(), "plugin_manager", None)
+            if plugin_manager is None:
+                return None
+            llm = await ServiceProvider().get_large_language_model(agent_id, plugin_manager)
+            if llm is None or type(llm).__name__ == "LLMDefault":
+                # The dumb fallback LLM is never a usable extractor.
+                return None
+            self._llm = llm
+            return llm
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[GraphRAG] Could not resolve agent LLM for '{agent_id}': {e}")
+            return None
 
     async def _extract_concept_relations(
         self,
         source: str,
         stored_points: List["PointStruct"],
-        stray_cat,
+        stray_cat=None,
         gen: str | None = None,
+        llm=None,
     ) -> None:
         tenant_id = self.agent_id
+
+        # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
+        # LLM (hook path), then a self-contained resolve from the agent config
+        # (vector-db path, no stray_cat). None -> skip silently.
+        if llm is None:
+            if stray_cat is not None:
+                llm = getattr(stray_cat, "large_language_model", None)
+            if llm is None:
+                llm = await self._resolve_agent_llm()
+        if llm is None:
+            return
 
         # Join full section texts (no per-chunk truncation), up to a total limit
         texts: List[str] = []
@@ -2800,7 +2862,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if len(combined) > max_chars:
             combined = combined[:max_chars] + " [truncated]"
 
-        relations = await self._llm_extract_relations(combined, stray_cat)
+        relations = await self._llm_extract_relations(combined, llm=llm)
         if not relations.get("concepts") and not relations.get("relations"):
             return
 
@@ -2824,8 +2886,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
 
     async def _llm_extract_relations(
-        self, text: str, stray_cat
+        self, text: str, stray_cat=None, llm=None
     ) -> Dict[str, list]:
+        # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
+        # LLM. The self-contained resolve happens one level up
+        # (``_extract_concept_relations``); a None here means no LLM is
+        # available -> return empty (step 8 no-op).
+        if llm is None:
+            if stray_cat is not None:
+                llm = getattr(stray_cat, "large_language_model", None)
+        if llm is None:
+            return {"concepts": [], "relations": []}
         # Use the per-agent prompt from settings; fall back to the built-in
         # default when it is not configured (None / empty). The document text
         # is concatenated after the prompt (no {text} placeholder anymore).
@@ -2847,7 +2918,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         output_model = self._build_llm_output_model()
         try:
             result = await StructuredLLM().run(
-                full_prompt, stray_cat.large_language_model, output_model
+                full_prompt, llm, output_model
             )
             model = result.model
             if hasattr(model, "model_dump"):
