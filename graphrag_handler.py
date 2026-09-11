@@ -3316,7 +3316,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         "page_content": p["page_content"],
                         "metadata": p["metadata"],
                     },
-                    vector=None,
+                    vector=[],
                 )
                 for p in by_source[source]
             ]
