@@ -1,6 +1,7 @@
-"""Standalone verification for the FX-7 fix: the hook
-``after_rabbithole_stored_documents`` survives the plugin loader's reload
-order via a lazy in-function ``GraphRAGHandler`` import.
+"""Standalone verification for the FX-7/FX-9 fixes: the hooks
+``after_rabbithole_stored_documents`` (FX-7) and
+``after_vector_database_settings_update`` (FX-9) survive the plugin loader's
+reload order via a lazy in-function ``GraphRAGHandler`` import.
 
 The MyCAT plugin loader (mad_hatter/plugin.py) walks the plugin's ``*.py``
 files in glob order and ``importlib.reload``s each one. In this folder glob
@@ -238,6 +239,20 @@ def _make_handler(handler_mod, *, derived_graph: bool):
     return handler
 
 
+def _make_settings_handler(handler_mod, *, active_gen="gen_old", new_gen="gen_new"):
+    """Handler for the settings-update hook: fingerprint + persisted-marker
+    reads stubbed so the hook reaches the scheduling branch."""
+    handler = handler_mod.GraphRAGHandler(
+        neo4j_uri="bolt://fake",
+        neo4j_user="u",
+        neo4j_password="p",
+    )
+    handler.agent_id = "agent_reload_test"
+    handler._concept_fingerprint = lambda: new_gen
+    handler._read_concept_gen = AsyncMock(return_value=active_gen)
+    return handler
+
+
 def test_hook_calls_derived_graph_after_reload_order():
     """Reproduces the loader's glob order (main BEFORE graphrag_handler) and
     proves the lazy in-function import resolves the CURRENT class, so the hook
@@ -285,6 +300,127 @@ def test_hook_skips_non_graphrag_handler():
     asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
 
 
+def test_settings_hook_schedules_recompute_after_reload_order():
+    """FX-9: reproduces the loader's glob order (main BEFORE graphrag_handler)
+    and proves the lazy in-function import resolves the CURRENT class, so the
+    settings-update hook passes the isinstance guard with a class-B handler and
+    schedules the concept-relations recompute (the FX-9 failure mode: 0
+    'scheduled recompute' lines in the F3 smoke)."""
+    importlib.import_module(f"{PKG}.main")  # binds main.GraphRAGHandler = class A
+    handler_mod = importlib.import_module(f"{PKG}.graphrag_handler")
+    importlib.reload(handler_mod)  # class B now lives in the module
+    main = importlib.import_module(f"{PKG}.main")
+
+    # The bug condition: main's module-level binding is the PRE-reload class.
+    assert main.GraphRAGHandler is not handler_mod.GraphRAGHandler
+
+    handler = _make_settings_handler(handler_mod)
+    cat = types.SimpleNamespace(
+        vector_memory_handler=handler, agent_key="agent_reload_test"
+    )
+
+    # Capture the scheduled job without running it (no loop, no real graph).
+    captured = {}
+
+    def _fake_create_task(coro):
+        captured["coro"] = coro
+        coro.close()
+        return types.SimpleNamespace()
+
+    main._concept_recompute_job = AsyncMock()
+    original_create_task = main.asyncio.create_task
+    main.asyncio.create_task = _fake_create_task
+    try:
+        asyncio.run(
+            main.after_vector_database_settings_update(
+                "Neo4jGraphRAGConfig",
+                {"concept_definitions": "old"},
+                {"concept_definitions": "new"},
+                cat,
+            )
+        )
+    finally:
+        main.asyncio.create_task = original_create_task
+
+    main._concept_recompute_job.assert_called_once_with(
+        handler, cat, "agent_reload_test", "gen_new"
+    )
+    assert len(handler._pending_entity_tasks) == 1, (
+        "the scheduled task must be tracked for close()"
+    )
+
+
+def test_settings_hook_skips_when_no_concept_change():
+    """No concept-related key changed -> no recompute scheduled."""
+    main = importlib.import_module(f"{PKG}.main")
+    handler_mod = importlib.import_module(f"{PKG}.graphrag_handler")
+
+    handler = _make_settings_handler(handler_mod)
+    cat = types.SimpleNamespace(
+        vector_memory_handler=handler, agent_key="agent_reload_test"
+    )
+
+    main._concept_recompute_job = AsyncMock()
+    asyncio.run(
+        main.after_vector_database_settings_update(
+            "Neo4jGraphRAGConfig",
+            {"concept_definitions": "same"},
+            {"concept_definitions": "same"},
+            cat,
+        )
+    )
+    main._concept_recompute_job.assert_not_called()
+    assert handler._pending_entity_tasks == []
+
+
+def test_settings_hook_skips_when_marker_already_active():
+    """The persisted-marker no-op (active == new_gen) still holds after the
+    lazy-import fix."""
+    main = importlib.import_module(f"{PKG}.main")
+    handler_mod = importlib.import_module(f"{PKG}.graphrag_handler")
+
+    handler = _make_settings_handler(
+        handler_mod, active_gen="gen_new", new_gen="gen_new"
+    )
+    cat = types.SimpleNamespace(
+        vector_memory_handler=handler, agent_key="agent_reload_test"
+    )
+
+    main._concept_recompute_job = AsyncMock()
+    asyncio.run(
+        main.after_vector_database_settings_update(
+            "Neo4jGraphRAGConfig",
+            {"concept_definitions": "old"},
+            {"concept_definitions": "new"},
+            cat,
+        )
+    )
+    main._concept_recompute_job.assert_not_called()
+    assert handler._pending_entity_tasks == []
+
+
+def test_settings_hook_skips_non_graphrag_handler():
+    """The isinstance gate still rejects non-GraphRAG handlers (no scheduling,
+    no attribute access)."""
+    main = importlib.import_module(f"{PKG}.main")
+
+    other = type("OtherHandler", (), {})()
+    cat = types.SimpleNamespace(
+        vector_memory_handler=other, agent_key="agent_reload_test"
+    )
+
+    main._concept_recompute_job = AsyncMock()
+    asyncio.run(
+        main.after_vector_database_settings_update(
+            "Neo4jGraphRAGConfig",
+            {"concept_definitions": "old"},
+            {"concept_definitions": "new"},
+            cat,
+        )
+    )
+    main._concept_recompute_job.assert_not_called()
+
+
 def main():
     _install_stubs()
     _make_package()
@@ -293,6 +429,10 @@ def main():
         test_hook_calls_derived_graph_after_reload_order,
         test_hook_skips_when_derived_graph_disabled,
         test_hook_skips_non_graphrag_handler,
+        test_settings_hook_schedules_recompute_after_reload_order,
+        test_settings_hook_skips_when_no_concept_change,
+        test_settings_hook_skips_when_marker_already_active,
+        test_settings_hook_skips_non_graphrag_handler,
     ]
     for test in tests:
         test()

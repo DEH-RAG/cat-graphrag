@@ -38,8 +38,14 @@ async def after_cheshire_cat_creation(cat) -> None:
     reconciled (a single ``provenance_reconciled`` marker count), so this is a
     cheap no-op on every boot after the first migration.
     """
+    # Lazy import (FX-9): the plugin loader reloads main.py BEFORE
+    # graphrag_handler.py (glob order), so a module-level import binds the
+    # PRE-reload class and isinstance() below ALWAYS fails (the factory
+    # instantiates the handler from the CURRENT, post-reload class). Import at
+    # call time, when graphrag_handler is the current module.
+    from .graphrag_handler import GraphRAGHandler as _GH
     handler = getattr(cat, "vector_memory_handler", None)
-    if not isinstance(handler, GraphRAGHandler):
+    if not isinstance(handler, _GH):
         return
     task = asyncio.create_task(handler.recompute_provenance())
     handler._pending_entity_tasks.append(task)
@@ -80,7 +86,11 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
         if hasattr(cat.vector_memory_handler, "_align_embedder_lazy"):
             await cat.vector_memory_handler._align_embedder_lazy()
 
-    if isinstance(cat.vector_memory_handler, GraphRAGHandler):
+    # Lazy import (FX-9): same reload-order rationale as
+    # after_cheshire_cat_creation — a module-level binding would be the
+    # PRE-reload class and this guard would ALWAYS fail.
+    from .graphrag_handler import GraphRAGHandler as _GH
+    if isinstance(cat.vector_memory_handler, _GH):
         handler = cat.vector_memory_handler
         if handler.entity_extractor:
             await handler.entity_extractor.ensure_initialized()
@@ -112,7 +122,11 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
 
 @hook(priority=10)
 async def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat) -> None:
-    if isinstance(cat.vector_memory_handler, GraphRAGHandler) and cat.vector_memory_handler.entity_extractor:
+    # Lazy import (FX-9): same reload-order rationale as
+    # after_cheshire_cat_creation — a module-level binding would be the
+    # PRE-reload class and this guard would ALWAYS fail.
+    from .graphrag_handler import GraphRAGHandler as _GH
+    if isinstance(cat.vector_memory_handler, _GH) and cat.vector_memory_handler.entity_extractor:
         await cat.vector_memory_handler.entity_extractor.ensure_downloaded()
 
 
@@ -146,8 +160,14 @@ async def after_vector_database_settings_update(
     if vector_database_name != "Neo4jGraphRAGConfig":
         return
 
+    # Lazy import (FX-9): the plugin loader reloads main.py BEFORE
+    # graphrag_handler.py (glob order), so a module-level import binds the
+    # PRE-reload class and isinstance() below ALWAYS fails (the factory
+    # instantiates the handler from the CURRENT, post-reload class). Import at
+    # call time, when graphrag_handler is the current module.
+    from .graphrag_handler import GraphRAGHandler as _GH
     handler = cat.vector_memory_handler
-    if not isinstance(handler, GraphRAGHandler):
+    if not isinstance(handler, _GH):
         return
 
     # 1 — Technology terminology refresh (unchanged semantics).
