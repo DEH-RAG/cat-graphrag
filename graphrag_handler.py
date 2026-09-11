@@ -2788,10 +2788,22 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         and the plugin hooks are unreliable (multi-worker toggle race). The LLM
         is resolved through the official ``ServiceProvider`` against the agent's
         saved ``llm`` config — the same mechanism ``CheshireCat.create`` uses — so
-        any configured LLM class works (not just the probe's OpenRouterLLM). The
-        plugin manager is taken from the running ``BillTheLizard`` singleton:
-        ``base_plugin`` always registers ``factory_allowed_llms``, so the hook is
-        always present in its registry. Imports are lazy (plugin import-safe rule).
+        any configured LLM class works (not just the probe's OpenRouterLLM).
+
+        The plugin manager must be AGENT-scoped (FX-8): the system
+        ``BillTheLizard`` singleton's MadHatter has ``context_execute_hook ==
+        "lizard"``, so ``execute_hook("factory_allowed_llms", ...)`` calls every
+        handler with a ``lizard=`` kwarg and the ``factory_allowed_llms(allowed,
+        cat)`` hooks of ``base_plugin``/``grinning_cat_plus`` raise ``TypeError``
+        (swallowed by ``execute_hook``) — the configured LLM class never enters
+        the allowed list and the factory falls back to ``LLMDefault``. Instead of
+        the heavy ``BillTheLizard.get_cheshire_cat(agent_id)`` (which creates a
+        FULL ``CheshireCat``: plugin discovery + Redis writes + a second vector
+        handler), a lightweight ``MadHatter(agent_id)`` is built that shares the
+        system manager's already-loaded hook registry (the same ``CatHook``
+        objects the agent's real MadHatter would use) and therefore has
+        ``context_execute_hook == "cat"``. Imports are lazy (plugin import-safe
+        rule).
 
         Returns None when the agent has no LLM or resolution fails (step 8
         degrades to a no-op); the resolved LLM is cached on the handler so a
@@ -2806,12 +2818,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         try:
             # lazy imports (plugin import-safe rule)
             from cat.looking_glass.bill_the_lizard import BillTheLizard
+            from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
             from cat.services.service_provider import ServiceProvider
 
-            plugin_manager = getattr(BillTheLizard(), "plugin_manager", None)
-            if plugin_manager is None:
+            system_pm = getattr(BillTheLizard(), "plugin_manager", None)
+            if system_pm is None or not getattr(system_pm, "hooks", None):
                 return None
-            llm = await ServiceProvider().get_large_language_model(agent_id, plugin_manager)
+            # Agent-scoped MadHatter: context_execute_hook == "cat" (the system
+            # manager's is "lizard" and breaks factory_allowed_llms — FX-8).
+            agent_pm = MadHatter(agent_id)
+            agent_pm.hooks = system_pm.hooks
+            llm = await ServiceProvider().get_large_language_model(agent_id, agent_pm)
             if llm is None or type(llm).__name__ == "LLMDefault":
                 # The dumb fallback LLM is never a usable extractor.
                 return None
