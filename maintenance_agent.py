@@ -3,18 +3,22 @@
 Maintenance agent CLI for the Neo4j GraphRAG plugin.
 
 Standalone, import-safe maintenance script that drives Grinning Cat's
-two-phase ingestion engine and the GraphRAG graph rebuild from INSIDE the
-Cat container.
+phase-based ingestion machine (feat/ingestion-phase-machine) and the
+GraphRAG ``graph_building`` phase from INSIDE the Cat container.
 
 Usage (inside the Cat container):
-    # Re-embed only (chunk reuse) for one agent
+    # Re-embed via the gen-based phase machine (stale phases recomputed)
     docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --reembed --yes
 
     # Re-ingest from scratch (points-first wipe, then re-parse + re-embed) for all agents
     docker exec cheshire_cat_core python /app/maintenance_agent.py --all --reingest --yes
 
-    # Rebuild the GraphRAG graph (wipe-then-rebuild) for one agent
+    # Drive the graph_building phase (mark it stale, then the phase machine re-runs it)
     docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --graph --yes
+
+    # Explicit destructive wipe of the tenant's graph edges + orphan entities,
+    # then drive the graph_building phase
+    docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --wipe-graph --yes
 
     # Combine ops and target the episodic collection
     docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --reingest --graph --collection episodic --yes
@@ -30,9 +34,25 @@ Exit codes:
     1 = partial failure (some agent/op failed, or a --verify check failed)
     2 = aborted (dry-run plan printed, or --yes missing for a destructive step)
 
-Every op requires --yes: --reembed deletes the status docs per source,
---reingest additionally deletes the source's points and re-ingests, and
---graph wipes the tenant's graph edges + orphan entities (A0 Cypher).
+Lifecycle model (feat/ingestion-phase-machine): status docs carry a
+``completed_phases`` diary (``[{phase, gen}]``) plus fingerprint dicts
+(``chunker`` / ``embedder`` / ``graphrag``). ``reembed_sources`` is the ONE
+probe-driven phase machine: per source it probes ``ingestion_phase_pending``
+and runs the stale phases serially. A phase is stale when its recorded
+generation differs from the recomputed one (settings fingerprint + dependency
+generations): a chunker change re-runs ``parsing_chunking`` (and followers),
+an embedder-only change re-runs ``embedding`` (and followers), and the graph
+work is the first-class ``graph_building`` phase (deps: ``parsing_chunking``
++ ``embedding`` — SIMILAR_TO needs valid vectors). Error rows are absorbing:
+once a row reaches ``status=error`` the phase loop stops for it and it is
+re-entered only by a fresh claim.
+
+Every op requires --yes: --reembed runs the gen-based phase machine (stale
+phases recomputed), --reingest deletes the source's points + status docs and
+re-parses from scratch (raw deletion is the only way to force a full re-parse
+the gen-based probe would not trigger), --graph marks the ``graph_building``
+phase stale and invokes the phase path, and --wipe-graph additionally wipes
+the tenant's graph edges + orphan entities (A0 Cypher) first.
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. It must have ZERO top-level side
@@ -45,36 +65,44 @@ import asyncio
 import importlib.util
 import json
 import sys
-import types  # noqa: F401  (used by the --graph LLM part in a later todo)
 from typing import Any, NotRequired, TypedDict
 
-# Destructive steps per op — what `--yes` confirms. `--reembed` deletes the
-# status docs per source (forces the embedding phase, Metis #9); `--reingest`
-# deletes the source's points FIRST (points-first wipe) and re-ingests;
-# `--graph` wipes the tenant's graph edges + orphan entities via the A0
-# Cypher. Every op therefore requires `--yes`; the missing-`--yes` message
-# lists these steps per agent+op.
+# Destructive steps per op — what `--yes` confirms. `--reembed` runs the
+# gen-based phase machine (stale phases recomputed from the settings
+# fingerprints + dependency generations); `--reingest` deletes the source's
+# points FIRST (points-first wipe) and its status doc, so the probe sees no
+# completed_phases and re-parses from scratch; `--graph` marks the
+# ``graph_building`` phase stale (strips the recorded generation from the
+# diary) and invokes the phase path; `--wipe-graph` additionally wipes the
+# tenant's graph edges + orphan entities via the A0 Cypher. Every op therefore
+# requires `--yes`; the missing-`--yes` message lists these steps per
+# agent+op.
 _DESTRUCTIVE_STEPS: dict[str, list[str]] = {
     "reingest": [
         "delete_tenant_points per source (points-first wipe)",
-        "delete_status per source",
-        "reembed_sources re-ingest (re-parse + re-embed)",
+        "delete_status per source (forces a full re-parse: the gen-based probe "
+        "only re-runs phases whose settings/deps changed)",
+        "reembed_sources phase dispatch (parsing_chunking -> embedding -> "
+        "graph_building)",
     ],
     "graph": [
+        "mark graph_building stale per source (strip the recorded gen from "
+        "completed_phases)",
+        "reembed_sources phase dispatch (graph_building phase: similarity + "
+        "concept relations)",
+    ],
+    "wipe_graph": [
         "A0 wipe Cypher (5 tenant-filtered statements: RELATED_TO, MENTIONS, "
         "PROVENANCE, SIMILAR_TO_<gen>, orphan entities)",
+        "mark graph_building stale per source (strip the recorded gen from "
+        "completed_phases)",
+        "reembed_sources phase dispatch (graph_building phase)",
     ],
     "reembed": [
-        "delete_status per source (forces the embedding phase)",
+        "reembed_sources phase dispatch (gen-based: stale phases recomputed "
+        "from settings fingerprints + dependency gens)",
     ],
 }
-
-# Batch size for the --graph fixed-part walk: after each batch the Epoch
-# token is re-read (Metis #16 drift re-check) and the batch re-run on drift.
-_GRAPH_WALK_BATCH_SIZE = 50
-# Upper bound for per-batch re-runs after a generation drift; beyond it the
-# batch is logged as unstable and the walk continues with the new generation.
-_GRAPH_WALK_MAX_RERUNS = 3
 
 # The admin's default agent (cat.db.database.DEFAULT_SYSTEM_KEY) is always
 # skipped by the enumeration; the legacy `default` agent is kept with a
@@ -99,8 +127,8 @@ def _parse_args() -> argparse.Namespace:
         prog="maintenance_agent",
         description=(
             "Agent maintenance for the Neo4j GraphRAG plugin: re-ingest, "
-            "re-embed or rebuild the graph for one agent or all agents. "
-            "Must run inside the Cat container."
+            "re-embed or drive the graph_building phase for one agent or all "
+            "agents. Must run inside the Cat container."
         ),
     )
 
@@ -120,20 +148,30 @@ def _parse_args() -> argparse.Namespace:
         "--reingest",
         action="store_true",
         help="Re-ingest from scratch: delete points per source, then re-parse "
-             "and re-embed. DESTRUCTIVE (requires --yes).",
+             "and re-embed (raw deletion forces a full re-parse the gen-based "
+             "probe would not trigger). DESTRUCTIVE (requires --yes).",
     )
     parser.add_argument(
         "--reembed",
         action="store_true",
-        help="Re-embed only: reuse stored chunks, recompute vectors. Deletes "
-             "status docs per source (requires --yes).",
+        help="Re-embed via the gen-based phase machine: stale phases (embedder "
+             "change -> embedding; chunker change -> parsing + followers) are "
+             "recomputed from the settings fingerprints. Requires --yes.",
     )
     parser.add_argument(
         "--graph",
         action="store_true",
-        help="Rebuild the GraphRAG graph (wipe-then-rebuild: fixed NER/"
-             "similarity/derived part + optional LLM concept relations). "
-             "DESTRUCTIVE (requires --yes).",
+        help="Drive the graph_building phase: mark it stale per source (strip "
+             "the recorded generation from completed_phases) and invoke the "
+             "phase path via reembed_sources (similarity + concept relations). "
+             "Requires --yes.",
+    )
+    parser.add_argument(
+        "--wipe-graph",
+        action="store_true",
+        help="Explicit destructive step: wipe the tenant's graph edges + "
+             "orphan entities (A0 Cypher), then drive the graph_building "
+             "phase. DESTRUCTIVE (requires --yes).",
     )
 
     parser.add_argument(
@@ -151,7 +189,7 @@ def _parse_args() -> argparse.Namespace:
         "--yes",
         action="store_true",
         help="Confirm destructive steps (required for every op: status/point "
-             "deletes, the graph wipe, re-ingest).",
+             "deletes, the graph wipe, re-ingest, phase re-runs).",
     )
     parser.add_argument(
         "--verify",
@@ -162,10 +200,19 @@ def _parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    # At least one op required; combinable.
+    # At least one op required; combinable. --wipe-graph is a superset of
+    # --graph (the wipe is followed by the same phase drive), so it replaces
+    # it when both are given.
     args.ops = [op for op in ("reingest", "reembed", "graph") if getattr(args, op)]
+    if args.wipe_graph:
+        if "graph" in args.ops:
+            args.ops.remove("graph")
+        args.ops.append("wipe_graph")
     if not args.ops:
-        parser.error("at least one operation is required: --reingest, --reembed, --graph")
+        parser.error(
+            "at least one operation is required: --reingest, --reembed, "
+            "--graph, --wipe-graph"
+        )
 
     return args
 
@@ -268,9 +315,9 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
 
     ``--agent <id>`` validates the id against the live agent list (aborts
     with exit 2 when unknown); ``--all`` expands to every agent minus
-    ``system``. When ``--graph`` is requested, the agent set is intersected
-    with the agents that have the GraphRAG plugin active; the others get a
-    ``skip_reason="plugin-not-active"`` entry.
+    ``system``. When ``--graph`` / ``--wipe-graph`` is requested, the agent
+    set is intersected with the agents that have the GraphRAG plugin active;
+    the others get a ``skip_reason="plugin-not-active"`` entry.
     """
     agents = await _list_agents()
 
@@ -283,12 +330,12 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
         agent_ids = agents
 
     active: set[str] = set()
-    if "graph" in args.ops:
+    if any(op in ("graph", "wipe_graph") for op in args.ops):
         plugin_id = _resolve_plugin_id()
         if plugin_id is None:
             print(
                 "ABORTED: GraphRAG plugin not found in the plugins dir "
-                "(--graph requires it)"
+                "(--graph/--wipe-graph requires it)"
             )
             sys.exit(2)
         from cat.db.cruds import plugins as crud_plugins
@@ -302,7 +349,7 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
             "ops": list(args.ops),
             "collection": args.collection,
         }
-        if "graph" in args.ops and agent_id not in active:
+        if any(op in ("graph", "wipe_graph") for op in args.ops) and agent_id not in active:
             entry["skip_reason"] = "plugin-not-active"
         plan.append(entry)
     return plan
@@ -311,11 +358,11 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
 def _print_plan(plan: list[_PlanEntry]) -> None:
     """Print the dry-run plan: per agent+op the concrete steps.
 
-    Pure plan (Metis #26): NO bootstrap, NO writes, NO ``CheshireCat.create``.
-    The A0 wipe statements are printed verbatim (with a ``<gen>`` placeholder
-    for the run-time generation); the per-source wipe/status-delete steps are
-    printed as templates — the actual source names are only known after
-    bootstrap, which dry-run must NOT do.
+    Pure plan: NO bootstrap, NO writes, NO ``CheshireCat.create``. The A0 wipe
+    statements (``--wipe-graph``) are printed verbatim (with a ``<gen>``
+    placeholder for the run-time generation); the per-source wipe/status-delete
+    steps are printed as templates — the actual source names are only known
+    after bootstrap, which dry-run must NOT do.
     """
     print("DRY-RUN PLAN (no writes performed)")
     for entry in plan:
@@ -342,27 +389,39 @@ def _print_plan(plan: list[_PlanEntry]) -> None:
                 )
                 print(
                     "      3. reembed_sources(ccat, collection, sources)  "
-                    "# re-parse + re-embed (PHASE_PARSING_CHUNKING)"
+                    "# probe-driven phase dispatch (parsing_chunking -> "
+                    "embedding -> graph_building)"
                 )
             elif op == "reembed":
                 print("    steps:")
                 print(
-                    "      1. for each source <name>: delete_status("
-                    "agent, 'agent', <name>)"
+                    "      1. reembed_sources(ccat, collection, sources)  "
+                    "# probe-driven phase dispatch (gen-based: stale phases "
+                    "recomputed from settings fingerprints + dependency gens)"
+                )
+            elif op == "graph":
+                print("    steps:")
+                print(
+                    "      1. for each source <name>: strip the graph_building "
+                    "entry from completed_phases (mark the phase stale)"
                 )
                 print(
                     "      2. reembed_sources(ccat, collection, sources)  "
-                    "# embedding phase, chunk reuse (PHASE_EMBEDDING)"
+                    "# graph_building phase (similarity + concept relations)"
                 )
-            elif op == "graph":
+            elif op == "wipe_graph":
                 print("    steps:")
                 print("      1. A0 wipe Cypher (5 tenant-filtered statements):")
                 for stmt in _graph_wipe_statements("<gen>"):
                     print(f"         {stmt}")
                 print(
-                    "      2. re-walk documents (NER + similarity + derived)"
+                    "      2. for each source <name>: strip the graph_building "
+                    "entry from completed_phases (mark the phase stale)"
                 )
-                print("      3. LLM concept relations (if enabled)")
+                print(
+                    "      3. reembed_sources(ccat, collection, sources)  "
+                    "# graph_building phase"
+                )
     print("(dry-run: exiting 2, nothing was written)")
 
 
@@ -375,10 +434,10 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
     ``initialize`` (required for the vector index; on an embedder change it
     launches the seamless shadow-swap ``reembed_tenant``, which flips the
     Epoch token — the flip is logged). Snapshots the current generation on
-    the handler as ``_walk_gen`` (consumed by the ``--graph`` A-helper) and
-    records the GraphRAG detection (``_graphrag_detected`` /
-    ``_concept_relations_enabled``) from the ``Neo4jGraphRAGConfig``
-    vector-db setting entry.
+    the handler as ``_walk_gen`` (consumed by the ``--wipe-graph`` A0 wipe)
+    and records the GraphRAG detection (``_graphrag_detected`` /
+    ``_concept_relations_enabled`` / ``_enable_derived_graph``) from the
+    ``Neo4jGraphRAGConfig`` vector-db setting entry.
 
     Returns ``(ccat, handler, None)`` on success, or
     ``(ccat, None, "handler-not-graphrag")`` when the agent's vector memory
@@ -405,7 +464,7 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
 
     # Generation baseline: initialize() may detect an embedder change and run
     # the shadow-swap reembed_tenant, which flips the Epoch token — the flip
-    # is the observable side effect we log (Metis #3).
+    # is the observable side effect we log.
     gen_before = await handler._read_generation(agent_id)
 
     embedder = await ccat.embedder()
@@ -420,17 +479,19 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
         )
 
     # GraphRAG detection: the vector-db setting entry named after the config
-    # class (same semantics as main.py:137). The --graph op additionally
-    # requires enable_knowledge_graph AND enable_concept_relations (D1: the
-    # knowledge-graph flag is the master switch for LLM concept extraction);
-    # the per-op skip is decided in _run_agent.
+    # class (same semantics as main.py). The --graph/--wipe-graph op requires
+    # the handler's ``_enable_derived_graph`` (the phase gate in main.py's
+    # ``ingestion_phase_pending``/``ingestion_phase_run`` hooks); the per-op
+    # skip is decided in _run_agent.
     from cat.db.cruds import settings as crud_settings
 
     entry = await crud_settings.get_setting_by_name(agent_id, "Neo4jGraphRAGConfig")
     handler._graphrag_detected = entry is not None
     kg = bool((entry or {}).get("value", {}).get("enable_knowledge_graph", False))
     cr = bool((entry or {}).get("value", {}).get("enable_concept_relations", False))
+    dg = bool((entry or {}).get("value", {}).get("enable_derived_graph", False))
     handler._concept_relations_enabled = bool(kg and cr)
+    handler._enable_derived_graph = dg
 
     return (ccat, handler, None)
 
@@ -442,10 +503,11 @@ async def _resolve_ingestion_engine(ccat, op: str = "reembed") -> str | None:
     resolves it against the allowed classes via ``cat.services.factory.ingestion``
     (``resolved_config_name``: saved entry, else first plugin class, else the
     base). Only the efficient engine (``EfficientIngestionConfiguration`` /
-    ``EfficientIngestionEngine``) is supported by ``--reembed``/``--reingest``:
-    the base engine's re-embed path (``embed_all_in_cheshire_cats``) is
-    destructive and out of scope, so it is refused with a message naming the
-    active engine (Metis #23).
+    ``EfficientIngestionEngine``) is supported by ``--reembed``/``--reingest``/
+    ``--graph``/``--wipe-graph``: it is the ONE probe-driven phase machine that
+    dispatches the ``graph_building`` phase; the base engine's re-embed path
+    (``embed_all_in_cheshire_cats``) is destructive and out of scope, so it is
+    refused with a message naming the active engine.
 
     Returns the active config name when the efficient engine is active, else
     None (the caller marks the op failed → exit 1).
@@ -464,18 +526,23 @@ async def _resolve_ingestion_engine(ccat, op: str = "reembed") -> str | None:
 
 
 async def _op_reembed(ccat, handler, collection: str) -> bool:
-    """Re-embed only: delete the status docs, then run the embedding phase.
+    """Re-embed via the gen-based phase machine (no status-doc deletion).
 
-    ``reembed_sources`` decides the phase per source from the status doc: no
-    doc + points exist → ``PHASE_EMBEDDING`` (chunk reuse, Metis #9). Deleting
-    the status doc per source therefore forces the embedding phase when the
-    source's points exist — chunks are reused, nothing is re-parsed. Status
-    docs whose source is absent from the enumeration are warned
-    (``detail=file-missing``, Metis #10). ``handler`` is accepted for signature
-    symmetry with the other ops (todo 5+).
+    ``reembed_sources`` is the ONE probe-driven phase machine: per source it
+    probes ``ingestion_phase_pending`` and runs the stale phases serially. A
+    phase is stale when its recorded generation (in ``completed_phases``)
+    differs from the recomputed one (settings fingerprint + dependency gens):
+    an embedder change re-runs ``embedding`` (chunk reuse), a chunker change
+    re-runs ``parsing_chunking`` first and ``embedding`` follows on the next
+    probe. With unchanged settings nothing is stale and the pass is a no-op.
+    Status docs are NOT deleted: raw deletion would make the probe see no
+    completed_phases and re-parse everything, which is ``--reingest``'s job.
+    Status docs whose source is absent from the enumeration are warned
+    (``detail=file-missing``). ``handler`` is accepted for signature symmetry
+    with the other ops.
     """
     from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
-    from cat.core_plugins.ingestion_status.registry import delete_status, list_statuses
+    from cat.core_plugins.ingestion_status.registry import list_statuses
     from cat.services.memory.models import VectorMemoryType
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -483,7 +550,7 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
 
-    # Metis #10: status docs whose source is absent from the enumeration.
+    # Status docs whose source is absent from the enumeration.
     statuses = await list_statuses(agent_id)
     known = {s.name for s in sources}
     for doc in statuses:
@@ -494,10 +561,6 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
                 f"detail=file-missing source={src}"
             )
 
-    # Metis #9: no doc + points exist → PHASE_EMBEDDING (chunk reuse).
-    for source in sources:
-        await delete_status(agent_id, "agent", source.name)
-
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
     return True
 
@@ -505,16 +568,18 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
 async def _op_reingest(ccat, handler, collection: str) -> bool:
     """Re-ingest from scratch: delete points per source, then re-parse + re-embed.
 
-    ``reembed_sources`` decides the phase per source from the status doc: no
-    doc + no points → ``PHASE_PARSING_CHUNKING`` (clean re-parse, Metis #9).
-    Deleting the status doc ALONE would leave the source's points in place and
-    silently chunk-reuse (``PHASE_EMBEDDING``) — so the points MUST be deleted
-    FIRST, per source, via ``handler.delete_tenant_points(str(collection),
-    metadata={"source": name})`` (which also triggers the provenance-cascade
-    graph cleanup), and only THEN the status doc. URL sources are passed
-    through as-is: the engine re-downloads them (the ``content=None`` path in
-    ``_source_from_entry``), so their points are NOT deleted by source name —
-    each pass-through is logged (``detail=url-pass-through``).
+    Raw deletion is STILL needed here: the gen-based probe only re-runs a
+    phase when its recorded generation differs from the recomputed one, and a
+    FORCED full re-ingest must re-parse regardless of fingerprints. Deleting
+    the source's points FIRST (``handler.delete_tenant_points(str(collection),
+    metadata={"source": name})`` — which also triggers the provenance-cascade
+    graph cleanup) and THEN the status doc makes the probe see no
+    completed_phases → ``parsing_chunking`` pending (clean re-parse) →
+    ``embedding`` follows on the next probe → ``graph_building`` follows. URL
+    sources are passed through as-is: the engine re-downloads them (the
+    ``content=None`` path in ``_source_from_entry``), so their points are NOT
+    deleted by source name — each pass-through is logged
+    (``detail=url-pass-through``).
     """
     from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
     from cat.core_plugins.ingestion_status.registry import delete_status
@@ -526,8 +591,8 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
 
-    # Metis #9 points-first: delete the source's points, THEN the status doc,
-    # so reembed_sources sees no doc + no points → PHASE_PARSING_CHUNKING.
+    # Points-first: delete the source's points, THEN the status doc, so the
+    # probe sees no doc + no points → PHASE_PARSING_CHUNKING.
     for source in sources:
         if is_url(source.name):
             print(
@@ -550,8 +615,8 @@ def _graph_wipe_statements(gen) -> list[str]:
     Shared by ``_graph_wipe`` (execution) and the dry-run plan printer
     (``_print_plan``, which passes the literal ``"<gen>"`` placeholder — the
     real generation is only known after bootstrap, which dry-run must NOT
-    do, Metis #26). Every statement is tenant-filtered; no ``MATCH
-    (e:Entity)`` without ``{tenant_id}``.
+    do). Every statement is tenant-filtered; no ``MATCH (e:Entity)`` without
+    ``{tenant_id}``.
     """
     similar_rel = f"SIMILAR_TO_{gen}"
     return [
@@ -566,248 +631,152 @@ def _graph_wipe_statements(gen) -> list[str]:
         f"(:Document {{tenant_id: $tenant_id}}) DELETE r",
         # 5. Orphan entities: once the edges above are gone, entities with NO
         #    edges at all are orphans — including stale ones (PROVENANCE was
-        #    deleted in step 3, so the cascade-prune condition matches,
-        #    Metis #7).
+        #    deleted in step 3, so the cascade-prune condition matches).
         "MATCH (e:Entity {tenant_id: $tenant_id}) WHERE NOT (e)--() DELETE e",
     ]
 
 
 async def _graph_wipe(handler, tenant_id, gen) -> None:
-    """Phase A0: wipe the tenant's fixed-graph edges + orphan entities.
+    """A0 wipe: delete the tenant's fixed-graph edges + orphan entities.
 
     The fixed part is additive-only (``_extract_and_link_entities`` MERGEs,
     never deletes stale edges), so a plain re-walk would accumulate ghost
-    entities and stale relations (Metis #1). No handler helper exists for
-    this — the Cypher is defined HERE (``_graph_wipe_statements``),
-    tenant-filtered on every statement. The Document/SourceFile/Collection
-    structure is kept: only edges and orphan entities are deleted. The
-    SIMILAR_TO relation name is the versioned one of the walk generation
-    (``SIMILAR_TO_<gen>``).
+    entities and stale relations — a deliberate wipe (``--wipe-graph``) is the
+    only way to remove them. No handler helper exists for this — the Cypher is
+    defined HERE (``_graph_wipe_statements``), tenant-filtered on every
+    statement. The Document/SourceFile/Collection structure is kept: only
+    edges and orphan entities are deleted. The SIMILAR_TO relation name is the
+    versioned one of the current generation (``SIMILAR_TO_<gen>``).
     """
     async with handler._get_session() as session:
         for stmt in _graph_wipe_statements(gen):
             await session.run(stmt, tenant_id=tenant_id)
 
 
-async def _graph_fetch_docs(handler, tenant_id, gen) -> list[dict[str, Any]]:
-    """Phase A1: fetch the tenant's stored Documents with their embeddings.
+async def _mark_graph_building_stale(agent_id: str, source: str, doc: dict[str, Any]) -> bool:
+    """Strip the ``graph_building`` entry from a status doc's diary.
 
-    Same fetch pattern as ``recompute_concept_relations``
-    (graphrag_handler.py:3157-3164) plus the versioned embedding property
-    ``embedding_<gen>`` of the walk generation. Metadata is stored as a JSON
-    string in Neo4j and parsed back to a dict here (same handling as the
-    handler's own walk).
+    The probe (``ingestion_phase_pending``) declares ``graph_building``
+    pending exactly when its recorded generation is absent from
+    ``completed_phases`` — so removing the entry forces the phase machine to
+    re-run the graph work for the source. ``set_status`` merge semantics
+    cannot REMOVE an entry (it merges by phase-id), so the stripped diary is
+    written via ``extra`` (wholesale replace). Only settled (``completed``)
+    rows are touched: error rows are absorbing (re-entered only by a fresh
+    claim) and mid-flight rows are left to their worker. Returns True when
+    the diary was stripped, False when the row was skipped.
     """
-    embedding_prop = f"embedding_{gen}"
-    query = (
-        "MATCH (d:Document {tenant_id: $tenant_id}) "
-        f"RETURN d.id AS id, d.content AS content, d.metadata AS metadata, "
-        f"d.{embedding_prop} AS embedding"
-    )
-    async with handler._get_session() as session:
-        result = await session.run(query, tenant_id=tenant_id)
-        rows = [record async for record in result]
+    from cat.core_plugins.ingestion_status.registry import IngestionStatus, set_status
+    from cat.utils import is_url
 
-    docs: list[dict[str, Any]] = []
-    for row in rows:
-        raw_meta = row["metadata"]
-        try:
-            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
-        except (TypeError, ValueError):
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-        docs.append(
-            {
-                "id": row["id"],
-                "content": row["content"] or "",
-                "metadata": meta,
-                "embedding": row["embedding"],
-            }
-        )
-    return docs
-
-
-async def _graph_walk_batch(handler, batch: list[dict[str, Any]], collection: str) -> None:
-    """Phase A2: re-walk one batch of documents INLINE.
-
-    Per doc: ``_extract_and_link_entities`` then
-    ``_create_similarity_relationships`` — both awaited synchronously (Metis
-    #8: NEVER ``add_point_to_tenant`` — its Document CREATE is not
-    idempotent — and NEVER ``create_task`` fire-and-forget). The vector for
-    similarity is the doc's ``embedding_<gen>`` property; docs without one
-    are skipped (the handler's own guard rejects zero/non-finite vectors,
-    but a missing property must not even reach it).
-    """
-    for doc in batch:
-        doc_id = doc["id"]
-        await handler._extract_and_link_entities(doc_id, doc["content"], doc["metadata"])
-        vector = doc["embedding"]
-        if vector:
-            await handler._create_similarity_relationships(doc_id, vector, collection)
-
-
-async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
-    """Rebuild the FIXED graph part: wipe-then-re-walk (NER + similarity + derived).
-
-    Phases:
-      A0 wipe — tenant-filtered Cypher defined here (no handler helper
-         exists, Metis #1): RELATED_TO / MENTIONS / PROVENANCE /
-         SIMILAR_TO_<gen> edges + orphan entities;
-      A1 fetch — stored Documents with their ``embedding_<gen>`` (same fetch
-         as ``recompute_concept_relations``), grouped by ``metadata.source``;
-      A2 re-walk — per doc, ``_extract_and_link_entities`` +
-         ``_create_similarity_relationships`` INLINE (Metis #8);
-      A3 derived — per source, ``create_derived_graph_for_source`` WITHOUT
-         ``stray_cat`` (Metis #6: passing it would double-run the LLM part B
-         and inflate ``RELATED_TO.weight`` by +0.5 per run); warns when a
-         point lacks ``chunk_index`` (derived structure not rebuildable,
-         Metis #5);
-      A4 gen re-check — per batch, re-read the Epoch token; on drift from
-         ``handler._walk_gen``, ``_rebuild_for_generation`` + re-run the
-         batch (bounded: max 3 re-runs per batch, then log error, Metis #16).
-
-    Part B (LLM concept relations) is ``_op_graph_part_b`` — this op never
-    touches it.
-    """
-    tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
-
-    gen = getattr(handler, "_walk_gen", None)
-    if gen is None:
-        gen = await handler._read_generation(tenant_id)
-        handler._walk_gen = gen
-
-    # ── Phase A0: wipe ────────────────────────────────────────────────────
-    await _graph_wipe(handler, tenant_id, gen)
-
-    # ── Phase A1: fetch ───────────────────────────────────────────────────
-    docs = await _graph_fetch_docs(handler, tenant_id, gen)
-
-    # ── Phase A2 + A4: walk in batches with per-batch generation re-check ─
-    for start in range(0, len(docs), _GRAPH_WALK_BATCH_SIZE):
-        batch = docs[start : start + _GRAPH_WALK_BATCH_SIZE]
-        await _graph_walk_batch(handler, batch, collection)
-
-        gen_now = await handler._read_generation(tenant_id)
-        if gen_now == gen:
-            continue
-
+    status = doc.get("status")
+    if status == IngestionStatus.ERROR.value:
         print(
-            f"[maintenance] agent={tenant_id} op=graph result=warn "
-            f"detail=generation-drift gen={gen}->{gen_now}"
+            f"[maintenance] agent={agent_id} op=graph result=warn "
+            f"detail=error-row-absorbing source={source}"
         )
-        handler._rebuild_for_generation(gen_now)
-        gen = gen_now
-        handler._walk_gen = gen
-        docs = await _graph_fetch_docs(handler, tenant_id, gen)
-        batch_ids = {d["id"] for d in batch}
-        rerun_docs = [d for d in docs if d["id"] in batch_ids]
-        for _attempt in range(1, _GRAPH_WALK_MAX_RERUNS + 1):
-            await _graph_walk_batch(handler, rerun_docs, collection)
-            gen_now = await handler._read_generation(tenant_id)
-            if gen_now == gen:
-                break
-            handler._rebuild_for_generation(gen_now)
-            gen = gen_now
-            handler._walk_gen = gen
-            docs = await _graph_fetch_docs(handler, tenant_id, gen)
-            rerun_docs = [d for d in docs if d["id"] in batch_ids]
-        else:
-            print(
-                f"[maintenance] agent={tenant_id} op=graph result=error "
-                f"detail=generation-drift-unstable gen={gen}"
-            )
-
-    # ── Phase A3: derived structure per source (no stray_cat — Metis #6) ──
-    from cat.services.memory.models import PointStruct
-
-    by_source: dict[str, list[dict[str, Any]]] = {}
-    for doc in docs:
-        source = str(doc["metadata"].get("source") or "unknown")
-        by_source.setdefault(source, []).append(doc)
-
-    for source in sorted(by_source):
-        src_docs = by_source[source]
-        missing_ci = [d for d in src_docs if d["metadata"].get("chunk_index") is None]
-        if missing_ci:
-            print(
-                f"[maintenance] agent={tenant_id} op=graph result=warn "
-                f"detail=missing-chunk-index source={source} docs={len(missing_ci)}"
-            )
-        points = [
-            PointStruct(
-                id=d["id"],
-                payload={
-                    "id": d["id"],
-                    "page_content": d["content"],
-                    "metadata": d["metadata"],
-                },
-            )
-            for d in src_docs
-        ]
-        await handler.create_derived_graph_for_source(source, points)
-
+        return False
+    if status != IngestionStatus.COMPLETED.value:
+        print(
+            f"[maintenance] agent={agent_id} op=graph result=warn "
+            f"detail=row-not-settled status={status} source={source}"
+        )
+        return False
+    completed = [
+        e
+        for e in (doc.get("completed_phases") or [])
+        if not (isinstance(e, dict) and e.get("phase") == "graph_building")
+    ]
+    await set_status(
+        agent_id,
+        "agent",
+        source,
+        type_="url" if is_url(source) else "file",
+        status=IngestionStatus.COMPLETED,
+        extra={"completed_phases": completed},
+    )
     return True
 
 
-async def _op_graph_part_b(ccat, handler) -> bool:
-    """Rebuild the LLM concept-relations part with a latest-wins flip loop.
+async def _op_graph(ccat, handler, collection: str, wipe: bool = False) -> bool:
+    """Drive the ``graph_building`` phase through the phase machine.
 
-    Runs ONLY when GraphRAG is detected AND ``enable_concept_relations``
-    (enforced in ``_run_agent``). The LLM re-extraction needs only
-    ``ccat.large_language_model`` — a ``SimpleNamespace`` duck suffices (Metis
-    #19, verified ``_llm_extract_relations`` graphrag_handler.py:2830 touches
-    only that attr).
+    The graph work is now a first-class ingestion phase (deps:
+    ``parsing_chunking`` + ``embedding`` — SIMILAR_TO needs valid vectors).
+    This op marks the phase stale per source (strips the recorded generation
+    from the status doc's ``completed_phases`` diary) and invokes the phase
+    path via ``reembed_sources``: the probe declares ``graph_building``
+    pending and the dispatcher runs it through the ``ingestion_phase_run``
+    hook (``run_graph_building_phase``: joins the source's background NER
+    tasks, re-runs similarity relationships for the stored points, and runs
+    the LLM concept-relations step when ``enable_knowledge_graph`` AND
+    ``enable_concept_relations``). All writes are idempotent MERGEs. Sources
+    without a status doc cannot be driven (no diary → the probe cannot declare
+    the phase) and are warned (``detail=no-status-doc``).
 
-    Latest-wins loop (Metis #14): the in-process single-flight in main.py does
-    NOT coordinate with this separate process — the persisted
-    ``concept_gen_active`` marker IS the cross-process guard. Each pass:
-    fingerprint -> read the active marker -> recompute with the new gen ->
-    ``_flip_concept_gen(expected_prev=active)``; a False flip means a newer
-    save won the race, so the loop re-reads the marker and retries (max 3
-    attempts). After a successful flip, the deferred GC of stale
-    old-generation concept nodes runs. Returns True on a committed flip,
-    False when the gen-guard aborted on every attempt.
+    ``wipe=True`` (the explicit ``--wipe-graph`` destructive step) runs the
+    tenant-filtered A0 wipe Cypher FIRST — the fixed part is additive-only
+    (MERGEs never delete stale edges), so a deliberate wipe is the only way to
+    remove ghost entities and stale relations.
     """
-    tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
-    stray_duck = types.SimpleNamespace(large_language_model=ccat.large_language_model)
+    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
+    from cat.core_plugins.ingestion_status.registry import list_statuses
+    from cat.services.memory.models import VectorMemoryType
 
-    for attempt in range(1, 4):
-        gen = handler._concept_fingerprint()
-        active = await handler._read_concept_gen(tenant_id)
-        await handler.recompute_concept_relations(stray_duck, gen=gen)
-        flipped = await handler._flip_concept_gen(
-            tenant_id, expected_prev=active, new_gen=gen
-        )
-        if flipped:
-            await handler._gc_stale_concept_nodes(tenant_id)
-            return True
-        print(
-            f"[maintenance] agent={tenant_id} op=graph result=warn "
-            f"detail=flip-conflict retry={attempt}"
-        )
+    agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+    assert agent_id is not None  # a bootstrapped CheshireCat always carries its key
 
-    print(
-        f"[maintenance] agent={tenant_id} op=graph result=fail "
-        f"detail=flip-conflict-exhausted"
-    )
-    return False
+    all_sources = await ccat.get_stored_sources_with_metadata()
+    sources = all_sources.get(VectorMemoryType(collection), [])
+
+    if wipe:
+        gen = getattr(handler, "_walk_gen", None)
+        if gen is None:
+            gen = await handler._read_generation(agent_id)
+            handler._walk_gen = gen
+        await _graph_wipe(handler, agent_id, gen)
+
+    # Mark graph_building stale per source: strip the recorded gen from the
+    # completed_phases diary so the probe declares the phase pending.
+    statuses = await list_statuses(agent_id)
+    by_source = {d.get("source"): d for d in statuses if d.get("source")}
+    known = {s.name for s in sources}
+    for src, doc in by_source.items():
+        if src not in known:
+            print(
+                f"[maintenance] agent={agent_id} op=graph result=warn "
+                f"detail=file-missing source={src}"
+            )
+            continue
+        await _mark_graph_building_stale(agent_id, src, doc)
+    for s in sources:
+        if s.name not in by_source:
+            print(
+                f"[maintenance] agent={agent_id} op=graph result=warn "
+                f"detail=no-status-doc source={s.name}"
+            )
+
+    await reembed_sources(ccat, VectorMemoryType(collection), sources)
+    return True
 
 
-async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarative") -> bool:
+async def _run_agent(
+    agent_id: str, ops: list[str], collection: str = "declarative"
+) -> bool:
     """Run the requested ops for one agent.
 
     Bootstraps the agent (``CheshireCat.create`` + handler checks +
     ``initialize``) and dispatches each op. ``--reembed`` and ``--reingest``
-    resolve the active ingestion engine first (refusing the base engine, Metis
-    #23) and then run the embedding phase via ``_op_reembed`` / the points-
-    first wipe + clean re-parse via ``_op_reingest``; ``--graph`` runs Part A
-    (fixed graph wipe-then-rebuild, ``_op_graph_part_a``) then Part B (LLM
-    concept relations with the latest-wins flip, ``_op_graph_part_b``). Skip
+    resolve the active ingestion engine first (refusing the base engine) and
+    then run the phase machine via ``_op_reembed`` (gen-based recompute) /
+    ``_op_reingest`` (points-first wipe + clean re-parse); ``--graph`` /
+    ``--wipe-graph`` resolve the engine too (the phase machine dispatches the
+    ``graph_building`` phase) and run ``_op_graph`` (mark the phase stale +
+    invoke the phase path; ``--wipe-graph`` runs the A0 wipe first). Skip
     reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
-    ``graphrag-not-enabled`` (the ``--graph`` op requires the
-    ``Neo4jGraphRAGConfig`` setting with ``enable_knowledge_graph`` AND
-    ``enable_concept_relations``).
+    ``graphrag-not-enabled`` (the ``--graph``/``--wipe-graph`` op requires the
+    ``Neo4jGraphRAGConfig`` setting AND the handler's ``_enable_derived_graph``
+    — the phase gate in main.py's hooks).
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
@@ -818,16 +787,16 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
 
     ok = True
     for op in ops:
-        if op == "graph" and not (
+        if op in ("graph", "wipe_graph") and not (
             getattr(handler, "_graphrag_detected", False)
-            and getattr(handler, "_concept_relations_enabled", False)
+            and getattr(handler, "_enable_derived_graph", False)
         ):
             print(
                 f"[maintenance] agent={agent_id} op={op} result=skip "
                 f"reason=graphrag-not-enabled"
             )
             continue
-        if op in ("reembed", "reingest"):
+        if op in ("reembed", "reingest", "graph", "wipe_graph"):
             engine = await _resolve_ingestion_engine(ccat, op=op)
             if engine is None:
                 ok = False
@@ -850,16 +819,11 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 continue
             print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reingested")
             continue
-        if op == "graph":
+        if op in ("graph", "wipe_graph"):
             try:
-                await _op_graph_part_a(ccat, handler, collection)
-                part_b_ok = await _op_graph_part_b(ccat, handler)
+                await _op_graph(ccat, handler, collection, wipe=(op == "wipe_graph"))
             except Exception as exc:  # noqa: BLE001 - per-op isolation
                 print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
-                ok = False
-                continue
-            if not part_b_ok:
-                # Part B already logged result=fail detail=flip-conflict-exhausted.
                 ok = False
                 continue
             print(f"[maintenance] agent={agent_id} op={op} result=ok detail=graph")
@@ -867,17 +831,21 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     return ok
 
 
-async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) -> list[tuple[str, bool]]:
-    """Run the acceptance checks (plan Success criteria, Metis #25).
+async def _verify_agent(
+    ccat, handler, collection: str, gen: str | None = None
+) -> list[tuple[str, bool]]:
+    """Run the acceptance checks (plan Success criteria).
 
     Read-only assertions against the agent's status docs and the Neo4j
     graph (via ``handler._get_session()``):
 
-      1. status docs completed with the active embedder/chunker;
+      1. status docs completed with the active fingerprint dicts and the
+         ``completed_phases`` diary (``parsing_chunking`` + ``embedding``,
+         plus ``graph_building`` when the graphrag phase is enabled);
       2. zero ``Document.embedding_<gen> IS NULL``;
       3. ``MENTIONS`` edge count > 0 and ``SIMILAR_TO_<gen>`` edge count > 0;
       4. ``Collection.concept_gen_active == handler._concept_fingerprint()``
-         (same read as ``_read_concept_gen``, graphrag_handler.py:2995);
+         (same read as ``_read_concept_gen``);
       5. no orphan entities (no MENTIONS/PROVENANCE) — count == 0;
       6. ``SourceFile`` count == source count.
 
@@ -895,18 +863,32 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
 
     checks: list[tuple[str, bool]] = []
 
-    # 1. status docs completed with the active embedder/chunker.
-    embedder = await ccat.embedder()
-    chunker = ccat.chunker
+    # 1. status docs completed with the active fingerprint dicts and the
+    #    completed_phases diary (parsing_chunking + embedding [+ graph_building
+    #    when the graphrag phase is enabled]).
     statuses = await list_statuses(tenant_id)
+    graphrag_expected = bool(
+        getattr(handler, "_graphrag_detected", False)
+        and getattr(handler, "_enable_derived_graph", False)
+    )
+
+    def _has_phase(doc, phase: str) -> bool:
+        return any(
+            isinstance(e, dict) and e.get("phase") == phase and e.get("gen")
+            for e in (doc.get("completed_phases") or [])
+        )
+
     checks.append(
         (
-            "status-completed-active-embedder-chunker",
+            "status-completed-phases",
             bool(statuses)
             and all(
                 doc.get("status") == "completed"
-                and doc.get("embedder_name") == embedder.name
-                and doc.get("chunker_name") == chunker.name
+                and doc.get("chunker") is not None
+                and doc.get("embedder") is not None
+                and _has_phase(doc, "parsing_chunking")
+                and _has_phase(doc, "embedding")
+                and (not graphrag_expected or _has_phase(doc, "graph_building"))
                 for doc in statuses
             ),
         )
@@ -1008,8 +990,8 @@ async def main() -> None:
 
     results = []
     for entry in runnable:
-        # Sequential per-agent execution (Metis #18): agents are processed one
-        # at a time, so no two ops ever run concurrently on the same agent.
+        # Sequential per-agent execution: agents are processed one at a time,
+        # so no two ops ever run concurrently on the same agent.
         print(f"[maintenance] agent={entry['agent_id']} progress=start")
         try:
             ok = await _run_agent(
