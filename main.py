@@ -120,6 +120,178 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     await handler.create_derived_graph_for_source(source, stored_points, cat)
 
 
+# ========== INGESTION PHASE MACHINE (T21-T24) ==========
+#
+# The core dispatcher (feat/ingestion-phase-machine) drives the phase-aware
+# ingestion lifecycle through three no-op hooks declared in
+# ``cat/core_plugins/base_plugin/hooks/ingestion.py`` plus the phase executor
+# ``ingestion_phase_run``. Dispatch is by hook name, so these handlers work
+# even before the core patch lands (they simply never fire).
+
+
+def _graphrag_handler(cat):
+    """Resolve the active GraphRAG handler, or None.
+
+    Same guard as every other hook in this module: lazy import (FX-9, the
+    plugin loader reloads main.py BEFORE graphrag_handler.py, so a module-level
+    binding would compare against the PRE-reload class and always fail) +
+    isinstance against the current class.
+    """
+    from .graphrag_handler import GraphRAGHandler as _GH
+    handler = getattr(cat, "vector_memory_handler", None)
+    if isinstance(handler, _GH):
+        return handler
+    return None
+
+
+@hook(priority=10)
+async def ingestion_phase_pending(pending, source, completed_phases, cat) -> list:
+    """Probe hook (T21): report ``graph_building`` as stale work.
+
+    ACCUMULATOR convention: the core dispatcher deep-copies the first
+    positional arg (``pending``) and threads it through every registrant;
+    each registrant receives the current accumulator and its non-None return
+    REPLACES it. This hook appends ``{"phase": "graph_building", "gen":
+    <recomputed>}`` only when BOTH dependency phases (``parsing_chunking``
+    and ``embedding``) are present in ``completed_phases`` AND the recorded
+    generation for ``graph_building`` differs from the recomputed one
+    (settings fingerprint + concept-relations fingerprint + dependency
+    generations). It ALWAYS returns ``pending`` (never ``[]`` — that would
+    discard other plugins' entries). Entries are dicts ``{"phase", "gen"}``,
+    not bare strings.
+    """
+    handler = _graphrag_handler(cat)
+    if handler is None:
+        return pending
+    if not getattr(handler, "_enable_derived_graph", False):
+        return pending
+
+    dep_ids = {"parsing_chunking", "embedding"}
+    completed_ids = {p.get("phase") for p in completed_phases if isinstance(p, dict)}
+    if not dep_ids.issubset(completed_ids):
+        return pending
+
+    # Core helpers (feat/ingestion-phase-machine). If they are not deployed
+    # yet, the phase machine is not running: no work to report.
+    try:
+        from cat.core_plugins.ingestion_status.fingerprints import (
+            build_graphrag_fingerprint,
+            phase_generation,
+        )
+    except Exception:  # noqa: BLE001
+        return pending
+
+    # Recorded generation of graph_building (from the full diary), and the
+    # dependency generations used to recompute it. graph_building itself is
+    # EXCLUDED from dep_gens: the recorded generation is computed from the
+    # DEPENDENCY phases only, so including it here would make the recomputed
+    # hash self-referential and the phase permanently stale.
+    recorded = next(
+        (
+            p.get("gen")
+            for p in completed_phases
+            if isinstance(p, dict) and p.get("phase") == "graph_building"
+        ),
+        None,
+    )
+    dep_gens = {
+        p["phase"]: p.get("gen")
+        for p in completed_phases
+        if isinstance(p, dict)
+        and p.get("phase") is not None
+        and p["phase"] != "graph_building"
+    }
+    fp = {
+        "settings": await build_graphrag_fingerprint(cat.agent_key),
+        "concept": handler._concept_fingerprint(),
+    }
+    recomputed = phase_generation("graph_building", fp, dep_gens)
+    if recorded == recomputed:
+        return pending
+    pending.append({"phase": "graph_building", "gen": recomputed})
+    return pending
+
+
+@hook(priority=10)
+async def ingestion_phase_run(phase, source, completed_phases, cat):
+    """Phase executor (T22): run the graph-building phase inline and awaited.
+
+    Only handles ``phase == "graph_building"`` (returns None otherwise). The
+    graph work for ``source`` runs AWAITED (not fire-and-forget): the source's
+    background NER tasks are joined, similarity relationships are re-run for
+    the source's stored points (needs valid vectors — that is why the
+    embedding phase must precede), and the LLM concept-relations step runs
+    inline. Returns ``{"status": "done"}`` on success and
+    ``{"status": "not_ready", "retry_after": <s>}`` when the source's points
+    are not yet in the store. Exceptions propagate (the core maps raise ->
+    status=error, fail-hard).
+    """
+    if phase != "graph_building":
+        return None
+    handler = _graphrag_handler(cat)
+    if handler is None:
+        return None
+    if not getattr(handler, "_enable_derived_graph", False):
+        return None
+    return await handler.run_graph_building_phase(source, cat=cat)
+
+
+@hook(priority=10)
+async def before_ingestion_status_completed(source, cat) -> None:
+    """Completion gate (T23): fail-hard when graph work is still pending.
+
+    Raises when live background tasks remain for the source or when the
+    ``graph_building`` generation was not recorded in the status doc, so the
+    core writes status=error. No-op when graphrag is not the active handler.
+    """
+    handler = _graphrag_handler(cat)
+    if handler is None:
+        return
+    if not getattr(handler, "_enable_derived_graph", False):
+        return
+
+    if handler.has_pending_source_tasks(source):
+        raise RuntimeError(
+            f"[GraphRAG] Pending background graph tasks for source '{source}'"
+        )
+
+    # The graph phase's generation must have been recorded in the status doc's
+    # completed-phases diary. Registry unavailable -> skip the doc check (the
+    # in-memory pending-task check above already passed).
+    try:
+        from cat.core_plugins.ingestion_status.registry import get_status
+    except Exception:  # noqa: BLE001
+        return
+    scope = cat.id if hasattr(cat, "id") else "agent"
+    doc = await get_status(cat.agent_key, scope, source)
+    if doc is not None:
+        completed = doc.get("completed_phases") or []
+        if not any(
+            isinstance(e, dict) and e.get("phase") == "graph_building"
+            for e in completed
+        ):
+            raise RuntimeError(
+                f"[GraphRAG] graph_building generation not recorded for source '{source}'"
+            )
+
+
+@hook(priority=10)
+async def after_vector_memory_transfer_on_agent(success, old_handler_name, cat) -> None:
+    """Old-store cleanup on vector-memory switch (T24).
+
+    When the transfer SUCCEEDED and the old handler was the GraphRAG one
+    (graphrag -> qdrant switch), wipe THIS agent's Neo4j tenant data
+    (Document/Entity/relations, strictly tenant-scoped). When the new handler
+    is graphrag (qdrant -> graphrag) nothing is done here — the revalidation
+    sweep + the ``graph_building`` phase handle graph computation. NEVER wipes
+    when ``success`` is False.
+    """
+    if not success or old_handler_name != "Neo4jGraphRAGConfig":
+        return
+    from .graphrag_handler import wipe_tenant_graph_data
+    await wipe_tenant_graph_data(cat.agent_key)
+
+
 @hook(priority=10)
 async def after_plugin_settings_update(plugin_id: str, settings: Dict[str, Any], cat) -> None:
     # Lazy import (FX-9): same reload-order rationale as
