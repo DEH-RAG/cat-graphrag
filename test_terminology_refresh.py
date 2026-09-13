@@ -225,7 +225,9 @@ class _FakeGraph:
         self.documents[(tenant, doc_id)] = content
 
     def add_entity(self, tenant, entity_id, name, etype):
-        self.entities[(tenant, entity_id)] = {"name": name, "type": etype}
+        self.entities[(tenant, entity_id)] = {
+            "name": name, "type": etype, "types": [etype],
+        }
 
     def add_mention(self, tenant, doc_id, entity_id):
         self.mentions.add((tenant, doc_id, entity_id))
@@ -243,6 +245,17 @@ class _FakeGraph:
         if tenant is None:
             return len(self.mentions)
         return sum(1 for m in self.mentions if m[0] == tenant)
+
+
+def _is_tech_entity(ent):
+    """Membership-aware TECHNOLOGY check mirroring the production predicates
+
+    ``(e.type = 'TECHNOLOGY' OR 'TECHNOLOGY' IN e.types)``.
+    """
+    return bool(ent) and (
+        ent.get("type") == "TECHNOLOGY"
+        or "TECHNOLOGY" in (ent.get("types") or [])
+    )
 
 
 class _FakeResult:
@@ -304,13 +317,41 @@ class _FakeSession:
                 if t == tenant
             ])
 
-        # 2. MERGE entity nodes.
+        # 2a. In-tx metadata pre-read (before the entity MERGE): the refresh
+        #     write reads each entity's current metadata JSON to merge fresh
+        #     per-document contributions with it. Rows only exist for node ids
+        #     already present — absent ids yield no record, so the caller's
+        #     dict.get() defaults to None (fresh metadata).
+        if "UNWIND $ids AS eid" in q and "RETURN e.id AS id, e.metadata AS metadata" in q:
+            return _FakeResult([
+                {"id": eid, "metadata": node.get("metadata")}
+                for eid in params.get("ids", [])
+                if (node := self.graph.entities.get((tenant, eid))) is not None
+            ])
+
+        # 2. MERGE entity nodes (types init on create / membership-aware append
+        #    on match + name/metadata writes, mirroring the ON CREATE/ON MATCH
+        #    clauses of the refresh batch_entity_query).
         if "MERGE (e:Entity {id: ent.id" in q:
             for ent in params.get("entities", []):
-                self.graph.entities[(tenant, ent["id"])] = {
-                    "name": ent["name"],
-                    "type": ent["type"],
-                }
+                key = (tenant, ent["id"])
+                node = self.graph.entities.get(key)
+                if node is None:
+                    self.graph.entities[key] = {
+                        "name": ent["name"],
+                        "type": ent["type"],
+                        "types": [ent["type"]],
+                        "metadata": ent.get("metadata"),
+                    }
+                else:
+                    etype = ent["type"]
+                    types = list(node.get("types") or [])
+                    if etype not in types:
+                        types.append(etype)
+                    node["name"] = ent["name"]
+                    node["type"] = node.get("type") or etype
+                    node["types"] = types
+                    node["metadata"] = ent.get("metadata")
             return _FakeResult([])
 
         # 3. MERGE MENTIONS edges.
@@ -327,7 +368,9 @@ class _FakeSession:
                 self.graph.provenance.add((tenant, doc_id, m["entity_id"]))
             return _FakeResult([])
 
-        # 4. Delete stale MENTIONS edges to Technology entities no longer matched.
+        # 4. Delete stale MENTIONS edges to Technology entities no longer
+        #    matched. Membership-aware (primary type OR types[] membership),
+        #    mirroring the WHERE clause of delete_stale_mentions_query.
         if "DELETE r" in q and "doc_terms" in params:
             for d in params["doc_terms"]:
                 doc_id = d["doc_id"]
@@ -336,20 +379,24 @@ class _FakeSession:
                     (tenant, doc_id, eid)
                     for (t, did, eid) in self.graph.mentions
                     if t == tenant and did == doc_id
-                    and self.graph.entities.get((tenant, eid), {}).get("type") == "TECHNOLOGY"
+                    and _is_tech_entity(self.graph.entities.get((tenant, eid)))
                     and eid not in valid
                 ]
                 for m in stale:
                     self.graph.mentions.discard(m)
             return _FakeResult([])
 
-        # 5. Prune orphaned Technology entities (no remaining MENTIONS).
+        # 5. Prune orphaned Technology Entity nodes: membership-aware like the
+        #    stale-mention deletion AND provenance-guarded — a node with a
+        #    PROVENANCE edge (e.g. a merged concept-owned node) is never
+        #    removed, mirroring prune_orphan_tech_query.
         if "DETACH DELETE e" in q:
             orphans = [
                 (tenant, eid)
                 for (t, eid), ent in self.graph.entities.items()
-                if t == tenant and ent["type"] == "TECHNOLOGY"
+                if t == tenant and _is_tech_entity(ent)
                 and not any(m[0] == tenant and m[2] == eid for m in self.graph.mentions)
+                and not any(p[0] == tenant and p[2] == eid for p in self.graph.provenance)
             ]
             for key in orphans:
                 self.graph.entities.pop(key, None)
