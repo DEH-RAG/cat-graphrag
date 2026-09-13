@@ -790,7 +790,7 @@ async def _op_graph_part_b(ccat, handler) -> bool:
     NOT coordinate with this separate process — the persisted
     ``concept_gen_active`` marker IS the cross-process guard. Each pass:
     fingerprint -> read the active marker -> recompute with the new gen ->
-    ``_flip_concept_gen(expected_prev=active)``; a False flip means a newer
+    ``_flip_concept_gen(expected_prev_gen=active)``; a False flip means a newer
     save won the race, so the loop re-reads the marker and retries (max 3
     attempts). After a successful flip, the deferred GC of stale
     old-generation concept nodes runs. Returns True on a committed flip,
@@ -804,7 +804,7 @@ async def _op_graph_part_b(ccat, handler) -> bool:
         active = await handler._read_concept_gen(tenant_id)
         await handler.recompute_concept_relations(stray_duck, gen=gen)
         flipped = await handler._flip_concept_gen(
-            tenant_id, expected_prev=active, new_gen=gen
+            tenant_id, expected_prev_gen=active, new_gen=gen
         )
         if flipped:
             await handler._gc_stale_concept_nodes(tenant_id)
