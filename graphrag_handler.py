@@ -32,6 +32,14 @@ from .models import EntityType
 from .structured_llm import StructuredLLM, StructuredLLMError
 from .versioning import ensure_version, retry_on_generation_change
 
+# Last-known GraphRAG connection config per agent, captured in ``_connect``
+# whenever a handler connects. Used by the old-store cleanup on vector-memory
+# switch (T24): after a graphrag -> other switch the Neo4j config is gone from
+# the settings store (the category holds only the newly selected config), so
+# the wipe must reconnect with the params the handler last used. Import-safe:
+# plain module-level dict, no side effects.
+_last_graphrag_config: Dict[str, Dict[str, Any]] = {}
+
 
 def _upper_str(value: Any) -> str:
     """Strip + uppercase a value before Literal validation.
@@ -157,6 +165,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
+        # Per-source view of the same background tasks (T22): maps a source
+        # name to the tasks spawned for its points, so the graph-building
+        # phase can join ONLY this source's work. Tasks are also in the flat
+        # ``_pending_entity_tasks`` list (close() drains both).
+        self._pending_source_tasks: Dict[str, List[asyncio.Task]] = {}
         # Semaphore: caps concurrent Neo4j write transactions to reduce lock
         # contention and deadlock probability during bulk PDF ingestion.
         # Shared between entity extraction and similarity writes.
@@ -286,6 +299,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 assert isinstance(self._driver, AsyncDriver)
                 async with self._driver.session(database=self._neo4j_database) as session:
                     await session.run("RETURN 1")
+                # Record the connection config for the old-store cleanup on
+                # vector-memory switch (T24): after a graphrag -> other switch
+                # the Neo4j config is gone from the settings store, so the wipe
+                # reconnects with the params this handler last used.
+                agent_key = getattr(self, "agent_id", None)
+                if agent_key:
+                    _last_graphrag_config[agent_key] = {
+                        "neo4j_uri": self._neo4j_uri,
+                        "neo4j_user": self._neo4j_user,
+                        "neo4j_password": self._neo4j_password,
+                        "neo4j_database": self._neo4j_database,
+                        "neo4j_kwargs": self._neo4j_kwargs,
+                    }
                 log.debug(f"Connected to Neo4j at {self._neo4j_uri}")
             except Exception as e:
                 log.error(f"Failed to connect to Neo4j: {e}")
@@ -952,6 +978,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Wait for cancellations to propagate
             await asyncio.gather(*tasks, return_exceptions=True)
             tasks.clear()
+        # Drop the per-source view too (same task objects, already cancelled).
+        self._pending_source_tasks.clear()
 
         driver = getattr(self, '_driver', None)
         if driver:
@@ -1196,6 +1224,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
+            self._track_source_task((metadata or {}).get("source"), task)
 
         # Create SIMILAR_TO relationships in the background (tracked for clean shutdown)
         # Only when the vector is valid: a zero/non-finite vector would produce
@@ -1203,9 +1232,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if vector_valid:
             sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
             self._pending_entity_tasks.append(sim_task)
+            self._track_source_task((metadata or {}).get("source"), sim_task)
 
         # Clean up completed tasks
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
+        # Mirror the prune in the per-source view so the dict does not grow
+        # with finished tasks of sources that never get drained.
+        for _src, _tasks in list(self._pending_source_tasks.items()):
+            self._pending_source_tasks[_src] = [t for t in _tasks if not t.done()]
 
         return PointStruct(
             id=point_id,
@@ -1217,6 +1251,105 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             },
             vector=vector_list,
         )
+
+    # ========== GRAPH-BUILDING PHASE (T21-T23) ==========
+
+    def _track_source_task(self, source: Optional[str], task: asyncio.Task) -> None:
+        """Record a background task under the source that spawned it.
+
+        The same task stays in the flat ``_pending_entity_tasks`` list (so
+        ``close()`` still drains it); this dict is the per-source view the
+        graph-building phase uses to join ONLY one source's work.
+        """
+        if source:
+            self._pending_source_tasks.setdefault(source, []).append(task)
+
+    def has_pending_source_tasks(self, source: str) -> bool:
+        """Whether any LIVE background task remains for a source.
+
+        Done tasks are ignored: the completion gate (T23) must not fail on
+        work that already finished.
+        """
+        tasks = self._pending_source_tasks.get(source) or []
+        return any(not t.done() for t in tasks)
+
+    async def drain_source_tasks(self, source: str) -> None:
+        """Await (join) all background tasks spawned for one source, inline.
+
+        Pops the source's task list (both the per-source view and the flat
+        list) and gathers them. The underlying methods
+        (``_extract_and_link_entities`` / ``_create_similarity_relationships``)
+        already fail-soft internally, so a failure here is logged, not raised
+        — the deterministic phase work below re-runs the same steps awaited.
+        """
+        tasks = self._pending_source_tasks.pop(source, [])
+        if not tasks:
+            return
+        self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r}")
+
+    async def get_source_points_by_collection(self, source: str) -> Dict[str, List[Record]]:
+        """Fetch all stored points of one source, grouped by collection.
+
+        The metadata filter matches the exact JSON fragment the store writes
+        (``"source": "<name>"``), so only points of THIS source are returned.
+        Ensures the versioned generation is resolved first so the embedding
+        property read targets the current generation.
+        """
+        await self._ensure_connected()
+        if self._generation is None:
+            gen = await self._read_generation()
+            self._rebuild_for_generation(gen)
+        result: Dict[str, List[Record]] = {}
+        for collection_name in await self.get_collection_names():
+            points, _ = await self.get_all_tenant_points(
+                collection_name, metadata={"source": source}, with_vectors=True
+            )
+            if points:
+                result[collection_name] = points
+        return result
+
+    async def run_graph_building_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited graph-building phase for one source (T22).
+
+        Runs the graph work the old ``after_rabbithole_stored_documents`` hook
+        fired-and-forgot, but inline and awaited:
+
+        1. joins the source's background NER/similarity tasks
+           (``drain_source_tasks``);
+        2. re-runs ``_create_similarity_relationships`` for the source's
+           stored points (needs valid vectors — that is why the embedding
+           phase must precede);
+        3. runs the LLM concept-relations step (``_extract_concept_relations``)
+           for the source.
+
+        Returns ``{"status": "done"}`` on success and
+        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
+        points are not yet in the store. Exceptions propagate (the core maps
+        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
+        so re-running after a retry never duplicates data.
+        """
+        await self.drain_source_tasks(source)
+
+        by_collection = await self.get_source_points_by_collection(source)
+        if not by_collection:
+            return {"status": "not_ready", "retry_after": 5}
+
+        all_points: List[Record] = []
+        for collection_name, points in by_collection.items():
+            all_points.extend(points)
+            for p in points:
+                vector = getattr(p, "vector", None)
+                if vector and self._is_valid_vector(vector):
+                    await self._create_similarity_relationships(p.id, vector, collection_name)
+
+        if self._enable_knowledge_graph and self._enable_concept_relations:
+            await self._extract_concept_relations(source, all_points, stray_cat=cat)
+
+        return {"status": "done"}
 
     async def _extract_and_link_entities(
         self,
@@ -3693,7 +3826,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             SET t.metadata = $t_metadata
                             MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                             SET r.concept_gen = CASE WHEN $r_gen IS NOT NULL THEN $r_gen ELSE r.concept_gen END
-                            SET r.weight = coalesce(r.weight, 1.0) + 0.5
+                            # Idempotent weight: re-running the graph phase for the
+                            # same source+gen must not mutate the edge. The old
+                            # `+ 0.5` accumulated on every re-run; the weight is
+                            # write-only (never read by recall), so first-write
+                            # behavior (1.0) is preserved and re-runs are no-ops.
+                            SET r.weight = coalesce(r.weight, 1.0)
                             SET r.text = $rel_text
                             SET r.source_files = CASE
                                 WHEN $source_files IS NULL THEN r.source_files
@@ -3792,6 +3930,34 @@ Return ONLY a valid JSON object with two arrays, "concepts" and "relations", and
 
 Text:
 {text}"""
+
+
+async def wipe_tenant_graph_data(agent_key: str) -> None:
+    """Wipe a tenant's Neo4j graph data after a graphrag -> other switch (T24).
+
+    Reconnects with the last-known GraphRAG connection config for the agent
+    (captured in ``_connect``) and deletes the tenant's Document/Entity/
+    relations via the existing per-tenant wipe path
+    (``_drop_tenant_data_in_session``). Strictly tenant-scoped: every
+    statement is filtered by ``tenant_id``, and a missing/unknown config
+    aborts instead of guessing. Never called when the transfer failed (the
+    hook gates on ``success``).
+    """
+    config = _last_graphrag_config.get(agent_key)
+    if not config:
+        log.warning(
+            f"[GraphRAG] No recorded Neo4j config for agent '{agent_key}'; "
+            "skipping old-store wipe (nothing to reconnect with)"
+        )
+        return
+    handler = GraphRAGHandler(**config)
+    handler.agent_id = agent_key
+    try:
+        await handler._ensure_connected()
+        async with handler._get_session() as session:
+            await handler._drop_tenant_data_in_session(session)
+    finally:
+        await handler.close()
 
 
 def parse_definitions(text: str) -> Dict[str, str]:
