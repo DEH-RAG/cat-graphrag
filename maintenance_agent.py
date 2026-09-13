@@ -768,6 +768,7 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
                     "page_content": d["content"],
                     "metadata": d["metadata"],
                 },
+                vector=[],
             )
             for d in src_docs
         ]
