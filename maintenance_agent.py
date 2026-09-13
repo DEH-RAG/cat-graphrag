@@ -81,6 +81,27 @@ _GRAPH_WALK_MAX_RERUNS = 3
 # one-time warning (module-level flag: warn once per process, not per call).
 _default_agent_warned = False
 
+# The Cat lizard's plugin manager is bootstrapped lazily ONCE per process
+# (see _ensure_lizard_booted).
+_lizard_booted = False
+
+
+async def _ensure_lizard_booted() -> None:
+    """Bootstrap the Cat lizard's plugin manager in this process.
+
+    ``CheshireCat.create`` resolves non-system agents' plugins through
+    ``BillTheLizard().plugin_manager.plugins``; in a fresh ``docker exec``
+    process that lizard is never bootstrapped (the server does it in the
+    uvicorn lifespan), so the registry is empty and ``base_plugin`` is
+    missing. Discover the plugins once, lazily, before creating any Cat.
+    """
+    global _lizard_booted
+    if _lizard_booted:
+        return
+    from cat.looking_glass.bill_the_lizard import BillTheLizard
+    await BillTheLizard().plugin_manager.discover_plugins()
+    _lizard_booted = True
+
 
 class _PlanEntry(TypedDict):
     """One per-agent plan entry: target, ops, collection, optional skip."""
@@ -385,6 +406,11 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
     handler is not a ``GraphRAGHandler``.
     """
     from cat.looking_glass.cheshire_cat import CheshireCat
+
+    # In a fresh `docker exec` process the lizard is never bootstrapped (the
+    # server does it in the uvicorn lifespan), so its plugin registry is empty
+    # and CheshireCat.create would KeyError on 'base_plugin'. Bootstrap once.
+    await _ensure_lizard_booted()
 
     ccat = await CheshireCat.create(agent_id)
     handler = ccat.vector_memory_handler
