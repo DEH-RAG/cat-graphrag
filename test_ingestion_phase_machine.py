@@ -1,24 +1,28 @@
-"""Standalone verification for the ingestion phase machine hooks (T21-T24).
+"""Standalone verification for the EffING phase-machine registration (T5).
 
-Covers the four hooks added to ``main.py`` plus the handler helpers they
-drive (``run_graph_building_phase``, ``drain_source_tasks``,
+Covers the EffING-contract hooks added to ``main.py`` plus the handler
+helpers they drive (``run_spacy_extraction_phase``,
+``run_llm_extraction_phase``, ``drain_source_tasks``,
 ``has_pending_source_tasks``, ``get_source_points_by_collection``,
 ``wipe_tenant_graph_data``):
 
-- ``ingestion_phase_pending`` (accumulator convention: first positional arg
-  ``pending`` is threaded through registrants and its non-None return
-  replaces it) returns the accumulator unchanged when the dependency phases
-  are missing, when the recorded generation matches the recomputed one, or
-  when graphrag is not the active handler; appends
-  ``{"phase": "graph_building", "gen": <recomputed>}`` when the deps are
-  done and the generation is stale, preserving any prior accumulator
-  entries;
-- ``ingestion_phase_run`` returns None for other phases, not_ready when the
-  source's points are absent, and done (with the LLM concept-relations step
-  awaited) when the points are present;
+- ``ingestion_phase_specs`` appends the two PhaseSpecs
+  (``graph_spacy_extraction`` / ``graph_llm_extraction``, both depending on
+  ``parsing_chunking`` + ``embedding``, ``settings_category=None``) and
+  returns the accumulator unchanged when EffING is not importable;
+- ``ingestion_phase_settings_marker`` returns ``_spacy_fingerprint`` for
+  ``graph_spacy_extraction``, ``_concept_fingerprint`` for
+  ``graph_llm_extraction``, None otherwise;
+- ``ingestion_phase_run`` returns None for unknown phases (fail-hard),
+  not_ready when the source's points are absent, and done (with the NER +
+  similarity work / the LLM concept-relations step awaited) when the points
+  are present;
 - ``before_ingestion_status_completed`` raises when live background tasks
-  remain for the source or when the graph_building generation was not
-  recorded, and passes when the work is clean;
+  remain for the source, and passes when the work is clean (the diary check
+  is gone: EffING owns the completed-phases diary);
+- ``after_rabbithole_stored_documents`` is a NO-OP when the EffING phase
+  machine is importable (the phases own the work) and keeps the legacy
+  ``create_derived_graph_for_source`` behavior when it is not;
 - ``after_vector_memory_transfer_on_agent`` wipes the tenant's Neo4j data
   ONLY on success + old handler == Neo4jGraphRAGConfig, and never on failure;
 - ``wipe_tenant_graph_data`` skips without a recorded config and wipes the
@@ -28,15 +32,12 @@ Runnable:  python test_ingestion_phase_machine.py
 Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
 external packages (cat, langchain_core, spacy, langdetect, pydantic, neo4j)
 are stubbed in sys.modules *before* the plugin modules are imported (same
-pattern as test_kg_master_switch.py). The core phase-machine helpers
-(``cat.core_plugins.ingestion_status.fingerprints`` / ``.registry``) are
-stubbed with the real ``phase_generation`` logic and fakes for the Redis
-reads.
+pattern as test_kg_master_switch.py). The EffING phase-machine contract
+(``cat.plugins.cat_efficient_ingestion.phases.PhaseSpec``) is stubbed with a
+recording fake.
 """
 
 import asyncio
-import hashlib
-import json
 import os
 import sys
 import types
@@ -63,8 +64,14 @@ def _install_cat_stub():
     cat_mod = types.ModuleType("cat")
     cat_mod.__path__ = []  # look like a package root for submodule imports
 
-    # @hook decorator: returns the function unchanged.
-    cat_mod.hook = lambda *a, **kwargs: (lambda f: f)
+    # @hook decorator: supports both bare ``@hook`` and ``@hook(priority=...)``;
+    # returns the function unchanged either way.
+    def _hook(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return lambda f: f
+
+    cat_mod.hook = _hook
     cat_mod.RecallSettings = type("RecallSettings", (), {})
     cat_mod.VectorDatabaseSettings = type("VectorDatabaseSettings", (), {})
     cat_mod.Embeddings = type("Embeddings", (), {})
@@ -201,41 +208,31 @@ def _install_pydantic_stub():
     sys.modules["pydantic"] = pydantic_mod
 
 
-def _phase_generation(phase_id, settings_fp, dep_gens):
-    """Mirror of the core's ``phase_generation`` (fingerprints.py)."""
-    payload = json.dumps(
-        {"phase": phase_id, "fp": settings_fp, "deps": dep_gens},
-        sort_keys=True,
-        default=str,
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
+def _install_effing_stub():
+    """Stub the EffING phase-machine contract the hooks import lazily.
 
-
-def _install_ingestion_status_stub():
-    """Stub the core phase-machine helpers the hooks import lazily.
-
-    ``build_graphrag_fingerprint`` is a fake Redis read (fixed value);
-    ``phase_generation`` is the REAL algorithm; ``get_status`` is a fake
-    Redis read whose return value tests override per-case.
+    ``PhaseSpec`` is a recording fake (id / settings_category / depends_on);
+    ``cat.plugins.cat_efficient_ingestion`` importable means the phase
+    machine is "deployed" for ``_phase_machine_active``.
     """
-    core_plugins = types.ModuleType("cat.core_plugins")
-    core_plugins.__path__ = []
-    sys.modules["cat.core_plugins"] = core_plugins
+    plugins = types.ModuleType("cat.plugins")
+    plugins.__path__ = []
+    sys.modules["cat.plugins"] = plugins
 
-    ingestion_status = types.ModuleType("cat.core_plugins.ingestion_status")
-    ingestion_status.__path__ = []
-    sys.modules["cat.core_plugins.ingestion_status"] = ingestion_status
+    effing = types.ModuleType("cat.plugins.cat_efficient_ingestion")
+    effing.__path__ = []
+    sys.modules["cat.plugins.cat_efficient_ingestion"] = effing
 
-    fingerprints = types.ModuleType("cat.core_plugins.ingestion_status.fingerprints")
-    fingerprints.build_graphrag_fingerprint = AsyncMock(
-        return_value={"name": "Neo4jGraphRAGConfig", "settings": {"neo4j_uri": "bolt://fake"}}
-    )
-    fingerprints.phase_generation = _phase_generation
-    sys.modules["cat.core_plugins.ingestion_status.fingerprints"] = fingerprints
+    phases = types.ModuleType("cat.plugins.cat_efficient_ingestion.phases")
 
-    registry = types.ModuleType("cat.core_plugins.ingestion_status.registry")
-    registry.get_status = AsyncMock(return_value=None)
-    sys.modules["cat.core_plugins.ingestion_status.registry"] = registry
+    class PhaseSpec:
+        def __init__(self, id, settings_category=None, depends_on=()):
+            self.id = id
+            self.settings_category = settings_category
+            self.depends_on = tuple(depends_on)
+
+    phases.PhaseSpec = PhaseSpec
+    sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = phases
 
 
 def _install_stubs():
@@ -245,7 +242,7 @@ def _install_stubs():
     _install_langdetect_stub()
     _install_spacy_stubs()
     _install_pydantic_stub()
-    _install_ingestion_status_stub()
+    _install_effing_stub()
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +259,10 @@ class _FakeCat:
 
 
 class _FakePoint:
-    def __init__(self, pid, vector=None):
+    def __init__(self, pid, vector=None, payload=None):
         self.id = pid
         self.vector = vector
+        self.payload = payload or {}
 
 
 def _make_handler(kg=True, cr=True, derived=True):
@@ -291,109 +289,102 @@ def _completed(deps, recorded_gen=None):
 
 
 # ---------------------------------------------------------------------------
-# T21 — probe
+# T5 — phase registration (ingestion_phase_specs / settings marker)
 # ---------------------------------------------------------------------------
 
 
-def test_probe_returns_empty_when_deps_missing():
+def test_specs_registers_two_graph_phases():
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    pending = asyncio.run(main.ingestion_phase_pending(
-        [], "file.pdf", _completed([("parsing_chunking", "g1")]), cat
-    ))
-    assert pending == [], f"expected [] with only parsing_chunking done, got {pending}"
-
-
-def test_probe_returns_graph_building_when_deps_done_and_stale():
-    from catgraphrag_phase import main
-
-    handler = _make_handler()
-    cat = _FakeCat(handler)
-    pending = asyncio.run(main.ingestion_phase_pending(
-        [],
-        "file.pdf",
-        _completed([("parsing_chunking", "g1"), ("embedding", "g2")]),
-        cat,
-    ))
-    assert len(pending) == 1, f"expected one entry, got {pending}"
-    entry = pending[0]
-    assert isinstance(entry, dict), f"entry must be a dict, got {type(entry)}"
-    assert entry["phase"] == "graph_building", f"got {entry}"
-    assert entry["gen"], f"entry must carry a recomputed gen, got {entry}"
-
-
-def test_probe_preserves_prior_accumulator_entries():
-    from catgraphrag_phase import main
-
-    handler = _make_handler()
-    cat = _FakeCat(handler)
-    accumulator = [{"phase": "embedding", "gen": "g2"}]
-    pending = asyncio.run(main.ingestion_phase_pending(
-        accumulator,
-        "file.pdf",
-        _completed([("parsing_chunking", "g1"), ("embedding", "g2")]),
-        cat,
-    ))
-    assert pending[0] == {"phase": "embedding", "gen": "g2"}, (
-        f"prior accumulator entries must be preserved, got {pending}"
+    specs = main.ingestion_phase_specs([], cat)
+    assert len(specs) == 2, f"expected two PhaseSpecs, got {specs}"
+    by_id = {s.id: s for s in specs}
+    assert set(by_id) == {"graph_spacy_extraction", "graph_llm_extraction"}, (
+        f"got {set(by_id)}"
     )
-    assert pending[1]["phase"] == "graph_building", f"got {pending}"
+    for spec in specs:
+        assert spec.settings_category is None, (
+            f"{spec.id}: settings_category must be None (marker IS the fingerprint), got {spec.settings_category}"
+        )
+        assert spec.depends_on == ("parsing_chunking", "embedding"), (
+            f"{spec.id}: depends_on must be parsing_chunking+embedding, got {spec.depends_on}"
+        )
 
 
-def test_probe_returns_empty_when_gen_recorded():
+def test_specs_preserves_prior_accumulator_entries():
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    # The recorded gen is computed from the DEPENDENCY phases only (the probe
-    # excludes graph_building itself from dep_gens).
-    dep_gens = {"parsing_chunking": "g1", "embedding": "g2"}
-    fp = {
-        "settings": {"name": "Neo4jGraphRAGConfig", "settings": {"neo4j_uri": "bolt://fake"}},
-        "concept": handler._concept_fingerprint(),
-    }
-    recorded = _phase_generation("graph_building", fp, dep_gens)
-    pending = asyncio.run(main.ingestion_phase_pending(
-        [],
-        "file.pdf",
-        _completed([("parsing_chunking", "g1"), ("embedding", "g2")], recorded_gen=recorded),
-        cat,
-    ))
-    assert pending == [], f"expected [] when gen recorded, got {pending}"
+    accumulator = [object()]  # opaque prior entry from another plugin
+    specs = main.ingestion_phase_specs(accumulator, cat)
+    assert specs[0] is accumulator[0], "prior accumulator entries must be preserved"
+    assert len(specs) == 3, f"got {len(specs)}"
 
 
-def test_probe_returns_empty_when_not_graphrag_handler():
+def test_specs_returns_accumulator_when_effing_absent():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
+    saved_phases = sys.modules.pop("cat.plugins.cat_efficient_ingestion.phases", None)
+    try:
+        accumulator = [object()]
+        specs = main.ingestion_phase_specs(accumulator, cat)
+        assert specs is accumulator, "must return the accumulator unchanged when EffING is absent"
+    finally:
+        if saved is not None:
+            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+        if saved_phases is not None:
+            sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved_phases
+
+
+def test_marker_returns_spacy_fingerprint():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    marker = main.ingestion_phase_settings_marker("graph_spacy_extraction", cat)
+    assert marker == handler._spacy_fingerprint(), f"got {marker}"
+
+
+def test_marker_returns_concept_fingerprint():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    marker = main.ingestion_phase_settings_marker("graph_llm_extraction", cat)
+    assert marker == handler._concept_fingerprint(), f"got {marker}"
+
+
+def test_marker_returns_none_for_unknown_phase():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    assert main.ingestion_phase_settings_marker("embedding", cat) is None
+
+
+def test_marker_returns_none_when_not_graphrag_handler():
     from catgraphrag_phase import main
 
     class _OtherHandler:
         pass
 
     cat = _FakeCat(_OtherHandler())
-    pending = asyncio.run(main.ingestion_phase_pending(
-        [], "file.pdf", _completed([("parsing_chunking", "g1"), ("embedding", "g2")]), cat
-    ))
-    assert pending == [], f"expected [] for non-graphrag handler, got {pending}"
-
-
-def test_probe_returns_empty_when_derived_graph_disabled():
-    from catgraphrag_phase import main
-
-    handler = _make_handler(derived=False)
-    cat = _FakeCat(handler)
-    pending = asyncio.run(main.ingestion_phase_pending(
-        [], "file.pdf", _completed([("parsing_chunking", "g1"), ("embedding", "g2")]), cat
-    ))
-    assert pending == [], f"expected [] when derived graph disabled, got {pending}"
+    assert main.ingestion_phase_settings_marker("graph_spacy_extraction", cat) is None
+    assert main.ingestion_phase_settings_marker("graph_llm_extraction", cat) is None
 
 
 # ---------------------------------------------------------------------------
-# T22 — phase execution
+# T5 — phase execution (ingestion_phase_run dispatch)
 # ---------------------------------------------------------------------------
 
 
-def test_phase_run_returns_none_for_other_phase():
+def test_phase_run_returns_none_for_unknown_phase():
     from catgraphrag_phase import main
 
     handler = _make_handler()
@@ -401,10 +392,34 @@ def test_phase_run_returns_none_for_other_phase():
     result = asyncio.run(main.ingestion_phase_run(
         "embedding", "file.pdf", _completed([]), cat
     ))
-    assert result is None, f"expected None for non-graph_building phase, got {result}"
+    assert result is None, f"expected None for unknown phase (fail-hard), got {result}"
 
 
-def test_phase_run_not_ready_when_points_absent():
+def test_phase_run_returns_none_when_not_graphrag_handler():
+    from catgraphrag_phase import main
+
+    class _OtherHandler:
+        pass
+
+    cat = _FakeCat(_OtherHandler())
+    result = asyncio.run(main.ingestion_phase_run(
+        "graph_spacy_extraction", "file.pdf", _completed([]), cat
+    ))
+    assert result is None, f"got {result}"
+
+
+def test_phase_run_returns_none_when_derived_graph_disabled():
+    from catgraphrag_phase import main
+
+    handler = _make_handler(derived=False)
+    cat = _FakeCat(handler)
+    result = asyncio.run(main.ingestion_phase_run(
+        "graph_spacy_extraction", "file.pdf", _completed([]), cat
+    ))
+    assert result is None, f"got {result}"
+
+
+def test_spacy_phase_not_ready_when_points_absent():
     from catgraphrag_phase import main
 
     handler = _make_handler()
@@ -412,13 +427,82 @@ def test_phase_run_not_ready_when_points_absent():
     with patch.object(type(handler), "get_source_points_by_collection", new=AsyncMock(return_value={})), \
          patch.object(type(handler), "drain_source_tasks", new=AsyncMock()) as drain:
         result = asyncio.run(main.ingestion_phase_run(
-            "graph_building", "file.pdf", _completed([]), cat
+            "graph_spacy_extraction", "file.pdf", _completed([]), cat
         ))
     assert result == {"status": "not_ready", "retry_after": 5}, f"got {result}"
     drain.assert_awaited_once_with("file.pdf")
 
 
-def test_phase_run_done_when_points_present():
+def test_spacy_phase_done_when_points_present():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    points = [
+        _FakePoint(
+            "doc1",
+            vector=[0.1, 0.2, 0.3],
+            payload={"page_content": "We use GraphVault daily.", "metadata": {"source": "file.pdf"}},
+        )
+    ]
+    with patch.object(type(handler), "get_source_points_by_collection",
+                      new=AsyncMock(return_value={"declarative": points})), \
+         patch.object(type(handler), "drain_source_tasks", new=AsyncMock()) as drain, \
+         patch.object(type(handler), "_create_similarity_relationships", new=AsyncMock()) as sim, \
+         patch.object(type(handler), "_extract_and_link_entities", new=AsyncMock()) as ner:
+        result = asyncio.run(main.ingestion_phase_run(
+            "graph_spacy_extraction", "file.pdf", _completed([]), cat
+        ))
+    assert result == {"status": "done"}, f"got {result}"
+    drain.assert_awaited_once_with("file.pdf")
+    sim.assert_awaited_once_with("doc1", [0.1, 0.2, 0.3], "declarative")
+    # the NER step runs AWAITED for the source's points (id, content, metadata)
+    ner.assert_awaited_once_with(
+        "doc1", "We use GraphVault daily.", {"source": "file.pdf"}
+    )
+
+
+def test_spacy_phase_skips_ner_when_entity_extraction_off():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    handler._enable_entity_extraction = False
+    handler._entity_extractor = None
+    cat = _FakeCat(handler)
+    points = [
+        _FakePoint(
+            "doc1",
+            vector=[0.1, 0.2, 0.3],
+            payload={"page_content": "text", "metadata": {"source": "file.pdf"}},
+        )
+    ]
+    with patch.object(type(handler), "get_source_points_by_collection",
+                      new=AsyncMock(return_value={"declarative": points})), \
+         patch.object(type(handler), "drain_source_tasks", new=AsyncMock()), \
+         patch.object(type(handler), "_create_similarity_relationships", new=AsyncMock()), \
+         patch.object(type(handler), "_extract_and_link_entities", new=AsyncMock()) as ner:
+        result = asyncio.run(main.ingestion_phase_run(
+            "graph_spacy_extraction", "file.pdf", _completed([]), cat
+        ))
+    assert result == {"status": "done"}, f"got {result}"
+    ner.assert_not_awaited()
+
+
+def test_llm_phase_not_ready_when_points_absent():
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    with patch.object(type(handler), "get_source_points_by_collection", new=AsyncMock(return_value={})), \
+         patch.object(type(handler), "drain_source_tasks", new=AsyncMock()) as drain:
+        result = asyncio.run(main.ingestion_phase_run(
+            "graph_llm_extraction", "file.pdf", _completed([]), cat
+        ))
+    assert result == {"status": "not_ready", "retry_after": 5}, f"got {result}"
+    drain.assert_awaited_once_with("file.pdf")
+
+
+def test_llm_phase_done_when_points_present():
     from catgraphrag_phase import main
 
     handler = _make_handler(kg=True, cr=True)
@@ -427,14 +511,12 @@ def test_phase_run_done_when_points_present():
     with patch.object(type(handler), "get_source_points_by_collection",
                       new=AsyncMock(return_value={"declarative": points})), \
          patch.object(type(handler), "drain_source_tasks", new=AsyncMock()) as drain, \
-         patch.object(type(handler), "_create_similarity_relationships", new=AsyncMock()) as sim, \
          patch.object(type(handler), "_extract_concept_relations", new=AsyncMock()) as extract:
         result = asyncio.run(main.ingestion_phase_run(
-            "graph_building", "file.pdf", _completed([]), cat
+            "graph_llm_extraction", "file.pdf", _completed([]), cat
         ))
     assert result == {"status": "done"}, f"got {result}"
     drain.assert_awaited_once_with("file.pdf")
-    sim.assert_awaited_once_with("doc1", [0.1, 0.2, 0.3], "declarative")
     extract.assert_awaited_once()
     # the LLM step receives the source's points and the cat (LLM resolution)
     _args = extract.await_args.args
@@ -442,7 +524,7 @@ def test_phase_run_done_when_points_present():
     assert _args[1] == points
 
 
-def test_phase_run_skips_llm_when_kg_off():
+def test_llm_phase_skips_llm_when_kg_off():
     from catgraphrag_phase import main
 
     handler = _make_handler(kg=False, cr=True)
@@ -451,17 +533,16 @@ def test_phase_run_skips_llm_when_kg_off():
     with patch.object(type(handler), "get_source_points_by_collection",
                       new=AsyncMock(return_value={"declarative": points})), \
          patch.object(type(handler), "drain_source_tasks", new=AsyncMock()), \
-         patch.object(type(handler), "_create_similarity_relationships", new=AsyncMock()), \
          patch.object(type(handler), "_extract_concept_relations", new=AsyncMock()) as extract:
         result = asyncio.run(main.ingestion_phase_run(
-            "graph_building", "file.pdf", _completed([]), cat
+            "graph_llm_extraction", "file.pdf", _completed([]), cat
         ))
     assert result == {"status": "done"}, f"got {result}"
     extract.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# T23 — completion gate
+# T5 — completion gate + legacy fire-and-forget gating
 # ---------------------------------------------------------------------------
 
 
@@ -489,44 +570,13 @@ def test_gate_raises_when_pending_tasks():
     asyncio.run(_run())
 
 
-def test_gate_raises_when_gen_not_recorded():
-    from catgraphrag_phase import main
-    from cat.core_plugins.ingestion_status import registry
-
-    handler = _make_handler()
-    cat = _FakeCat(handler)
-    registry.get_status.return_value = {
-        "status": "processing",
-        "completed_phases": [{"phase": "parsing_chunking", "gen": "g1"}],
-    }
-    try:
-        try:
-            asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
-            raise AssertionError("expected RuntimeError when gen not recorded")
-        except RuntimeError as e:
-            assert "graph_building generation not recorded" in str(e)
-    finally:
-        registry.get_status.return_value = None
-
-
 def test_gate_passes_when_clean():
     from catgraphrag_phase import main
-    from cat.core_plugins.ingestion_status import registry
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    registry.get_status.return_value = {
-        "status": "processing",
-        "completed_phases": [
-            {"phase": "parsing_chunking", "gen": "g1"},
-            {"phase": "embedding", "gen": "g2"},
-            {"phase": "graph_building", "gen": "g3"},
-        ],
-    }
-    try:
-        asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
-    finally:
-        registry.get_status.return_value = None
+    # no pending tasks, no diary check (EffING owns the diary): must pass
+    asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
 
 
 def test_gate_noop_when_not_graphrag_handler():
@@ -538,6 +588,34 @@ def test_gate_noop_when_not_graphrag_handler():
     cat = _FakeCat(_OtherHandler())
     # must not raise even with a "pending" source (no graphrag handler)
     asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
+
+
+def test_rabbithole_hook_noop_when_phase_machine_active():
+    """stale_state: with EffING importable, the old fire-and-forget must NOT
+    run (the registered phases own the graph work)."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
+        asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
+        create.assert_not_awaited()
+
+
+def test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent():
+    """Without EffING importable, the legacy fire-and-forget must run."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
+    try:
+        with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
+            asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
+            create.assert_awaited_once_with("file.pdf", [], cat)
+    finally:
+        if saved is not None:
+            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
 
 
 # ---------------------------------------------------------------------------
@@ -805,20 +883,27 @@ def main():
     from catgraphrag_phase import main as main_mod  # noqa: E402
 
     tests = [
-        test_probe_returns_empty_when_deps_missing,
-        test_probe_returns_graph_building_when_deps_done_and_stale,
-        test_probe_preserves_prior_accumulator_entries,
-        test_probe_returns_empty_when_gen_recorded,
-        test_probe_returns_empty_when_not_graphrag_handler,
-        test_probe_returns_empty_when_derived_graph_disabled,
-        test_phase_run_returns_none_for_other_phase,
-        test_phase_run_not_ready_when_points_absent,
-        test_phase_run_done_when_points_present,
-        test_phase_run_skips_llm_when_kg_off,
+        test_specs_registers_two_graph_phases,
+        test_specs_preserves_prior_accumulator_entries,
+        test_specs_returns_accumulator_when_effing_absent,
+        test_marker_returns_spacy_fingerprint,
+        test_marker_returns_concept_fingerprint,
+        test_marker_returns_none_for_unknown_phase,
+        test_marker_returns_none_when_not_graphrag_handler,
+        test_phase_run_returns_none_for_unknown_phase,
+        test_phase_run_returns_none_when_not_graphrag_handler,
+        test_phase_run_returns_none_when_derived_graph_disabled,
+        test_spacy_phase_not_ready_when_points_absent,
+        test_spacy_phase_done_when_points_present,
+        test_spacy_phase_skips_ner_when_entity_extraction_off,
+        test_llm_phase_not_ready_when_points_absent,
+        test_llm_phase_done_when_points_present,
+        test_llm_phase_skips_llm_when_kg_off,
         test_gate_raises_when_pending_tasks,
-        test_gate_raises_when_gen_not_recorded,
         test_gate_passes_when_clean,
         test_gate_noop_when_not_graphrag_handler,
+        test_rabbithole_hook_noop_when_phase_machine_active,
+        test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent,
         test_transfer_cleanup_noop_on_failure,
         test_transfer_cleanup_noop_when_old_not_neo4j,
         test_transfer_cleanup_wipes_on_success_neo4j,

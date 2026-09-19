@@ -1312,19 +1312,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 result[collection_name] = points
         return result
 
-    async def run_graph_building_phase(self, source: str, cat=None) -> Dict[str, Any]:
-        """Deterministic, awaited graph-building phase for one source (T22).
+    async def run_spacy_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited spaCy graph phase for one source (T5).
 
-        Runs the graph work the old ``after_rabbithole_stored_documents`` hook
-        fired-and-forgot, but inline and awaited:
+        The NER + link + similarity work the old ``after_rabbithole_stored_documents``
+        hook fired-and-forgot, but inline and awaited:
 
         1. joins the source's background NER/similarity tasks
            (``drain_source_tasks``);
-        2. re-runs ``_create_similarity_relationships`` for the source's
-           stored points (needs valid vectors — that is why the embedding
-           phase must precede);
-        3. runs the LLM concept-relations step (``_extract_concept_relations``)
-           for the source.
+        2. re-runs ``_extract_and_link_entities`` AWAITED for the source's
+           stored points (the NER + link that today runs in background);
+        3. re-runs ``_create_similarity_relationships`` for the source's
+           stored points with valid vectors (needs valid vectors — that is
+           why the embedding phase must precede).
 
         Returns ``{"status": "done"}`` on success and
         ``{"status": "not_ready", "retry_after": <s>}`` when the source's
@@ -1345,6 +1345,44 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 vector = getattr(p, "vector", None)
                 if vector and self._is_valid_vector(vector):
                     await self._create_similarity_relationships(p.id, vector, collection_name)
+
+        # NER + link, awaited (mirrors the background spawner's guard).
+        if self._enable_entity_extraction and self._entity_extractor:
+            for p in all_points:
+                payload = getattr(p, "payload", None) or {}
+                content = payload.get("page_content", "")
+                if content:
+                    await self._extract_and_link_entities(
+                        p.id, content, payload.get("metadata", {})
+                    )
+
+        return {"status": "done"}
+
+    async def run_llm_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited LLM graph phase for one source (T5).
+
+        Runs ONLY the LLM concept-relations step (``_extract_concept_relations``)
+        for the source's stored points, gated on ``_enable_knowledge_graph``
+        and ``_enable_concept_relations``. Independent from the spaCy phase:
+        it consumes ONLY the stored chunks + LLM + definitions/prompt, NOT the
+        spaCy entities, so it can run in any order relative to
+        ``run_spacy_extraction_phase``.
+
+        Returns ``{"status": "done"}`` on success and
+        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
+        points are not yet in the store. Exceptions propagate (the core maps
+        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
+        so re-running after a retry never duplicates data.
+        """
+        await self.drain_source_tasks(source)
+
+        by_collection = await self.get_source_points_by_collection(source)
+        if not by_collection:
+            return {"status": "not_ready", "retry_after": 5}
+
+        all_points: List[Record] = []
+        for collection_name, points in by_collection.items():
+            all_points.extend(points)
 
         if self._enable_knowledge_graph and self._enable_concept_relations:
             await self._extract_concept_relations(source, all_points, stray_cat=cat)
@@ -3321,6 +3359,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         return {"concepts": concepts, "relations": relations}
 
     # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
+
+    def _spacy_fingerprint(self) -> str:
+        """Stable SHA-256 fingerprint of the effective spaCy extraction config.
+
+        Normalizes the model map (``sort_keys=True``) and the whitespace-
+        stripped technology terminology (``extra_technology_patterns``), so
+        cosmetic edits (line order, indentation, trailing whitespace) do NOT
+        produce a spurious generation change — mirroring
+        ``_concept_fingerprint``. The resulting token is the material marker
+        for the ``graph_spacy_extraction`` phase.
+        """
+        payload = (
+            "MODELS:" + json.dumps(self._spacy_models, sort_keys=True)
+            + "|PATTERNS:"
+            + json.dumps(
+                [p.strip() for p in (self._extra_technology_patterns or [])],
+                sort_keys=True,
+            )
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def _concept_fingerprint(self) -> str:
         """Stable SHA-256 fingerprint of the effective concept-relations config.
