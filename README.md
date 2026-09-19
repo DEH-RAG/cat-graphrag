@@ -101,6 +101,29 @@ Results found by both graph and vector phases receive a boost during reranking.
 
 ---
 
+## Ingestion phases (EffING phase machine)
+
+When the [EffING](https://github.com/DEH-RAG/cat-efficient-ingestion) phase machine is deployed, this plugin registers its graph work as two ingestion phases instead of running it fire-and-forget after each store. The machine drives the lifecycle, computes staleness, and records a durable diary entry per phase, so the graph work is restartable and re-runs automatically when its inputs change.
+
+The two phases are declared through the `ingestion_phase_specs` accumulator hook, both with `settings_category=None` (the material marker IS the settings fingerprint) and `depends_on=("parsing_chunking", "embedding")` — the graph work needs the stored chunks AND valid vectors:
+
+- **`graph_spacy_extraction`** — the spaCy NER + link + similarity work (`run_spacy_extraction_phase`): drains the source's background tasks, then re-runs `_extract_and_link_entities` (NER + link) and `_create_similarity_relationships` over the stored points with valid vectors.
+- **`graph_llm_extraction`** — the LLM concept-relations step (`run_llm_extraction_phase`): runs `_extract_concept_relations` over the stored chunks, gated on `_enable_knowledge_graph` and `_enable_concept_relations`. It consumes only the stored chunks + LLM + definitions/prompt, NOT the spaCy entities, so it can run in any order relative to the spaCy phase.
+
+The registration contract is the standard EffING one: `ingestion_phase_specs` declares the phases, `ingestion_phase_settings_marker` returns the material marker (`_spacy_fingerprint` for the spaCy phase, `_concept_fingerprint` for the LLM phase), and `ingestion_phase_run` dispatches both. `before_ingestion_status_completed` fails hard when live background tasks remain for the source. When the phase machine is active, the legacy `after_rabbithole_stored_documents` fire-and-forget is a no-op (gated on `_phase_machine_active`), so the work never runs twice.
+
+### Shared Entity-node schema (internal contract)
+
+Both phases write to the SAME `Entity` nodes, which is why the LLM phase is NOT extracted into a separate plugin. The contract is internal to this plugin:
+
+- the spaCy NER step (`_extract_and_link_entities`) writes shared Entity nodes and `REMOVE`s the `concept_gen` / `concept_gen_active` tags from them;
+- the LLM concept-relations step tags its own Entity nodes with `concept_gen`;
+- the stale-concept GC (`_gc_stale_concept_nodes`) only deletes nodes marked `concept_gen_active = false` AND with no remaining `MENTIONS` edge — the `NOT (e)<-[:MENTIONS]-()` guard protects shared spaCy nodes, so an entity that spaCy picked up keeps its `MENTIONS` edge and is never deleted when the LLM generation flips.
+
+Because the two phases coordinate on the same node schema, they must live in the same plugin.
+
+---
+
 ## Requirements
 
 Before using this plugin, make sure you have:
