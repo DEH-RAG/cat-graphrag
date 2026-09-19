@@ -9,20 +9,29 @@ helpers they drive (``run_spacy_extraction_phase``,
 - ``ingestion_phase_specs`` appends the two PhaseSpecs
   (``graph_spacy_extraction`` / ``graph_llm_extraction``, both depending on
   ``parsing_chunking`` + ``embedding``, ``settings_category=None``) and
-  returns the accumulator unchanged when EffING is not importable;
+  returns the accumulator unchanged when EffING is not importable OR when
+  the ``phases`` import itself raises (T7);
 - ``ingestion_phase_settings_marker`` returns ``_spacy_fingerprint`` for
   ``graph_spacy_extraction``, ``_concept_fingerprint`` for
   ``graph_llm_extraction``, None otherwise;
 - ``ingestion_phase_run`` returns None for unknown phases (fail-hard),
   not_ready when the source's points are absent, and done (with the NER +
   similarity work / the LLM concept-relations step awaited) when the points
-  are present;
+  are present; dispatch to ``run_spacy_extraction_phase`` /
+  ``run_llm_extraction_phase`` is asserted directly with AsyncMocks (T7);
 - ``before_ingestion_status_completed`` raises when live background tasks
   remain for the source, and passes when the work is clean (the diary check
-  is gone: EffING owns the completed-phases diary);
+  is gone: EffING owns the completed-phases diary); it is a no-op when the
+  handler is not GraphRAG or ``_enable_derived_graph`` is False, and it never
+  reaches into the core ingestion-status registry (T7);
 - ``after_rabbithole_stored_documents`` is a NO-OP when the EffING phase
   machine is importable (the phases own the work) and keeps the legacy
   ``create_derived_graph_for_source`` behavior when it is not;
+- ``_phase_machine_active`` is True exactly when
+  ``cat.plugins.cat_efficient_ingestion`` is importable (T7);
+- the spaCy entity batch write keeps ``REMOVE e.concept_gen,
+  e.concept_gen_active`` — the shared Entity-node contract stays internal
+  to the plugin (T7 shared-schema guard);
 - ``after_vector_memory_transfer_on_agent`` wipes the tenant's Neo4j data
   ONLY on success + old handler == Neo4jGraphRAGConfig, and never on failure;
 - ``wipe_tenant_graph_data`` skips without a recorded config and wipes the
@@ -342,6 +351,35 @@ def test_specs_returns_accumulator_when_effing_absent():
             sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved_phases
 
 
+def test_specs_returns_accumulator_when_phases_import_raises():
+    """T7: even when the ``phases`` module is present but its import raises
+    (broken EffING install), the accumulator must come back unchanged."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+
+    class _RaisingPhases(types.ModuleType):
+        def __getattr__(self, name):
+            raise ImportError(f"cannot import {name} from phases")
+
+    saved = sys.modules.get("cat.plugins.cat_efficient_ingestion.phases")
+    sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = _RaisingPhases(
+        "cat.plugins.cat_efficient_ingestion.phases"
+    )
+    try:
+        accumulator = [object()]
+        specs = main.ingestion_phase_specs(accumulator, cat)
+        assert specs is accumulator, (
+            "must return the accumulator unchanged when the PhaseSpec import raises"
+        )
+    finally:
+        if saved is not None:
+            sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved
+        else:
+            sys.modules.pop("cat.plugins.cat_efficient_ingestion.phases", None)
+
+
 def test_marker_returns_spacy_fingerprint():
     from catgraphrag_phase import main
 
@@ -417,6 +455,38 @@ def test_phase_run_returns_none_when_derived_graph_disabled():
         "graph_spacy_extraction", "file.pdf", _completed([]), cat
     ))
     assert result is None, f"got {result}"
+
+
+def test_phase_run_dispatches_spacy_to_run_spacy_extraction_phase():
+    """T7: graph_spacy_extraction must dispatch to the handler's
+    run_spacy_extraction_phase (awaited, with the cat for LLM resolution)."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    with patch.object(type(handler), "run_spacy_extraction_phase",
+                      new=AsyncMock(return_value={"status": "done"})) as run:
+        result = asyncio.run(main.ingestion_phase_run(
+            "graph_spacy_extraction", "file.pdf", _completed([]), cat
+        ))
+    assert result == {"status": "done"}, f"got {result}"
+    run.assert_awaited_once_with("file.pdf", cat=cat)
+
+
+def test_phase_run_dispatches_llm_to_run_llm_extraction_phase():
+    """T7: graph_llm_extraction must dispatch to the handler's
+    run_llm_extraction_phase (awaited, with the cat for LLM resolution)."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    with patch.object(type(handler), "run_llm_extraction_phase",
+                      new=AsyncMock(return_value={"status": "done"})) as run:
+        result = asyncio.run(main.ingestion_phase_run(
+            "graph_llm_extraction", "file.pdf", _completed([]), cat
+        ))
+    assert result == {"status": "done"}, f"got {result}"
+    run.assert_awaited_once_with("file.pdf", cat=cat)
 
 
 def test_spacy_phase_not_ready_when_points_absent():
@@ -590,6 +660,52 @@ def test_gate_noop_when_not_graphrag_handler():
     asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
 
 
+def test_gate_raises_when_has_pending_source_tasks_true():
+    """T7: the gate must fail-hard whenever has_pending_source_tasks is True,
+    regardless of how the pending state is represented."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    with patch.object(type(handler), "has_pending_source_tasks",
+                      new=Mock(return_value=True)):
+        try:
+            asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
+            raise AssertionError("expected RuntimeError when has_pending_source_tasks is True")
+        except RuntimeError as e:
+            assert "Pending background graph tasks" in str(e)
+
+
+def test_gate_noop_when_derived_graph_disabled():
+    """T7: with _enable_derived_graph False the gate must not even probe the
+    pending-task state (no graph work is owned by this plugin)."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler(derived=False)
+    cat = _FakeCat(handler)
+    with patch.object(type(handler), "has_pending_source_tasks",
+                      new=Mock(return_value=True)) as pending:
+        asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
+        pending.assert_not_called()
+
+
+def test_gate_does_not_import_core_registry():
+    """T7: the completion gate must not reach into the core ingestion-status
+    registry (EffING owns the diary + staleness). Assert the forbidden
+    references are absent from main.py's source."""
+    import inspect
+    from catgraphrag_phase import main
+
+    src = inspect.getsource(main)
+    forbidden = (
+        "core_plugins." + "ingestion_status",
+        "ingestion_status." + "fingerprints",
+        "ingestion_" + "phase_pending",
+    )
+    for ref in forbidden:
+        assert ref not in src, f"forbidden core-registry reference found: {ref}"
+
+
 def test_rabbithole_hook_noop_when_phase_machine_active():
     """stale_state: with EffING importable, the old fire-and-forget must NOT
     run (the registered phases own the graph work)."""
@@ -613,6 +729,31 @@ def test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent():
         with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
             asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
             create.assert_awaited_once_with("file.pdf", [], cat)
+    finally:
+        if saved is not None:
+            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+
+
+def test_phase_machine_active_true_when_effing_importable():
+    """T7: with cat.plugins.cat_efficient_ingestion importable (stub present),
+    the phase machine is active."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    assert main._phase_machine_active(cat) is True
+
+
+def test_phase_machine_active_false_when_effing_absent():
+    """T7: without cat.plugins.cat_efficient_ingestion (stub removed from
+    sys.modules), the phase machine is inactive -> legacy paths run."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
+    try:
+        assert main._phase_machine_active(cat) is False
     finally:
         if saved is not None:
             sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
@@ -864,6 +1005,20 @@ def test_derived_graph_writes_are_merge_based():
     assert "MERGE (child)-[:CHILD_OF]->(parent)" in all_queries
 
 
+def test_spacy_batch_query_keeps_concept_gen_removal():
+    """T7 shared-schema guard: the spaCy entity batch write must keep
+    REMOVE-ing the LLM-owned concept_gen markers. The Entity-node contract
+    (concept_gen / concept_gen_active) stays internal to the plugin: the
+    spaCy phase must never resurrect stale LLM generations."""
+    import inspect
+    from catgraphrag_phase import graphrag_handler
+
+    src = inspect.getsource(graphrag_handler.GraphRAGHandler._extract_and_link_entities)
+    assert "REMOVE e.concept_gen, e.concept_gen_active" in src, (
+        "spaCy batch entity query must REMOVE the LLM-owned concept_gen markers"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -886,6 +1041,7 @@ def main():
         test_specs_registers_two_graph_phases,
         test_specs_preserves_prior_accumulator_entries,
         test_specs_returns_accumulator_when_effing_absent,
+        test_specs_returns_accumulator_when_phases_import_raises,
         test_marker_returns_spacy_fingerprint,
         test_marker_returns_concept_fingerprint,
         test_marker_returns_none_for_unknown_phase,
@@ -893,6 +1049,8 @@ def main():
         test_phase_run_returns_none_for_unknown_phase,
         test_phase_run_returns_none_when_not_graphrag_handler,
         test_phase_run_returns_none_when_derived_graph_disabled,
+        test_phase_run_dispatches_spacy_to_run_spacy_extraction_phase,
+        test_phase_run_dispatches_llm_to_run_llm_extraction_phase,
         test_spacy_phase_not_ready_when_points_absent,
         test_spacy_phase_done_when_points_present,
         test_spacy_phase_skips_ner_when_entity_extraction_off,
@@ -902,8 +1060,13 @@ def main():
         test_gate_raises_when_pending_tasks,
         test_gate_passes_when_clean,
         test_gate_noop_when_not_graphrag_handler,
+        test_gate_raises_when_has_pending_source_tasks_true,
+        test_gate_noop_when_derived_graph_disabled,
+        test_gate_does_not_import_core_registry,
         test_rabbithole_hook_noop_when_phase_machine_active,
         test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent,
+        test_phase_machine_active_true_when_effing_importable,
+        test_phase_machine_active_false_when_effing_absent,
         test_transfer_cleanup_noop_on_failure,
         test_transfer_cleanup_noop_when_old_not_neo4j,
         test_transfer_cleanup_wipes_on_success_neo4j,
@@ -912,6 +1075,7 @@ def main():
         test_concept_store_rerun_issues_identical_merge_queries,
         test_similar_rel_query_is_merge_based,
         test_derived_graph_writes_are_merge_based,
+        test_spacy_batch_query_keeps_concept_gen_removal,
     ]
 
     failed = 0
