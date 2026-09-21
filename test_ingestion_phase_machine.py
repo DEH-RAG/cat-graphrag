@@ -29,6 +29,9 @@ helpers they drive (``run_spacy_extraction_phase``,
   ``create_derived_graph_for_source`` behavior when it is not;
 - ``_phase_machine_active`` is True exactly when
   ``cat.plugins.cat_efficient_ingestion`` is importable (T7);
+- every ``cat.*`` import in the phase-machine path resolves against the
+  harness stub, which mirrors upstream CAT's public surface (todo 10 CAT
+  alignment: the lazy imports inside functions are pinned too);
 - the spaCy entity batch write keeps ``REMOVE e.concept_gen,
   e.concept_gen_active`` — the shared Entity-node contract stays internal
   to the plugin (T7 shared-schema guard);
@@ -121,6 +124,61 @@ def _install_cat_stub():
     models_mod.ScoredPoint = type("ScoredPoint", (), {})
     models_mod.UpdateResult = type("UpdateResult", (), {})
     sys.modules["cat.services.memory.models"] = models_mod
+
+    # --- Upstream-CAT surface used by the phase-machine path (todo 10) ---
+    # The stub mirrors upstream CAT's public surface (verified against
+    # /root/git/grinning-cat-core @ feat/efficient-ingestion), so the
+    # ``test_cat_interfaces_resolve_on_upstream_surface`` check below is a
+    # real resolution gate: a plugin import that upstream CAT lacks fails it.
+
+    # cat.db.crud.distributed_lock (graphrag_handler lazy import, guarded by
+    # try/except ImportError -> None fallback; async context manager, same
+    # signature as upstream cat/db/crud.py:12).
+    db = types.ModuleType("cat.db")
+    db.__path__ = []
+    sys.modules["cat.db"] = db
+
+    crud = types.ModuleType("cat.db.crud")
+
+    class _DistributedLock:
+        def __init__(self, key_pattern, timeout=10.0, blocking_timeout=15.0):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    crud.distributed_lock = _DistributedLock
+    sys.modules["cat.db.crud"] = crud
+
+    # cat.looking_glass.bill_the_lizard.BillTheLizard /
+    # cat.looking_glass.mad_hatter.mad_hatter.MadHatter /
+    # cat.services.service_provider.ServiceProvider (lazy imports inside
+    # graphrag_handler functions — never exercised by the module import, so
+    # the surface test below is what pins them).
+    bill = types.ModuleType("cat.looking_glass.bill_the_lizard")
+    bill.BillTheLizard = type("BillTheLizard", (), {})
+    sys.modules["cat.looking_glass.bill_the_lizard"] = bill
+
+    mad = types.ModuleType("cat.looking_glass.mad_hatter")
+    mad.__path__ = []
+    sys.modules["cat.looking_glass.mad_hatter"] = mad
+
+    mad_hatter = types.ModuleType("cat.looking_glass.mad_hatter.mad_hatter")
+    mad_hatter.MadHatter = type("MadHatter", (), {})
+    sys.modules["cat.looking_glass.mad_hatter.mad_hatter"] = mad_hatter
+
+    provider = types.ModuleType("cat.services.service_provider")
+    provider.ServiceProvider = type("ServiceProvider", (), {})
+    sys.modules["cat.services.service_provider"] = provider
+
+    # cat.utils.parse_json (structured_llm lazy import, guarded by
+    # try/except ImportError -> None fallback).
+    utils = types.ModuleType("cat.utils")
+    utils.parse_json = lambda *a, **k: None
+    sys.modules["cat.utils"] = utils
 
 
 def _install_neo4j_stub():
@@ -759,6 +817,54 @@ def test_phase_machine_active_false_when_effing_absent():
             sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
 
 
+def test_cat_interfaces_resolve_on_upstream_surface():
+    """CAT-alignment (todo 10): every ``cat.*`` import in the phase-machine
+    path (main.py, graphrag_handler.py, entity_extractor.py,
+    structured_llm.py) must resolve against the harness stub, which mirrors
+    upstream CAT's public surface (verified against /root/git/grinning-cat-core
+    @ feat/efficient-ingestion: cat/__init__.py exports, memory models,
+    cat.db.crud.distributed_lock, BillTheLizard / MadHatter / ServiceProvider /
+    StrayCat, cat.utils.parse_json, cat.log.log). The EffING contract import
+    (cat.plugins.cat_efficient_ingestion.phases.PhaseSpec) resolves against
+    the EffING stub.
+
+    The stub IS the mirror of the upstream surface, so a plugin import that
+    upstream CAT lacks fails here. The AST walk covers the LAZY imports too
+    (inside functions), which the module import alone never exercises.
+    """
+    import ast
+
+    files = (
+        "main.py",
+        "graphrag_handler.py",
+        "entity_extractor.py",
+        "structured_llm.py",
+    )
+    checked = 0
+    for fname in files:
+        with open(os.path.join(REPO_ROOT, fname)) as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if node.module != "cat" and not node.module.startswith("cat."):
+                continue
+            mod = sys.modules.get(node.module)
+            assert mod is not None, (
+                f"{fname}: `from {node.module} import ...` does not resolve on "
+                "the upstream-CAT-mirroring stub"
+            )
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                assert hasattr(mod, alias.name), (
+                    f"{fname}: `{node.module}.{alias.name}` does not resolve on "
+                    "the upstream-CAT-mirroring stub"
+                )
+                checked += 1
+    assert checked > 0, "no cat.* imports found — test is vacuous"
+
+
 # ---------------------------------------------------------------------------
 # T24 — old-store cleanup on switch
 # ---------------------------------------------------------------------------
@@ -1067,6 +1173,7 @@ def main():
         test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent,
         test_phase_machine_active_true_when_effing_importable,
         test_phase_machine_active_false_when_effing_absent,
+        test_cat_interfaces_resolve_on_upstream_surface,
         test_transfer_cleanup_noop_on_failure,
         test_transfer_cleanup_noop_when_old_not_neo4j,
         test_transfer_cleanup_wipes_on_success_neo4j,
