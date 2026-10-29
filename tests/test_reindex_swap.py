@@ -433,7 +433,7 @@ class _FakeEmbedder:
 
 def _make_handler(graph):
     """Build a GraphRAGHandler wired to the fake graph."""
-    from catgraphrag_swaptest import graphrag_handler
+    from .. import graphrag_handler
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -669,9 +669,6 @@ def main():
     sys.modules["catgraphrag_swaptest"] = _pkg
 
     global graphrag_handler
-    from catgraphrag_swaptest import graphrag_handler  # noqa: E402
-    from catgraphrag_swaptest import epoch  # noqa: E402
-    from catgraphrag_swaptest import versioning  # noqa: E402
 
     tests = [
         test_shadow_build_writes_v2_while_v1_intact,

@@ -426,7 +426,7 @@ class _FakeDriver:
 
 def _make_handler(graph, patterns):
     """Build a GraphRAGHandler wired to the fake graph with the given patterns."""
-    from catgraphrag_tertest import graphrag_handler
+    from .. import graphrag_handler
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -441,8 +441,8 @@ def _make_handler(graph, patterns):
 
 def _hash(term, tenant="agent_test"):
     """Entity hash for a TECHNOLOGY term (mirrors EntityExtractor.get_entity_hash)."""
-    from catgraphrag_tertest import entity_extractor
-    from catgraphrag_tertest.models import EntityType
+    from .. import entity_extractor
+    from ..models import EntityType
 
     return entity_extractor.EntityExtractor.get_entity_hash(
         term, EntityType.TECHNOLOGY, tenant
@@ -455,7 +455,7 @@ def _hash(term, tenant="agent_test"):
 
 
 def test_hook_ignores_other_vector_databases():
-    from catgraphrag_tertest import main as main_mod
+    from .. import main as main_mod
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [r"\b(MyTool)\b"])
@@ -477,7 +477,7 @@ def test_hook_ignores_other_vector_databases():
 
 
 def test_hook_ignores_unchanged_patterns():
-    from catgraphrag_tertest import main as main_mod
+    from .. import main as main_mod
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [r"\b(MyTool)\b"])
@@ -502,7 +502,7 @@ def test_hook_ignores_unchanged_patterns():
 
 
 def test_hook_rebuilds_extractor_on_pattern_change():
-    from catgraphrag_tertest import main as main_mod
+    from .. import main as main_mod
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [])
@@ -651,10 +651,6 @@ def main():
     sys.modules["catgraphrag_tertest"] = _pkg
 
     global graphrag_handler, main, entity_extractor, models
-    from catgraphrag_tertest import graphrag_handler  # noqa: E402
-    from catgraphrag_tertest import main  # noqa: E402
-    from catgraphrag_tertest import entity_extractor  # noqa: E402
-    from catgraphrag_tertest import models  # noqa: E402
 
     tests = [
         test_hook_ignores_other_vector_databases,

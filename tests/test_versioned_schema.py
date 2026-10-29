@@ -426,7 +426,7 @@ class _FakeDriver:
 
 def _make_handler(graph):
     """Build a GraphRAGHandler wired to the fake graph."""
-    from catgraphrag_verstest import graphrag_handler
+    from .. import graphrag_handler
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -490,7 +490,7 @@ def test_versioned_names_suffixes():
 
 
 def test_ensure_version_probes_rebuilds_and_runs_once():
-    from catgraphrag_verstest import versioning
+    from .. import versioning
 
     graph = _FakeGraph()
     graph.epochs["agent_test"] = "v1"
@@ -515,7 +515,7 @@ def test_ensure_version_probes_rebuilds_and_runs_once():
 
 
 def test_retry_on_generation_change_reruns_whole_fn_once():
-    from catgraphrag_verstest import versioning
+    from .. import versioning
 
     graph = _FakeGraph()
     graph.epochs["agent_test"] = "v1"
@@ -590,7 +590,7 @@ def test_decorated_paths_use_plain_session_run_no_execute_write():
 
 
 def test_recall_tenant_memory_from_embedding_retries_whole_orchestration():
-    from catgraphrag_verstest import versioning
+    from .. import versioning
 
     graph = _FakeGraph()
     graph.epochs["agent_test"] = "v1"
@@ -687,9 +687,6 @@ def main():
     sys.modules["catgraphrag_verstest"] = _pkg
 
     global graphrag_handler
-    from catgraphrag_verstest import graphrag_handler  # noqa: E402
-    from catgraphrag_verstest import epoch  # noqa: E402
-    from catgraphrag_verstest import versioning  # noqa: E402
 
     tests = [
         test_read_generation_creates_v1_when_absent,
