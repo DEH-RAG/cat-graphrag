@@ -10,7 +10,7 @@ Cat plugin loader recursively imports every `.py` under the plugin.
 Removed. It documented the obsolete single-phase `graph_building` model
 (`ingestion_phase_pending` + a diary/generation check in
 `before_ingestion_status_completed`) and imported the pre-extraction module
-path `cat.plugins.cat_efficient_ingestion`.
+path (the legacy `cat.plugins.*` namespace).
 
 The current two-phase model (`graph_spacy_extraction` /
 `graph_llm_extraction`, registered through EffING's `ingestion_phase_specs`)
