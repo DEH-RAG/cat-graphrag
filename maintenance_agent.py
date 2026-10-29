@@ -28,7 +28,14 @@ Usage (inside the Cat container):
 Exit codes:
     0 = all agents/ops ok (and verify ok when --verify)
     1 = partial failure (some agent/op failed, or a --verify check failed)
-    2 = aborted (dry-run plan printed, or --yes missing for a destructive step)
+    2 = aborted (dry-run plan printed, --yes missing for a destructive step,
+        or an op needs the efficient ingestion plugin EffING and it is not
+        importable as ``cat.core_plugins.cat_efficient_ingestion``)
+
+``--reembed``, ``--reingest`` and ``--verify`` require the extracted EffING
+plugin (``reembed``/``registry`` modules). Its imports are lazy and guarded:
+when it is absent the CLI still starts (``--help`` works) and those ops abort
+with a clear message and exit code 2 instead of raising a traceback.
 
 Every op requires --yes: --reembed deletes the status docs per source,
 --reingest additionally deletes the source's points and re-ingests, and
@@ -46,7 +53,29 @@ import importlib.util
 import json
 import sys
 import types  # noqa: F401  (used by the --graph LLM part in a later todo)
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NoReturn, NotRequired, TypedDict
+
+_EFFING_MODULE = "cat.core_plugins.cat_efficient_ingestion"
+
+
+def _abort_missing_effing(exc: ImportError) -> NoReturn:
+    """Report the absent EffING dependency and abort (exit code 2, no traceback).
+
+    EffING was extracted to ``cat.core_plugins.cat_efficient_ingestion``; the
+    ops that drive its phase machine cannot run without it. Callers wrap their
+    lazy ``cat.core_plugins.cat_efficient_ingestion.*`` imports in
+    ``try/except ImportError`` and delegate here, so the module itself stays
+    import-safe and ``--help`` keeps working when the plugin is absent.
+    """
+    print(
+        "[maintenance] ABORTED: required optional dependency "
+        f"'{_EFFING_MODULE}' is not importable ({exc}). "
+        "--reembed, --reingest and --verify need the efficient ingestion "
+        "plugin (EffING); install/enable it and retry.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 
 # Destructive steps per op — what `--yes` confirms. `--reembed` deletes the
 # status docs per source (forces the embedding phase, Metis #9); `--reingest`
@@ -500,8 +529,14 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     (``detail=file-missing``, Metis #10). ``handler`` is accepted for signature
     symmetry with the other ops (todo 5+).
     """
-    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
-    from cat.core_plugins.ingestion_status.registry import delete_status, list_statuses
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            delete_status,
+            list_statuses,
+        )
+    except ImportError as exc:
+        _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -542,8 +577,11 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     ``_source_from_entry``), so their points are NOT deleted by source name —
     each pass-through is logged (``detail=url-pass-through``).
     """
-    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
-    from cat.core_plugins.ingestion_status.registry import delete_status
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
+        from cat.core_plugins.cat_efficient_ingestion.registry import delete_status
+    except ImportError as exc:
+        _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
     from cat.utils import is_url
 
@@ -911,7 +949,10 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
     Returns a list of ``(check_name, ok)`` tuples; the caller prints the
     ``result=verify-ok|verify-fail`` summary. Never destructive.
     """
-    from cat.core_plugins.ingestion_status.registry import list_statuses
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.registry import list_statuses
+    except ImportError as exc:
+        _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
 
     tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
