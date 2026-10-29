@@ -38,7 +38,20 @@ import sys
 import types
 from unittest.mock import AsyncMock, patch
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The plugin folder name contains a dot/hyphen, so the scripts register the
+# repo root under this synthetic package and import the plugin modules from
+# it: a bare ``python tests/<file>.py`` run then resolves the same modules the
+# Cat loader would, without a relative import from ``__main__``.
+PKG = "catgraphrag_kgtest"
+
+
+def _plugin(name):
+    import importlib
+
+    return importlib.import_module(f"{PKG}.{name}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +287,7 @@ class _Point:
 
 def _make_handler(kg: bool, cr: bool):
     """Build a GraphRAGHandler with the given master-switch flags."""
-    from .. import graphrag_handler
+    graphrag_handler = _plugin("graphrag_handler")
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -466,7 +479,7 @@ def main():
     sys.modules["catgraphrag_kgtest"] = _pkg
 
     global graphrag_handler
-    from .. import graphrag_handler  # noqa: E402
+    graphrag_handler = _plugin("graphrag_handler")  # noqa: E402
 
     tests = [
         test_derived_graph_skips_llm_when_kg_off,

@@ -232,33 +232,56 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         _l2_sq = sum(x * x for x in vector)
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
 
+    @staticmethod
+    def _is_empty_mapping(vector) -> bool:
+        """Whether the point carries EffING's ``vector={}`` empty mapping.
+
+        The staging pass writes ``vector={}`` (a truthy-type but empty
+        ``dict``), NOT a numeric zero-norm vector: ``_store_empty_vectors``
+        builds ``PointStruct(..., vector={})``. The classic core never does
+        this — ``RabbitHole.store_documents`` always writes the list returned
+        by ``embedder.embed_documents`` (a zero-norm *list* on a fallback), and
+        the multimodal image hook either embeds the image or drops it. So an
+        empty mapping can only come from the two-phase machine.
+        """
+        return isinstance(vector, dict) and not vector
+
     async def _is_empty_vector_staging_pass(
-        self, source: Optional[str], metadata: Dict | None
+        self, source: Optional[str], metadata: Dict | None, vector=None
     ) -> bool:
         """Whether this write belongs to EffING's empty-vector staging pass.
 
         The efficient engine stores every chunk TWICE: once in the
-        ``parsing_chunking`` phase with empty vectors (``_store_empty_vectors``)
-        and again in the ``embedding`` phase with real vectors (or payload-only
-        for images). Graph extraction is vector-independent, so it must run on
-        the second pass only.
+        ``parsing_chunking`` phase with ``vector={}`` (``_store_empty_vectors``)
+        and again in the ``embedding`` phase with real vectors (or
+        payload-only for images). Graph extraction is vector-independent, so
+        it must run on the second pass only.
 
-        Vector validity is NOT a valid discriminator: a legitimate payload-only
-        document (e.g. an image under a non-multimodal embedder) also carries
-        an empty vector and MUST still build the graph. The reliable signal is
-        the source's CURRENT ingestion phase, which EffING records before it
-        calls the storage (``set_phase(PHASE_PARSING_CHUNKING)`` before
-        ``_run_parsing_phase``, ``PHASE_EMBEDDING`` before ``_embed_phase``).
-        The phase alone is not enough because the CLASSIC core ingestion has a
-        status row in the same ``parsing_chunking`` phase (EffING's generic
-        ingestion-status hooks) while doing a single real pass; the phase
-        machine additionally CLAIMS the source (``resume_owner``), which is the
-        explicit staging-pass marker.
+        The discriminator is the CONJUNCTION of two signals:
 
-        No status doc / no claim (classic path, direct writes) means "not a
-        staging pass": build the graph, exactly as before.
+        1. the point carries the empty mapping ``vector={}`` (see
+           :meth:`_is_empty_mapping`) — written ONLY by EffING's staging pass;
+           and
+        2. the source's recorded phase is ``parsing_chunking`` — EffING sets
+           it before ``_run_parsing_phase`` (``set_phase``), and its
+           ``embedding`` pass (which may legitimately still carry ``{}`` for a
+           payload-only image) is a different phase.
+
+        The ``resume_owner`` lease is deliberately NOT used: the host never
+        clears it on a terminal status (only ``resume_created``), and the core
+        ingestion rewrites ``phase=parsing_chunking`` for EVERY ingestion, so a
+        classic re-ingest after an EffING ingest inherited
+        ``resume_owner``+``parsing_chunking`` and the graph was silently
+        skipped. The empty mapping is an intrinsic property of the write and
+        cannot fire on the classic path (always a list, zero-norm included).
+
+        Vector VALIDITY is still not the discriminator: a legitimate
+        payload-only / zero-norm vector (list) MUST build the graph.
+
+        No status doc / no empty mapping (classic path, direct writes) means
+        "not a staging pass": build the graph, exactly as before.
         """
-        if not source:
+        if not source or not self._is_empty_mapping(vector):
             return False
         try:
             from cat.core_plugins.cat_efficient_ingestion import registry
@@ -270,17 +293,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return False
         if not doc:
             return False
-        # ``phase == parsing_chunking`` alone is NOT enough: the core (classic)
-        # ingestion also has a status row in the same phase (written by EffING's
-        # generic ingestion-status hooks), yet it does a SINGLE real pass and
-        # must build the graph. The efficient PHASE MACHINE claims the source
-        # (``claim_source_for_resume`` -> ``resume_owner``) before it runs
-        # ``_store_empty_vectors``; that lease is the explicit "this write is
-        # the staging pass of the two-phase machine" marker.
-        return (
-            doc.get("phase") == registry.PHASE_PARSING_CHUNKING
-            and bool(doc.get("resume_owner"))
-        )
+        return doc.get("phase") == registry.PHASE_PARSING_CHUNKING
 
     @staticmethod
     def _next_generation(gen: str) -> str:
@@ -2199,20 +2212,22 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         operation_id = random.randint(1, 100000)
 
         # Discriminate the EMPTY-VECTOR STAGING PASS, not vector validity.
-        # The staging pass (``parsing_chunking``) writes every point with an
-        # empty vector and must not build any graph; the ``embedding`` pass
-        # writes the same points with real vectors OR payload-only and owns the
-        # graph. A payload-only document (legitimately empty vector) therefore
-        # still builds once the pass is the embedding one. Computed per source
-        # (one registry read per unique source/chat scope, not per point).
+        # The staging pass (``parsing_chunking``) writes every point with the
+        # empty mapping ``vector={}`` and must not build any graph; the
+        # ``embedding`` pass writes the same points with real vectors OR
+        # payload-only and owns the graph. The phase read is cached per source
+        # (one registry read per unique source/chat scope, not per point); the
+        # empty-mapping signal is per point and cannot appear on the classic
+        # path (see ``_is_empty_mapping``), so a stale ``resume_owner`` lease
+        # can never turn a classic re-ingest into a false staging pass.
         staging_cache: Dict[tuple, bool] = {}
         staging_flags: List[bool] = []
         for point in points:
             meta = (point.payload or {}).get("metadata", {}) or {}
-            key = (meta.get("source"), meta.get("chat_id"))
+            key = (meta.get("source"), meta.get("chat_id"), self._is_empty_mapping(point.vector))
             if key not in staging_cache:
                 staging_cache[key] = await self._is_empty_vector_staging_pass(
-                    meta.get("source"), meta
+                    meta.get("source"), meta, point.vector
                 )
             staging_flags.append(staging_cache[key])
 

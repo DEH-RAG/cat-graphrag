@@ -35,7 +35,7 @@ import sys
 import types
 from unittest.mock import AsyncMock
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = "catgraphrag_reload"
 
 
