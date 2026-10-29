@@ -127,7 +127,8 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
 
 # ========== INGESTION PHASE MACHINE (EffING registration contract) ==========
 #
-# The EffING phase machine (deployed as ``cat.plugins.cat_efficient_ingestion``)
+# The EffING phase machine (deployed as
+# ``cat.core_plugins.cat_efficient_ingestion``)
 # drives the phase-aware ingestion lifecycle. Plugins REGISTER their phases
 # (``ingestion_phase_specs``), provide the material marker for each
 # (``ingestion_phase_settings_marker``), and execute them
@@ -160,7 +161,7 @@ def _phase_machine_active(cat) -> bool:
     When inactive (EffING absent), the legacy paths run unchanged.
     """
     try:
-        import cat.plugins.cat_efficient_ingestion  # noqa: F401
+        import cat.core_plugins.cat_efficient_ingestion  # noqa: F401
     except Exception:  # noqa: BLE001
         return False
     return True
@@ -179,8 +180,10 @@ def ingestion_phase_specs(specs, cat) -> list:
     try/except keeps this module import-safe when EffING is not deployed.
     """
     try:
-        from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
-    except Exception:  # noqa: BLE001
+        from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
+    except ImportError:
+        PhaseSpec = None
+    if PhaseSpec is None:
         return specs
     specs.append(
         PhaseSpec(

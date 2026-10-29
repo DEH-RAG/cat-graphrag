@@ -28,7 +28,7 @@ helpers they drive (``run_spacy_extraction_phase``,
   machine is importable (the phases own the work) and keeps the legacy
   ``create_derived_graph_for_source`` behavior when it is not;
 - ``_phase_machine_active`` is True exactly when
-  ``cat.plugins.cat_efficient_ingestion`` is importable (T7);
+  ``cat.core_plugins.cat_efficient_ingestion`` is importable (T7);
 - the spaCy entity batch write keeps ``REMOVE e.concept_gen,
   e.concept_gen_active`` — the shared Entity-node contract stays internal
   to the plugin (T7 shared-schema guard);
@@ -42,7 +42,7 @@ Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
 external packages (cat, langchain_core, spacy, langdetect, pydantic, neo4j)
 are stubbed in sys.modules *before* the plugin modules are imported (same
 pattern as test_kg_master_switch.py). The EffING phase-machine contract
-(``cat.plugins.cat_efficient_ingestion.phases.PhaseSpec``) is stubbed with a
+(``cat.core_plugins.cat_efficient_ingestion.phases.PhaseSpec``) is stubbed with a
 recording fake.
 """
 
@@ -221,18 +221,18 @@ def _install_effing_stub():
     """Stub the EffING phase-machine contract the hooks import lazily.
 
     ``PhaseSpec`` is a recording fake (id / settings_category / depends_on);
-    ``cat.plugins.cat_efficient_ingestion`` importable means the phase
+    ``cat.core_plugins.cat_efficient_ingestion`` importable means the phase
     machine is "deployed" for ``_phase_machine_active``.
     """
     plugins = types.ModuleType("cat.plugins")
     plugins.__path__ = []
     sys.modules["cat.plugins"] = plugins
 
-    effing = types.ModuleType("cat.plugins.cat_efficient_ingestion")
+    effing = types.ModuleType("cat.core_plugins.cat_efficient_ingestion")
     effing.__path__ = []
-    sys.modules["cat.plugins.cat_efficient_ingestion"] = effing
+    sys.modules["cat.core_plugins.cat_efficient_ingestion"] = effing
 
-    phases = types.ModuleType("cat.plugins.cat_efficient_ingestion.phases")
+    phases = types.ModuleType("cat.core_plugins.cat_efficient_ingestion.phases")
 
     class PhaseSpec:
         def __init__(self, id, settings_category=None, depends_on=()):
@@ -241,7 +241,7 @@ def _install_effing_stub():
             self.depends_on = tuple(depends_on)
 
     phases.PhaseSpec = PhaseSpec
-    sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = phases
+    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = phases
 
 
 def _install_stubs():
@@ -338,17 +338,17 @@ def test_specs_returns_accumulator_when_effing_absent():
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
-    saved_phases = sys.modules.pop("cat.plugins.cat_efficient_ingestion.phases", None)
+    saved = sys.modules.pop("cat.core_plugins.cat_efficient_ingestion", None)
+    saved_phases = sys.modules.pop("cat.core_plugins.cat_efficient_ingestion.phases", None)
     try:
         accumulator = [object()]
         specs = main.ingestion_phase_specs(accumulator, cat)
         assert specs is accumulator, "must return the accumulator unchanged when EffING is absent"
     finally:
         if saved is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+            sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
         if saved_phases is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved_phases
+            sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = saved_phases
 
 
 def test_specs_returns_accumulator_when_phases_import_raises():
@@ -363,9 +363,9 @@ def test_specs_returns_accumulator_when_phases_import_raises():
         def __getattr__(self, name):
             raise ImportError(f"cannot import {name} from phases")
 
-    saved = sys.modules.get("cat.plugins.cat_efficient_ingestion.phases")
-    sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = _RaisingPhases(
-        "cat.plugins.cat_efficient_ingestion.phases"
+    saved = sys.modules.get("cat.core_plugins.cat_efficient_ingestion.phases")
+    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = _RaisingPhases(
+        "cat.core_plugins.cat_efficient_ingestion.phases"
     )
     try:
         accumulator = [object()]
@@ -375,9 +375,9 @@ def test_specs_returns_accumulator_when_phases_import_raises():
         )
     finally:
         if saved is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved
+            sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = saved
         else:
-            sys.modules.pop("cat.plugins.cat_efficient_ingestion.phases", None)
+            sys.modules.pop("cat.core_plugins.cat_efficient_ingestion.phases", None)
 
 
 def test_marker_returns_spacy_fingerprint():
@@ -724,18 +724,18 @@ def test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent():
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
+    saved = sys.modules.pop("cat.core_plugins.cat_efficient_ingestion", None)
     try:
         with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
             asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
             create.assert_awaited_once_with("file.pdf", [], cat)
     finally:
         if saved is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+            sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
 
 
 def test_phase_machine_active_true_when_effing_importable():
-    """T7: with cat.plugins.cat_efficient_ingestion importable (stub present),
+    """T7: with cat.core_plugins.cat_efficient_ingestion importable (stub present),
     the phase machine is active."""
     from catgraphrag_phase import main
 
@@ -745,18 +745,18 @@ def test_phase_machine_active_true_when_effing_importable():
 
 
 def test_phase_machine_active_false_when_effing_absent():
-    """T7: without cat.plugins.cat_efficient_ingestion (stub removed from
+    """T7: without cat.core_plugins.cat_efficient_ingestion (stub removed from
     sys.modules), the phase machine is inactive -> legacy paths run."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
+    saved = sys.modules.pop("cat.core_plugins.cat_efficient_ingestion", None)
     try:
         assert main._phase_machine_active(cat) is False
     finally:
         if saved is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+            sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
 
 
 # ---------------------------------------------------------------------------
