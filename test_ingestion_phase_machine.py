@@ -34,7 +34,8 @@ helpers they drive (``run_spacy_extraction_phase``,
   e.concept_gen_active`` — the shared Entity-node contract stays internal
   to the plugin (T7 shared-schema guard);
 - ``after_vector_memory_transfer_on_agent`` wipes the tenant's Neo4j data
-  ONLY on success + old handler == Neo4jGraphRAGConfig, and never on failure;
+  ONLY on success when the NEW handler is not GraphRAG (host no longer passes
+  the old handler name), and never on failure;
 - ``wipe_tenant_graph_data`` skips without a recorded config and wipes the
   tenant (tenant-scoped) when one exists.
 
@@ -798,27 +799,27 @@ def test_phase_path_active_truth_table():
 def test_transfer_cleanup_noop_on_failure():
     from catgraphrag_phase import main
 
-    cat = _FakeCat(None)
+    cat = _FakeCat(_make_handler())
     with patch("catgraphrag_phase.graphrag_handler.wipe_tenant_graph_data", new=AsyncMock()) as wipe:
-        asyncio.run(main.after_vector_memory_transfer_on_agent(False, "Neo4jGraphRAGConfig", cat))
+        asyncio.run(main.after_vector_memory_transfer_on_agent(False, cat))
         wipe.assert_not_awaited()
 
 
-def test_transfer_cleanup_noop_when_old_not_neo4j():
+def test_transfer_cleanup_noop_when_new_handler_is_graphrag():
+    from catgraphrag_phase import main
+
+    cat = _FakeCat(_make_handler())
+    with patch("catgraphrag_phase.graphrag_handler.wipe_tenant_graph_data", new=AsyncMock()) as wipe:
+        asyncio.run(main.after_vector_memory_transfer_on_agent(True, cat))
+        wipe.assert_not_awaited()
+
+
+def test_transfer_cleanup_wipes_on_success_when_new_handler_not_graphrag():
     from catgraphrag_phase import main
 
     cat = _FakeCat(None)
     with patch("catgraphrag_phase.graphrag_handler.wipe_tenant_graph_data", new=AsyncMock()) as wipe:
-        asyncio.run(main.after_vector_memory_transfer_on_agent(True, "QdrantConfig", cat))
-        wipe.assert_not_awaited()
-
-
-def test_transfer_cleanup_wipes_on_success_neo4j():
-    from catgraphrag_phase import main
-
-    cat = _FakeCat(None)
-    with patch("catgraphrag_phase.graphrag_handler.wipe_tenant_graph_data", new=AsyncMock()) as wipe:
-        asyncio.run(main.after_vector_memory_transfer_on_agent(True, "Neo4jGraphRAGConfig", cat))
+        asyncio.run(main.after_vector_memory_transfer_on_agent(True, cat))
         wipe.assert_awaited_once_with("agent_test")
 
 

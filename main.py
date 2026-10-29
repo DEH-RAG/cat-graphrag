@@ -344,17 +344,31 @@ async def before_ingestion_status_completed(source, cat) -> None:
 
 
 @hook(priority=10)
-async def after_vector_memory_transfer_on_agent(success, old_handler_name, cat) -> None:
+async def after_vector_memory_transfer_on_agent(success: bool, cat) -> None:
     """Old-store cleanup on vector-memory switch (T24).
 
-    When the transfer SUCCEEDED and the old handler was the GraphRAG one
-    (graphrag -> qdrant switch), wipe THIS agent's Neo4j tenant data
-    (Document/Entity/relations, strictly tenant-scoped). When the new handler
-    is graphrag (qdrant -> graphrag) nothing is done here — the revalidation
-    sweep + the ``graph_building`` phase handle graph computation. NEVER wipes
-    when ``success`` is False.
+    Host contract: ``after_vector_memory_transfer_on_agent(success: bool, cat)``
+    (``cat.core_plugins.base_plugin.hooks.flow``; invoked by
+    ``CheshireCat.transfer_vector_points_from``). The host does NOT pass the
+    old handler name, and by the time this hook runs ``cat.vector_memory_handler``
+    already points at the NEW handler, so the old name is not reachable from
+    the hook args or from the (already updated) settings.
+
+    The switch direction is therefore inferred from the CURRENT handler: the
+    only switch that leaves a stale GraphRAG store behind is
+    GraphRAG -> non-GraphRAG, and in that case the current handler is not a
+    ``GraphRAGHandler``. When the new handler IS GraphRAG
+    (non-graphrag -> graphrag) the revalidation sweep + the ``graph_building``
+    phase own graph computation, so nothing is wiped here. NEVER wipes when
+    ``success`` is False.
+
+    A non-GraphRAG -> non-GraphRAG switch can also reach the wipe branch, but
+    ``wipe_tenant_graph_data`` is a strict no-op without a recorded Neo4j
+    config and tenant-scoped otherwise, so it stays safe.
     """
-    if not success or old_handler_name != "Neo4jGraphRAGConfig":
+    if not success:
+        return
+    if _graphrag_handler(cat) is not None:
         return
     from .graphrag_handler import wipe_tenant_graph_data
     await wipe_tenant_graph_data(cat.agent_key)
