@@ -1220,8 +1220,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     embedding=vector_list,
                 )
 
-        # Start entity extraction in the background
-        if self._enable_entity_extraction and self._entity_extractor:
+        # Start entity extraction in the background — ONLY for a point that
+        # carries a real embedding. The efficient engine stores every chunk
+        # twice: first with EMPTY vectors (``_store_empty_vectors``, the
+        # parsing_chunking phase), then again with the real vectors after the
+        # embedding phase deletes and re-adds the points. Extraction is
+        # vector-independent, so without this gate it runs on BOTH passes and
+        # duplicates the whole NER/linking graph work per document. The empty
+        # pass is a pure staging write; the real-vector pass is the one that
+        # owns the graph. ``vector_valid`` is the single normalized check
+        # (``_is_valid_vector``: non-empty, all-zero and non-finite rejected).
+        if vector_valid and self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
             self._track_source_task((metadata or {}).get("source"), task)
@@ -2143,7 +2152,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 str(point.id),
             )
 
-        if self._enable_derived_graph:
+        # Same real-vector gate as the per-point extraction above: the
+        # efficient engine's empty-vector staging pass must not build the
+        # derived graph (SourceFile / NEXT / Section / ... and, in step 8, the
+        # LLM concept-relation extraction) only for the embedding phase to
+        # rebuild it. A batch is graph-ready when at least one point carries a
+        # real vector — payload-only points (e.g. images under a non-multimodal
+        # embedder) still participate in the shape once a valid sibling point
+        # makes the batch eligible, so no node/relationship shape changes.
+        batch_has_real_vector = any(
+            self._is_valid_vector(list(p.vector or [])) for p in points
+        )
+        if self._enable_derived_graph and batch_has_real_vector:
             sources: Dict[str, List[PointStruct]] = {}
             for p in points:
                 meta = (p.payload or {}).get("metadata", {}) or {}
