@@ -145,9 +145,9 @@ Toggles:
 - **`enable_derived_graph`** is the master switch for all graph building: when off, both ingestion paths are no-ops.
 - **`enable_knowledge_graph`** and **`enable_concept_relations`** must **both** be on for the LLM concept/relation phase; with either off, that phase still completes but does no extraction. The spaCy phase independently honours `enable_entity_extraction`.
 
-### One extraction per document (real-vector gate)
+### One extraction per document (empty-pass discriminator)
 
-The efficient engine stores each chunk twice: first with empty vectors (parsing/chunking), then again with real vectors after embedding. Graph extraction is vector-independent, so the plugin gates it on `_is_valid_vector` (non-empty, non-zero, finite): only the real-vector write spawns NER/entity-link/similarity work. This keeps the graph work at **one extraction per document** instead of two, and it is the same gate the phase executors rely on.
+The efficient engine stores each chunk twice: first with empty vectors (parsing/chunking), then again with real vectors after embedding. Graph extraction is vector-independent, so the plugin gates it on the **pass**, not on vector validity: `_is_empty_vector_staging_pass` reads the source's recorded ingestion phase (`parsing_chunking` = staging -> skip; `embedding` -> build). This keeps the graph work at **one extraction per document** instead of two, while a legitimate payload-only / zero-vector document (e.g. an image under a non-multimodal embedder) still builds the graph exactly once. Vector validity is still required only for the similarity edges, where a zero vector is meaningless.
 
 ### Shared Entity-node schema (internal contract)
 

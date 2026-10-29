@@ -14,10 +14,11 @@ helpers they drive (``run_spacy_extraction_phase``,
 - ``ingestion_phase_settings_marker`` returns ``_spacy_fingerprint`` for
   ``graph_spacy_extraction``, ``_concept_fingerprint`` for
   ``graph_llm_extraction``, None otherwise;
-- ``ingestion_phase_run`` returns None for unknown phases (fail-hard),
-  not_ready when the source's points are absent, and done (with the NER +
-  similarity work / the LLM concept-relations step awaited) when the points
-  are present; dispatch to ``run_spacy_extraction_phase`` /
+- ``ingestion_phase_run`` returns None only for unknown phases (fail-hard),
+  ``done`` when there is nothing to do (non-GraphRAG handler / derived graph
+  disabled), not_ready when the source's points are absent, and done (with
+  the NER + similarity work / the LLM concept-relations step awaited) when
+  the points are present; dispatch to ``run_spacy_extraction_phase`` /
   ``run_llm_extraction_phase`` is asserted directly with AsyncMocks (T7);
 - ``before_ingestion_status_completed`` raises when live background tasks
   remain for the source, and passes when the work is clean (the diary check
@@ -309,11 +310,8 @@ def _make_handler(kg=True, cr=True, derived=True):
     return handler
 
 
-def _completed(deps, recorded_gen=None):
-    entries = [{"phase": pid, "gen": gen} for pid, gen in deps]
-    if recorded_gen is not None:
-        entries.append({"phase": "graph_building", "gen": recorded_gen})
-    return entries
+def _completed(deps):
+    return [{"phase": pid, "gen": gen} for pid, gen in deps]
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +450,8 @@ def test_phase_run_returns_none_for_unknown_phase():
     assert result is None, f"expected None for unknown phase (fail-hard), got {result}"
 
 
-def test_phase_run_returns_none_when_not_graphrag_handler():
+def test_phase_run_returns_done_when_not_graphrag_handler():
+    """B1: a registered-but-inactive phase is a no-op, never an ERROR."""
     from catgraphrag_phase import main
 
     class _OtherHandler:
@@ -462,10 +461,11 @@ def test_phase_run_returns_none_when_not_graphrag_handler():
     result = asyncio.run(main.ingestion_phase_run(
         "graph_spacy_extraction", "file.pdf", _completed([]), cat
     ))
-    assert result is None, f"got {result}"
+    assert result == {"status": "done"}, f"got {result}"
 
 
-def test_phase_run_returns_none_when_derived_graph_disabled():
+def test_phase_run_returns_done_when_derived_graph_disabled():
+    """B1: derived graph off -> nothing to do -> done (never None/ERROR)."""
     from catgraphrag_phase import main
 
     handler = _make_handler(derived=False)
@@ -473,7 +473,7 @@ def test_phase_run_returns_none_when_derived_graph_disabled():
     result = asyncio.run(main.ingestion_phase_run(
         "graph_spacy_extraction", "file.pdf", _completed([]), cat
     ))
-    assert result is None, f"got {result}"
+    assert result == {"status": "done"}, f"got {result}"
 
 
 def test_phase_run_dispatches_spacy_to_run_spacy_extraction_phase():
@@ -1079,8 +1079,8 @@ def main():
         test_marker_returns_none_for_unknown_phase,
         test_marker_returns_none_when_not_graphrag_handler,
         test_phase_run_returns_none_for_unknown_phase,
-        test_phase_run_returns_none_when_not_graphrag_handler,
-        test_phase_run_returns_none_when_derived_graph_disabled,
+        test_phase_run_returns_done_when_not_graphrag_handler,
+        test_phase_run_returns_done_when_derived_graph_disabled,
         test_phase_run_dispatches_spacy_to_run_spacy_extraction_phase,
         test_phase_run_dispatches_llm_to_run_llm_extraction_phase,
         test_spacy_phase_not_ready_when_points_absent,
@@ -1100,8 +1100,8 @@ def main():
         test_rabbithole_hook_keeps_classic_path_with_core_engine,
         test_phase_path_active_truth_table,
         test_transfer_cleanup_noop_on_failure,
-        test_transfer_cleanup_noop_when_old_not_neo4j,
-        test_transfer_cleanup_wipes_on_success_neo4j,
+        test_transfer_cleanup_noop_when_new_handler_is_graphrag,
+        test_transfer_cleanup_wipes_on_success_when_new_handler_not_graphrag,
         test_wipe_tenant_graph_data_skips_without_config,
         test_wipe_tenant_graph_data_wipes_tenant,
         test_concept_store_rerun_issues_identical_merge_queries,

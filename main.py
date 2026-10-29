@@ -306,15 +306,25 @@ async def ingestion_phase_run(phase, source, completed_phases, cat):
 
     ``graph_spacy_extraction`` -> ``run_spacy_extraction_phase`` (NER + link +
     similarity, awaited); ``graph_llm_extraction`` ->
-    ``run_llm_extraction_phase`` (LLM concept relations). Returns None for
-    unknown phases (fail-hard: the core maps raise -> status=error, so an
-    unhandled phase must NOT silently succeed). Exceptions propagate.
+    ``run_llm_extraction_phase`` (LLM concept relations). Returns the
+    documented tri-state status dict:
+
+    - ``{"status": "done"}`` when there is nothing to do (the active handler is
+      not ``GraphRAGHandler``, or ``_enable_derived_graph`` is off) — a
+      registered-but-inactive graph phase must NOT turn a successful ingestion
+      into an ERROR;
+    - whatever the phase executor returns (``done`` / ``not_ready``) when the
+      handler is active;
+    - ``None`` for an UNKNOWN phase (fail-hard: the core maps ``None`` ->
+      status=error, so an unhandled phase never silently succeeds).
+
+    Exceptions propagate (the core maps them to status=error).
     """
     handler = _graphrag_handler(cat)
     if handler is None:
-        return None
+        return {"status": "done"}
     if not getattr(handler, "_enable_derived_graph", False):
-        return None
+        return {"status": "done"}
     if phase == "graph_spacy_extraction":
         return await handler.run_spacy_extraction_phase(source, cat=cat)
     if phase == "graph_llm_extraction":

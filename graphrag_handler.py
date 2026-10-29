@@ -232,6 +232,56 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         _l2_sq = sum(x * x for x in vector)
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
 
+    async def _is_empty_vector_staging_pass(
+        self, source: Optional[str], metadata: Dict | None
+    ) -> bool:
+        """Whether this write belongs to EffING's empty-vector staging pass.
+
+        The efficient engine stores every chunk TWICE: once in the
+        ``parsing_chunking`` phase with empty vectors (``_store_empty_vectors``)
+        and again in the ``embedding`` phase with real vectors (or payload-only
+        for images). Graph extraction is vector-independent, so it must run on
+        the second pass only.
+
+        Vector validity is NOT a valid discriminator: a legitimate payload-only
+        document (e.g. an image under a non-multimodal embedder) also carries
+        an empty vector and MUST still build the graph. The reliable signal is
+        the source's CURRENT ingestion phase, which EffING records before it
+        calls the storage (``set_phase(PHASE_PARSING_CHUNKING)`` before
+        ``_run_parsing_phase``, ``PHASE_EMBEDDING`` before ``_embed_phase``).
+        The phase alone is not enough because the CLASSIC core ingestion has a
+        status row in the same ``parsing_chunking`` phase (EffING's generic
+        ingestion-status hooks) while doing a single real pass; the phase
+        machine additionally CLAIMS the source (``resume_owner``), which is the
+        explicit staging-pass marker.
+
+        No status doc / no claim (classic path, direct writes) means "not a
+        staging pass": build the graph, exactly as before.
+        """
+        if not source:
+            return False
+        try:
+            from cat.core_plugins.cat_efficient_ingestion import registry
+
+            chat_id = (metadata or {}).get("chat_id")
+            scope = str(chat_id) if chat_id else "agent"
+            doc = await registry.get_status(self.agent_id, scope, source)
+        except Exception:  # noqa: BLE001 - never let the discriminator break a write
+            return False
+        if not doc:
+            return False
+        # ``phase == parsing_chunking`` alone is NOT enough: the core (classic)
+        # ingestion also has a status row in the same phase (written by EffING's
+        # generic ingestion-status hooks), yet it does a SINGLE real pass and
+        # must build the graph. The efficient PHASE MACHINE claims the source
+        # (``claim_source_for_resume`` -> ``resume_owner``) before it runs
+        # ``_store_empty_vectors``; that lease is the explicit "this write is
+        # the staging pass of the two-phase machine" marker.
+        return (
+            doc.get("phase") == registry.PHASE_PARSING_CHUNKING
+            and bool(doc.get("resume_owner"))
+        )
+
     @staticmethod
     def _next_generation(gen: str) -> str:
         """Increment a generation token: 'v1' -> 'v2', 'v2' -> 'v3'."""
@@ -1112,6 +1162,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector: Iterable,
         metadata: Dict = None,
         id_point: str | None = None,
+        skip_graph: bool = False,
         **kwargs,
     ) -> PointStruct | None:
         """
@@ -1220,17 +1271,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     embedding=vector_list,
                 )
 
-        # Start entity extraction in the background — ONLY for a point that
-        # carries a real embedding. The efficient engine stores every chunk
+        # Start entity extraction in the background — on every point EXCEPT the
+        # empty-vector staging pass. The efficient engine stores every chunk
         # twice: first with EMPTY vectors (``_store_empty_vectors``, the
         # parsing_chunking phase), then again with the real vectors after the
         # embedding phase deletes and re-adds the points. Extraction is
         # vector-independent, so without this gate it runs on BOTH passes and
-        # duplicates the whole NER/linking graph work per document. The empty
-        # pass is a pure staging write; the real-vector pass is the one that
-        # owns the graph. ``vector_valid`` is the single normalized check
-        # (``_is_valid_vector``: non-empty, all-zero and non-finite rejected).
-        if vector_valid and self._enable_entity_extraction and self._entity_extractor:
+        # duplicates the whole NER/linking graph work per document.
+        #
+        # The gate is the PASS, not vector validity: a legitimate payload-only
+        # document (zero/empty vector, e.g. an image under a non-multimodal
+        # embedder) MUST still build the graph. ``skip_graph`` is set by
+        # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
+        # recorded ingestion phase); a direct/classic write defaults to False.
+        if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
             self._track_source_task((metadata or {}).get("source"), task)
@@ -2143,27 +2197,40 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         await self._ensure_connected()
 
         operation_id = random.randint(1, 100000)
+
+        # Discriminate the EMPTY-VECTOR STAGING PASS, not vector validity.
+        # The staging pass (``parsing_chunking``) writes every point with an
+        # empty vector and must not build any graph; the ``embedding`` pass
+        # writes the same points with real vectors OR payload-only and owns the
+        # graph. A payload-only document (legitimately empty vector) therefore
+        # still builds once the pass is the embedding one. Computed per source
+        # (one registry read per unique source/chat scope, not per point).
+        staging_cache: Dict[tuple, bool] = {}
+        staging_flags: List[bool] = []
         for point in points:
+            meta = (point.payload or {}).get("metadata", {}) or {}
+            key = (meta.get("source"), meta.get("chat_id"))
+            if key not in staging_cache:
+                staging_cache[key] = await self._is_empty_vector_staging_pass(
+                    meta.get("source"), meta
+                )
+            staging_flags.append(staging_cache[key])
+
+        for point, is_staging in zip(points, staging_flags):
             await self.add_point_to_tenant(
                 collection_name,
                 point.payload.get("page_content", ""),  # type: ignore[arg-type]
                 point.vector,
                 point.payload.get("metadata", {}),  # type: ignore[arg-type]
                 str(point.id),
+                skip_graph=is_staging,
             )
 
-        # Same real-vector gate as the per-point extraction above: the
-        # efficient engine's empty-vector staging pass must not build the
-        # derived graph (SourceFile / NEXT / Section / ... and, in step 8, the
-        # LLM concept-relation extraction) only for the embedding phase to
-        # rebuild it. A batch is graph-ready when at least one point carries a
-        # real vector — payload-only points (e.g. images under a non-multimodal
-        # embedder) still participate in the shape once a valid sibling point
-        # makes the batch eligible, so no node/relationship shape changes.
-        batch_has_real_vector = any(
-            self._is_valid_vector(list(p.vector or [])) for p in points
-        )
-        if self._enable_derived_graph and batch_has_real_vector:
+        # Derived graph (SourceFile / NEXT / Section / ... and, in step 8, the
+        # LLM concept-relation extraction) follows the SAME pass discriminator:
+        # skipped only when the whole batch is the empty-vector staging pass.
+        batch_is_staging = bool(points) and all(staging_flags)
+        if self._enable_derived_graph and not batch_is_staging:
             sources: Dict[str, List[PointStruct]] = {}
             for p in points:
                 meta = (p.payload or {}).get("metadata", {}) or {}
