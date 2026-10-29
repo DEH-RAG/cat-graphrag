@@ -79,12 +79,38 @@ async def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> 
     return config
 
 
-@hook(priority=10)
-async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+async def _inject_embedder(cat) -> None:
+    """Inject the agent's resolved embedder into the active handler (idempotent).
+
+    ``embedder`` is one of the two SYSTEM-level services, so the instance the
+    handler must use is what ``cat.embedder()`` resolves for this agent. Owning
+    the same instance again is a no-op and ``_align_embedder_lazy`` is guarded
+    to run at most once per handler, so repeated injection is harmless.
+    """
     if hasattr(cat.vector_memory_handler, "embedder"):
         cat.vector_memory_handler.embedder = await cat.embedder()
         if hasattr(cat.vector_memory_handler, "_align_embedder_lazy"):
             await cat.vector_memory_handler._align_embedder_lazy()
+
+
+@hook(priority=10)
+async def rabbithole_ingestion_processing(source, cat) -> None:
+    """Inject the embedder on the hook BOTH ingestion engines emit.
+
+    The classic RabbitHole fires this right before parsing/embedding; the
+    efficient engine (EffING, ``cat/core_plugins/cat_efficient_ingestion``)
+    fires it too and NEVER fires ``before_rabbithole_stores_documents``. Without
+    this hook the handler would run its extraction phases with no embedder under
+    EffING, silently skipping entity embeddings. Idempotent (see
+    ``_inject_embedder``), so on the classic flow — which emits both hooks — the
+    second injection changes nothing.
+    """
+    await _inject_embedder(cat)
+
+
+@hook(priority=10)
+async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+    await _inject_embedder(cat)
 
     # Lazy import (FX-9): same reload-order rationale as
     # after_cheshire_cat_creation — a module-level binding would be the
