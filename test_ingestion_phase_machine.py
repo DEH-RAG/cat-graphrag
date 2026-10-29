@@ -24,11 +24,12 @@ helpers they drive (``run_spacy_extraction_phase``,
   is gone: EffING owns the completed-phases diary); it is a no-op when the
   handler is not GraphRAG or ``_enable_derived_graph`` is False, and it never
   reaches into the core ingestion-status registry (T7);
-- ``after_rabbithole_stored_documents`` is a NO-OP when the EffING phase
-  machine is importable (the phases own the work) and keeps the legacy
-  ``create_derived_graph_for_source`` behavior when it is not;
-- ``_phase_machine_active`` is True exactly when
-  ``cat.core_plugins.cat_efficient_ingestion`` is importable (T7);
+- ``after_rabbithole_stored_documents`` is a NO-OP when the phase path is
+  active and keeps the classic ``create_derived_graph_for_source`` behavior
+  otherwise;
+- ``_phase_path_active`` is True exactly when EffING is importable AND the
+  SYSTEM-level ``ingestion`` selection resolves to the efficient engine
+  (truth table: uninstalled / installed-core-engine / installed-efficient);
 - the spaCy entity batch write keeps ``REMOVE e.concept_gen,
   e.concept_gen_active`` — the shared Entity-node contract stays internal
   to the plugin (T7 shared-schema guard);
@@ -53,6 +54,11 @@ import types
 from unittest.mock import AsyncMock, Mock, patch
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# SYSTEM-level ingestion selection returned by the stubbed resolver. Tests
+# flip this between "EfficientIngestionConfiguration" (phase path) and
+# "BaseIngestionConfiguration" (classic path).
+_RESOLVED_INGESTION = {"name": "EfficientIngestionConfiguration"}
 
 
 class _StubLog:
@@ -121,6 +127,18 @@ def _install_cat_stub():
     models_mod.ScoredPoint = type("ScoredPoint", (), {})
     models_mod.UpdateResult = type("UpdateResult", (), {})
     sys.modules["cat.services.memory.models"] = models_mod
+
+    factory = types.ModuleType("cat.services.factory")
+    factory.__path__ = []
+    sys.modules["cat.services.factory"] = factory
+
+    ingestion_factory = types.ModuleType("cat.services.factory.ingestion")
+
+    async def resolved_config_name(lizard):
+        return _RESOLVED_INGESTION["name"]
+
+    ingestion_factory.resolved_config_name = resolved_config_name
+    sys.modules["cat.services.factory.ingestion"] = ingestion_factory
 
 
 def _install_neo4j_stub():
@@ -221,8 +239,8 @@ def _install_effing_stub():
     """Stub the EffING phase-machine contract the hooks import lazily.
 
     ``PhaseSpec`` is a recording fake (id / settings_category / depends_on);
-    ``cat.core_plugins.cat_efficient_ingestion`` importable means the phase
-    machine is "deployed" for ``_phase_machine_active``.
+    ``cat.core_plugins.cat_efficient_ingestion`` importable is one half of the
+    ``_phase_path_active`` gate (the other is the system ingestion selection).
     """
     plugins = types.ModuleType("cat.plugins")
     plugins.__path__ = []
@@ -706,20 +724,21 @@ def test_gate_does_not_import_core_registry():
         assert ref not in src, f"forbidden core-registry reference found: {ref}"
 
 
-def test_rabbithole_hook_noop_when_phase_machine_active():
-    """stale_state: with EffING importable, the old fire-and-forget must NOT
+def test_rabbithole_hook_noop_when_phase_path_active():
+    """EffING installed + efficient engine: the classic fire-and-forget must NOT
     run (the registered phases own the graph work)."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
     with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
         asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
         create.assert_not_awaited()
 
 
-def test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent():
-    """Without EffING importable, the legacy fire-and-forget must run."""
+def test_rabbithole_hook_keeps_classic_path_when_effing_absent():
+    """Without EffING importable, the classic fire-and-forget must run once."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
@@ -734,29 +753,41 @@ def test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent():
             sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
 
 
-def test_phase_machine_active_true_when_effing_importable():
-    """T7: with cat.core_plugins.cat_efficient_ingestion importable (stub present),
-    the phase machine is active."""
+def test_rabbithole_hook_keeps_classic_path_with_core_engine():
+    """EffING installed but the SYSTEM ingestion selection is the core engine:
+    the classic fire-and-forget must run once (no dead path)."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    assert main._phase_machine_active(cat) is True
+    _RESOLVED_INGESTION["name"] = "BaseIngestionConfiguration"
+    try:
+        with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
+            asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
+            create.assert_awaited_once_with("file.pdf", [], cat)
+    finally:
+        _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
 
 
-def test_phase_machine_active_false_when_effing_absent():
-    """T7: without cat.core_plugins.cat_efficient_ingestion (stub removed from
-    sys.modules), the phase machine is inactive -> legacy paths run."""
+def test_phase_path_active_truth_table():
+    """uninstalled -> False; installed+core engine -> False; installed+efficient -> True."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
     saved = sys.modules.pop("cat.core_plugins.cat_efficient_ingestion", None)
     try:
-        assert main._phase_machine_active(cat) is False
+        _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+        assert asyncio.run(main._phase_path_active(cat)) is False
     finally:
         if saved is not None:
             sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
+
+    _RESOLVED_INGESTION["name"] = "BaseIngestionConfiguration"
+    assert asyncio.run(main._phase_path_active(cat)) is False
+
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    assert asyncio.run(main._phase_path_active(cat)) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1063,10 +1094,10 @@ def main():
         test_gate_raises_when_has_pending_source_tasks_true,
         test_gate_noop_when_derived_graph_disabled,
         test_gate_does_not_import_core_registry,
-        test_rabbithole_hook_noop_when_phase_machine_active,
-        test_rabbithole_hook_keeps_legacy_path_when_phase_machine_absent,
-        test_phase_machine_active_true_when_effing_importable,
-        test_phase_machine_active_false_when_effing_absent,
+        test_rabbithole_hook_noop_when_phase_path_active,
+        test_rabbithole_hook_keeps_classic_path_when_effing_absent,
+        test_rabbithole_hook_keeps_classic_path_with_core_engine,
+        test_phase_path_active_truth_table,
         test_transfer_cleanup_noop_on_failure,
         test_transfer_cleanup_noop_when_old_not_neo4j,
         test_transfer_cleanup_wipes_on_success_neo4j,

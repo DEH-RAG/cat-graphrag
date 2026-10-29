@@ -117,10 +117,10 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     # default there silently disabled the whole derived-graph + LLM path, FX-1).
     if not getattr(handler, "_enable_derived_graph", False):
         return
-    # When the EffING phase machine is deployed, the registered phases own the
-    # graph work: this fire-and-forget must be a NO-OP (T5), otherwise the
-    # work would run twice (once here, once in the phases).
-    if _phase_machine_active(cat):
+    # The classic callback is the ONLY graph writer when the phase path is
+    # inactive; when it is active the registered phases own the work, so this
+    # fire-and-forget must be a NO-OP (otherwise the graph is built twice).
+    if await _phase_path_active(cat):
         return
     await handler.create_derived_graph_for_source(source, stored_points, cat)
 
@@ -153,18 +153,70 @@ def _graphrag_handler(cat):
     return None
 
 
-def _phase_machine_active(cat) -> bool:
-    """Whether the EffING phase machine is deployed (importable).
+_EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
 
-    When active, the registered phases own the graph work, so the legacy
-    fire-and-forget hooks must be NO-OPs (otherwise the work would run twice).
-    When inactive (EffING absent), the legacy paths run unchanged.
+
+async def _resolved_system_ingestion_config_name(cat) -> "str | None":
+    """Effective SYSTEM-level ingestion engine name.
+
+    The ``ingestion`` category is one of the two system-level services (the
+    other is ``embedder``), so its selection is read against
+    ``DEFAULT_SYSTEM_KEY`` — never the agent key. ``resolved_config_name`` is
+    the canonical resolver (signature: ``resolved_config_name(lizard) -> str``);
+    a host that predates it is handled by reading the same single system-level
+    category entry directly, so both paths return the same value.
+    """
+    try:
+        from cat.services.factory.ingestion import resolved_config_name
+    except ImportError:
+        resolved_config_name = None
+
+    if resolved_config_name is not None:
+        return await resolved_config_name(cat)
+
+    from cat.db.cruds import settings as crud_settings
+    from cat.db.database import DEFAULT_SYSTEM_KEY
+
+    saved = await crud_settings.get_settings_by_category(
+        DEFAULT_SYSTEM_KEY, "ingestion"
+    )
+    return (saved or {}).get("name")
+
+
+async def _phase_path_active(cat) -> bool:
+    """Whether the EffING phase path owns graph building for this ingest.
+
+    Single source of truth for the two ingestion modes. The phase path is
+    active **iff**:
+
+    ==========================  ======================  =============
+    EffING installed/loadable   SYSTEM ``ingestion``    phase path
+    ==========================  ======================  =============
+    no                          any                     inactive
+    yes                         core engine             inactive
+    yes                         efficient engine        active
+    ==========================  ======================  =============
+
+    In every other case the classic path runs (``after_rabbithole_stored_documents``
+    -> ``create_derived_graph_for_source``). The phase hooks are still REGISTERED
+    whenever EffING is importable; this helper only decides which mechanism
+    writes the graph, so the two can never run together and neither is dead.
     """
     try:
         import cat.core_plugins.cat_efficient_ingestion  # noqa: F401
     except Exception:  # noqa: BLE001
         return False
-    return True
+
+    try:
+        name = await _resolved_system_ingestion_config_name(cat)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            f"[GraphRAG] Could not resolve the system ingestion engine "
+            f"({exc!r}); using the classic path."
+        )
+        return False
+
+    return name == _EFFICIENT_INGESTION_CONFIG_NAME
 
 
 @hook(priority=10)
