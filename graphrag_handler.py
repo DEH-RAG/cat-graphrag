@@ -1435,8 +1435,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """Deterministic, awaited LLM graph phase for one source (T5).
 
         Runs ONLY the LLM concept-relations step (``_extract_concept_relations``)
-        for the source's stored points, gated on ``_enable_knowledge_graph``
-        and ``_enable_concept_relations``. Independent from the spaCy phase:
+        for the source's stored points, gated on ``_enable_concept_relations``.
+        ``enable_knowledge_graph`` is display-only (UI) and does not gate.
+        Independent from the spaCy phase:
         it consumes ONLY the stored chunks + LLM + definitions/prompt, NOT the
         spaCy entities, so it can run in any order relative to
         ``run_spacy_extraction_phase``.
@@ -1457,7 +1458,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         for collection_name, points in by_collection.items():
             all_points.extend(points)
 
-        if self._enable_knowledge_graph and self._enable_concept_relations:
+        if self._enable_concept_relations:
             await self._extract_concept_relations(source, all_points, stray_cat=cat)
 
         return {"status": "done"}
@@ -3151,13 +3152,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction (gated on the
-        # enable_knowledge_graph master switch, D1). Self-contained: when no
+        # 8 — LLM-based concept relation extraction (gated on
+        # enable_concept_relations; enable_knowledge_graph is display-only).
+        # Self-contained: when no
         # stray_cat is available (vector-db path via add_points_to_tenant — the
         # plugin hooks are unreliable under the multi-worker toggle race, so
         # they cannot be the trigger), the agent LLM is resolved directly from
         # the saved agent config via _resolve_agent_llm().
-        if self._enable_knowledge_graph and self._enable_concept_relations:
+        if self._enable_concept_relations:
             try:
                 if stray_cat is not None:
                     await self._extract_concept_relations(source, stored_points, stray_cat)
@@ -3672,7 +3674,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         OTHER generation. No re-ingest, no re-embed, no full wipe; every query
         is tenant-scoped and the walk is serialized by the write semaphore.
         """
-        if not (self._enable_knowledge_graph and self._enable_concept_relations):
+        if not self._enable_concept_relations:
             return
         tenant_id = self.agent_id
         if gen is None:
@@ -4248,7 +4250,11 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
     enable_knowledge_graph: bool = Field(
         default=False,
-        description="Enable the knowledge graph feature globally",
+        description=(
+            "Display-only flag for the frontend; it does not gate backend "
+            "concept writes or retrieval. Use enable_concept_relations to "
+            "control LLM concept/relation extraction."
+        ),
     )
     enable_student_knowledge_graph: bool = Field(
         default=False,
