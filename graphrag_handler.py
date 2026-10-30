@@ -2595,7 +2595,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         active_gen = await self._read_concept_gen(self.agent_id)
         if active_gen is None:
-            active_gen = self._concept_fingerprint()
+            active_gen = await self._concept_fingerprint()
         return await self._run_cached(
             f"recall_entity_related:{depth}",
             self._generation,
@@ -3286,7 +3286,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             relations,
             source=source,
             document_ids=document_ids,
-            concept_gen=gen or self._concept_fingerprint(),
+            concept_gen=gen or await self._concept_fingerprint(),
         )
         log.info(
             f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
@@ -3476,8 +3476,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         stripped technology terminology (``extra_technology_patterns``), so
         cosmetic edits (line order, indentation, trailing whitespace) do NOT
         produce a spurious generation change — mirroring
-        ``_concept_fingerprint``. The resulting token is the material marker
-        for the ``graph_spacy_extraction`` phase.
+        ``_concept_fingerprint``. ``enable_entity_extraction`` is included
+        because it gates the per-point extraction (turning it off leaves no
+        spaCy entities at all), so it is material for the phase. The resulting
+        token is the material marker for the ``graph_spacy_extraction`` phase.
         """
         payload = (
             "MODELS:" + json.dumps(self._spacy_models, sort_keys=True)
@@ -3486,23 +3488,66 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 [p.strip() for p in (self._extra_technology_patterns or [])],
                 sort_keys=True,
             )
+            + "|ENTITY_EXTRACTION:"
+            + json.dumps(bool(self._enable_entity_extraction))
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    def _concept_fingerprint(self) -> str:
+    async def _resolve_agent_llm_identity(self) -> str:
+        """Stable, secret-free identifier of the agent's configured LLM.
+
+        Resolved the same way the extraction phase resolves its LLM: the
+        agent-scoped ``llm`` service setting (``ServiceProvider`` /
+        ``_resolve_agent_llm`` read the same category). The identifier is
+        ``<config class name>:<model>`` — never a client object and never
+        credentials; a missing/default/dumb LLM collapses to a stable sentinel
+        so the fingerprint stays deterministic. Cached per handler instance.
+        """
+        cached = getattr(self, "_llm_identity", None)
+        if cached is not None:
+            return cached
+
+        identity = "none"
+        agent_id = getattr(self, "agent_id", None)
+        if agent_id:
+            try:
+                # lazy import (plugin import-safe rule)
+                from cat.db.cruds import settings as crud_settings
+
+                saved = await crud_settings.get_settings_by_category(agent_id, "llm")
+                if saved:
+                    name = str(saved.get("name") or "")
+                    value = saved.get("value") or {}
+                    model = value.get("model") if isinstance(value, dict) else None
+                    if name and name != "LLMDefaultConfig":
+                        identity = f"{name}:{model or ''}"
+                    else:
+                        identity = "default"
+            except Exception:  # noqa: BLE001
+                identity = "unknown"
+
+        self._llm_identity = identity
+        return identity
+
+    async def _concept_fingerprint(self) -> str:
         """Stable SHA-256 fingerprint of the effective concept-relations config.
 
-        Normalizes the PARSED definition dicts (``sort_keys=True``) and the
-        whitespace-stripped prompt, so cosmetic edits (line order, indentation,
-        trailing whitespace) do NOT produce a spurious generation change. The
-        resulting token tags every concept node/edge written by
-        ``_store_concept_relations`` (the ``concept_gen`` property) and is what
-        the save-trigger recompute (todo 12) flips to.
+        Normalizes the PARSED definition dicts (``sort_keys=True``), the
+        whitespace-stripped prompt, the agent-level LLM identity and the
+        ``enable_concept_relations`` toggle, so cosmetic edits do NOT produce a
+        spurious generation change. The LLM identity is material because it
+        actually produces the concepts; the toggle is material because it
+        gates the whole extraction. The resulting token tags every concept
+        node/edge written by ``_store_concept_relations`` (the ``concept_gen``
+        property) and is what the save-trigger recompute (todo 12) flips to.
         """
         payload = (
             "CONCEPT:" + json.dumps(self._concept_definitions, sort_keys=True)
             + "|REL:" + json.dumps(self._relation_definitions, sort_keys=True)
             + "|PROMPT:" + (self._concept_relations_prompt or "").strip()
+            + "|LLM:" + await self._resolve_agent_llm_identity()
+            + "|CONCEPT_RELATIONS:"
+            + json.dumps(bool(self._enable_concept_relations))
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -3678,7 +3723,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return
         tenant_id = self.agent_id
         if gen is None:
-            gen = self._concept_fingerprint()
+            gen = await self._concept_fingerprint()
 
         await self._ensure_connected()
         async with self._neo4j_write_semaphore:

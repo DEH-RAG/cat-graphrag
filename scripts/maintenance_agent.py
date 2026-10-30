@@ -838,7 +838,7 @@ async def _op_graph_part_b(ccat, handler) -> bool:
     stray_duck = types.SimpleNamespace(large_language_model=ccat.large_language_model)
 
     for attempt in range(1, 4):
-        gen = handler._concept_fingerprint()
+        gen = await handler._concept_fingerprint()
         active = await handler._read_concept_gen(tenant_id)
         await handler.recompute_concept_relations(stray_duck, gen=gen)
         flipped = await handler._flip_concept_gen(
@@ -1013,7 +1013,7 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
         "MATCH (c:Collection {tenant_id: $tenant_id}) "
         "RETURN c.concept_gen_active AS n LIMIT 1"
     )
-    checks.append(("concept-gen-active", active_gen == handler._concept_fingerprint()))
+    checks.append(("concept-gen-active", active_gen == await handler._concept_fingerprint()))
 
     # 5. no orphan entities (no MENTIONS/PROVENANCE) — count == 0.
     orphans = await _scalar(

@@ -401,7 +401,9 @@ def test_marker_returns_spacy_fingerprint():
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    marker = main.ingestion_phase_settings_marker("graph_spacy_extraction", cat)
+    marker = asyncio.run(
+        main.ingestion_phase_settings_marker("graph_spacy_extraction", cat)
+    )
     assert marker == handler._spacy_fingerprint(), f"got {marker}"
 
 
@@ -410,8 +412,10 @@ def test_marker_returns_concept_fingerprint():
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    marker = main.ingestion_phase_settings_marker("graph_llm_extraction", cat)
-    assert marker == handler._concept_fingerprint(), f"got {marker}"
+    marker = asyncio.run(
+        main.ingestion_phase_settings_marker("graph_llm_extraction", cat)
+    )
+    assert marker == asyncio.run(handler._concept_fingerprint()), f"got {marker}"
 
 
 def test_marker_returns_none_for_unknown_phase():
@@ -419,7 +423,9 @@ def test_marker_returns_none_for_unknown_phase():
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    assert main.ingestion_phase_settings_marker("embedding", cat) is None
+    assert asyncio.run(
+        main.ingestion_phase_settings_marker("embedding", cat)
+    ) is None
 
 
 def test_marker_returns_none_when_not_graphrag_handler():
@@ -429,8 +435,12 @@ def test_marker_returns_none_when_not_graphrag_handler():
         pass
 
     cat = _FakeCat(_OtherHandler())
-    assert main.ingestion_phase_settings_marker("graph_spacy_extraction", cat) is None
-    assert main.ingestion_phase_settings_marker("graph_llm_extraction", cat) is None
+    assert asyncio.run(
+        main.ingestion_phase_settings_marker("graph_spacy_extraction", cat)
+    ) is None
+    assert asyncio.run(
+        main.ingestion_phase_settings_marker("graph_llm_extraction", cat)
+    ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +610,9 @@ def test_llm_phase_done_when_points_present():
     assert _args[1] == points
 
 
-def test_llm_phase_skips_llm_when_kg_off():
+def test_llm_phase_runs_when_kg_off_display_only():
+    """``enable_knowledge_graph`` is display-only (todo 6), so the LLM phase
+    still runs when it is off; only ``enable_concept_relations`` gates it."""
     from catgraphrag_phase import main
 
     handler = _make_handler(kg=False, cr=True)
@@ -614,7 +626,7 @@ def test_llm_phase_skips_llm_when_kg_off():
             "graph_llm_extraction", "file.pdf", _completed([]), cat
         ))
     assert result == {"status": "done"}, f"got {result}"
-    extract.assert_not_awaited()
+    extract.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1061,7 +1073,7 @@ def main():
         test_spacy_phase_skips_ner_when_entity_extraction_off,
         test_llm_phase_not_ready_when_points_absent,
         test_llm_phase_done_when_points_present,
-        test_llm_phase_skips_llm_when_kg_off,
+        test_llm_phase_runs_when_kg_off_display_only,
         test_gate_raises_when_pending_tasks,
         test_gate_passes_when_clean,
         test_gate_noop_when_not_graphrag_handler,

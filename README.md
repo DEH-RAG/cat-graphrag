@@ -136,7 +136,7 @@ Three per-agent settings drive it:
 - **`relation_definitions`** — one `TYPE: definition` per line; each key becomes an admissible relation type and is interpolated into `{relation_definitions}`.
 - **`concept_relations_prompt`** — the prompt template; the document text is appended after it. Empty falls back to the built-in default.
 
-All three feed `_concept_fingerprint` (SHA-256 over the parsed definitions + the whitespace-stripped prompt). When any of them changes, the fingerprint changes; the next ingestion recomputes concept extraction, and a save-triggered recompute re-runs it for existing documents.
+The fingerprint also includes the **agent-level LLM identity** (`<config class name>:<model>`, resolved from the agent's `llm` category) and the `enable_concept_relations` toggle, because both change what the phase produces. `enable_student_knowledge_graph` and the display-only `enable_knowledge_graph` are deliberately excluded. `_concept_fingerprint` is SHA-256 over the parsed definitions + the whitespace-stripped prompt + the LLM identity + the toggle. When any material input changes, the fingerprint changes; the next ingestion recomputes concept extraction, and a save-triggered recompute re-runs it for existing documents.
 
 Writes are **generation-versioned**: every concept node/edge is tagged with the fingerprint as its `concept_gen`, the tenant's active generation is persisted on its `Collection` node (`concept_gen_active`), and superseded generations are hidden by the retrieval gate and garbage-collected. The stale-concept GC only deletes nodes marked inactive **and** with no remaining `MENTIONS` edge, so shared spaCy-owned entities survive a generation flip.
 
@@ -170,7 +170,7 @@ Only two services are **system-level** in Cat; everything else is **per-agent**:
 | `llm` (agent LLM) | per-agent | used by concept/relation extraction |
 | `chunker` | per-agent | |
 | vector store (`Neo4jGraphRAGConfig` / `GraphRAGHandler`) | per-agent | |
-| concept definitions / relation definitions / prompt | per-agent | drive `_concept_fingerprint` |
+| concept definitions / relation definitions / prompt / `enable_concept_relations` / agent `llm` | per-agent | drive `_concept_fingerprint` |
 
 ### Optional dependency
 

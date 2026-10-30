@@ -278,14 +278,16 @@ def ingestion_phase_specs(specs, cat) -> list:
 
 
 @hook(priority=10)
-def ingestion_phase_settings_marker(phase, cat) -> Any:
+async def ingestion_phase_settings_marker(phase, cat) -> Any:
     """Material marker for the graph phases (T5).
 
     The marker IS the settings fingerprint: ``_spacy_fingerprint`` for
-    ``graph_spacy_extraction`` (spaCy models + technology terminology) and
-    ``_concept_fingerprint`` for ``graph_llm_extraction`` (concept/relation
-    definitions + prompt). EffING compares markers across runs to decide
-    staleness — no timestamps, no full settings dumps.
+    ``graph_spacy_extraction`` (spaCy models + technology terminology +
+    ``enable_entity_extraction``) and ``await _concept_fingerprint`` for
+    ``graph_llm_extraction`` (concept/relation definitions + prompt +
+    agent-level LLM identity + ``enable_concept_relations``). EffING compares
+    markers across runs to decide staleness — no timestamps, no full settings
+    dumps.
     """
     handler = _graphrag_handler(cat)
     if handler is None:
@@ -293,7 +295,7 @@ def ingestion_phase_settings_marker(phase, cat) -> Any:
     if phase == "graph_spacy_extraction":
         return handler._spacy_fingerprint()
     if phase == "graph_llm_extraction":
-        return handler._concept_fingerprint()
+        return await handler._concept_fingerprint()
     return None
 
 
@@ -443,7 +445,7 @@ async def after_vector_database_settings_update(
     if not concept_changed:
         return
 
-    new_gen = handler._concept_fingerprint()
+    new_gen = await handler._concept_fingerprint()
     active = await handler._read_concept_gen(cat.agent_key)
     if active == new_gen:
         return  # the marker already enforces this generation: no-op
