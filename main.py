@@ -138,11 +138,8 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     handler = cat.vector_memory_handler
     if not isinstance(handler, _GH):
         return
-    # Single source of truth: the handler's config (vector-DB settings), NOT the
-    # plugin settings store (which is empty unless explicitly saved — a stale
-    # default there silently disabled the whole derived-graph + LLM path, FX-1).
-    if not getattr(handler, "_enable_derived_graph", False):
-        return
+    # The document-structure graph is ALWAYS built; the retired
+    # ``enable_derived_graph`` toggle is accepted-but-ignored in saved configs.
     # The classic callback is the ONLY graph writer when the phase path is
     # inactive; when it is active the registered phases own the work, so this
     # fire-and-forget must be a NO-OP (otherwise the graph is built twice).
@@ -310,9 +307,8 @@ async def ingestion_phase_run(phase, source, completed_phases, cat):
     documented tri-state status dict:
 
     - ``{"status": "done"}`` when there is nothing to do (the active handler is
-      not ``GraphRAGHandler``, or ``_enable_derived_graph`` is off) — a
-      registered-but-inactive graph phase must NOT turn a successful ingestion
-      into an ERROR;
+      not ``GraphRAGHandler``) — a registered-but-inactive graph phase must NOT
+      turn a successful ingestion into an ERROR;
     - whatever the phase executor returns (``done`` / ``not_ready``) when the
       handler is active;
     - ``None`` for an UNKNOWN phase (fail-hard: the core maps ``None`` ->
@@ -322,8 +318,6 @@ async def ingestion_phase_run(phase, source, completed_phases, cat):
     """
     handler = _graphrag_handler(cat)
     if handler is None:
-        return {"status": "done"}
-    if not getattr(handler, "_enable_derived_graph", False):
         return {"status": "done"}
     if phase == "graph_spacy_extraction":
         return await handler.run_spacy_extraction_phase(source, cat=cat)
@@ -343,8 +337,6 @@ async def before_ingestion_status_completed(source, cat) -> None:
     """
     handler = _graphrag_handler(cat)
     if handler is None:
-        return
-    if not getattr(handler, "_enable_derived_graph", False):
         return
 
     if handler.has_pending_source_tasks(source):

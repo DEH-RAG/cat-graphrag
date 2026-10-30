@@ -142,7 +142,7 @@ Writes are **generation-versioned**: every concept node/edge is tagged with the 
 
 Toggles:
 
-- **`enable_derived_graph`** is the master switch for all graph building: when off, both ingestion paths are no-ops.
+- The document-structure graph (`:SourceFile`, `[:PART_OF]`, `[:NEXT]`, `[:HAS_SUMMARY]`) is **always built**; it is no longer toggleable. The retired `enable_derived_graph` key is still accepted in saved configs but has no effect.
 - **`enable_knowledge_graph`** and **`enable_concept_relations`** must **both** be on for the LLM concept/relation phase; with either off, that phase still completes but does no extraction. The spaCy phase independently honours `enable_entity_extraction`.
 
 ### One extraction per document (empty-pass discriminator)
@@ -265,7 +265,6 @@ The plugin exposes a `Neo4jGraphRAGConfig` settings model.
 
 | Setting | Default | Description |
 |---|---|---|
-| `enable_derived_graph` | `False` | Master switch for all graph building (classic and phase paths) |
 | `enable_knowledge_graph` | `False` | Enables the LLM knowledge-graph feature |
 | `enable_concept_relations` | `False` | Enables LLM concept/relation extraction (requires `enable_knowledge_graph`) |
 | `concept_definitions` | built-in RITA defaults | Admissible concept types, one `TYPE: definition` per line |

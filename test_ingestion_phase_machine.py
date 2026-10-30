@@ -15,16 +15,16 @@ helpers they drive (``run_spacy_extraction_phase``,
   ``graph_spacy_extraction``, ``_concept_fingerprint`` for
   ``graph_llm_extraction``, None otherwise;
 - ``ingestion_phase_run`` returns None only for unknown phases (fail-hard),
-  ``done`` when there is nothing to do (non-GraphRAG handler / derived graph
-  disabled), not_ready when the source's points are absent, and done (with
+  ``done`` when there is nothing to do (non-GraphRAG handler), not_ready when
+  the source's points are absent, and done (with
   the NER + similarity work / the LLM concept-relations step awaited) when
   the points are present; dispatch to ``run_spacy_extraction_phase`` /
   ``run_llm_extraction_phase`` is asserted directly with AsyncMocks (T7);
 - ``before_ingestion_status_completed`` raises when live background tasks
   remain for the source, and passes when the work is clean (the diary check
-  is gone: EffING owns the completed-phases diary); it is a no-op when the
-  handler is not GraphRAG or ``_enable_derived_graph`` is False, and it never
-  reaches into the core ingestion-status registry (T7);
+  is gone: EffING owns the completed-phases diary); it is a no-op only when
+  the handler is not GraphRAG, and it never reaches into the core
+  ingestion-status registry (T7);
 - ``after_rabbithole_stored_documents`` is a NO-OP when the phase path is
   active and keeps the classic ``create_derived_graph_for_source`` behavior
   otherwise;
@@ -294,7 +294,7 @@ class _FakePoint:
         self.payload = payload or {}
 
 
-def _make_handler(kg=True, cr=True, derived=True):
+def _make_handler(kg=True, cr=True):
     """Build a GraphRAGHandler with the given flags (no driver needed)."""
     from catgraphrag_phase import graphrag_handler
 
@@ -302,7 +302,6 @@ def _make_handler(kg=True, cr=True, derived=True):
         neo4j_uri="bolt://fake",
         neo4j_user="u",
         neo4j_password="p",
-        enable_derived_graph=derived,
         enable_knowledge_graph=kg,
         enable_concept_relations=cr,
     )
@@ -458,18 +457,6 @@ def test_phase_run_returns_done_when_not_graphrag_handler():
         pass
 
     cat = _FakeCat(_OtherHandler())
-    result = asyncio.run(main.ingestion_phase_run(
-        "graph_spacy_extraction", "file.pdf", _completed([]), cat
-    ))
-    assert result == {"status": "done"}, f"got {result}"
-
-
-def test_phase_run_returns_done_when_derived_graph_disabled():
-    """B1: derived graph off -> nothing to do -> done (never None/ERROR)."""
-    from catgraphrag_phase import main
-
-    handler = _make_handler(derived=False)
-    cat = _FakeCat(handler)
     result = asyncio.run(main.ingestion_phase_run(
         "graph_spacy_extraction", "file.pdf", _completed([]), cat
     ))
@@ -693,19 +680,6 @@ def test_gate_raises_when_has_pending_source_tasks_true():
             raise AssertionError("expected RuntimeError when has_pending_source_tasks is True")
         except RuntimeError as e:
             assert "Pending background graph tasks" in str(e)
-
-
-def test_gate_noop_when_derived_graph_disabled():
-    """T7: with _enable_derived_graph False the gate must not even probe the
-    pending-task state (no graph work is owned by this plugin)."""
-    from catgraphrag_phase import main
-
-    handler = _make_handler(derived=False)
-    cat = _FakeCat(handler)
-    with patch.object(type(handler), "has_pending_source_tasks",
-                      new=Mock(return_value=True)) as pending:
-        asyncio.run(main.before_ingestion_status_completed("file.pdf", cat))
-        pending.assert_not_called()
 
 
 def test_gate_does_not_import_core_registry():
@@ -1080,7 +1054,6 @@ def main():
         test_marker_returns_none_when_not_graphrag_handler,
         test_phase_run_returns_none_for_unknown_phase,
         test_phase_run_returns_done_when_not_graphrag_handler,
-        test_phase_run_returns_done_when_derived_graph_disabled,
         test_phase_run_dispatches_spacy_to_run_spacy_extraction_phase,
         test_phase_run_dispatches_llm_to_run_llm_extraction_phase,
         test_spacy_phase_not_ready_when_points_absent,
@@ -1093,7 +1066,6 @@ def main():
         test_gate_passes_when_clean,
         test_gate_noop_when_not_graphrag_handler,
         test_gate_raises_when_has_pending_source_tasks_true,
-        test_gate_noop_when_derived_graph_disabled,
         test_gate_does_not_import_core_registry,
         test_rabbithole_hook_noop_when_phase_path_active,
         test_rabbithole_hook_keeps_classic_path_when_effing_absent,

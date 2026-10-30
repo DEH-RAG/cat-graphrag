@@ -11,7 +11,7 @@ from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
 from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
-from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
+from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings
 from cat.services.memory.models import (
     DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
 )
@@ -122,7 +122,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
-        enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
         concept_relations_prompt: str | None = None,
         concept_definitions: str | None = None,
@@ -149,7 +148,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_retrieval_depth=graph_retrieval_depth
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
-        self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
@@ -224,7 +222,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             "graph_retrieval_depth": self._graph_retrieval_depth,
             "graph_decay_factor": self._graph_decay_factor,
             "connection_pool_size": self._connection_pool_size,
-            "enable_derived_graph": self._enable_derived_graph,
         }
 
     def _is_valid_vector(self, vector: List[float]) -> bool:
@@ -1163,7 +1160,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return [r["name"] for r in records]
 
     async def save_dump(self, collection_name: str, folder: str = "dormouse/"):
-        log.info(f"Save dump not implemented, use neo4j-admin dump")
+        log.info("Save dump not implemented, use neo4j-admin dump")
         pass
 
     # ========== POINT METHODS ==========
@@ -1238,15 +1235,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # The embedding property is set ONLY when the vector is valid: a node
         # stored without `embedding_{gen}` is skipped by the vector index but
         # stays reachable via the graph (entity/relation recall, keywords).
-        create_query = f"""
-        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
-        CREATE (d:Document {{
+        create_query = """
+        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
+        CREATE (d:Document {
             id: $id,
             content: $content,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
-        }})
+        })
         CREATE (d)-[:BELONGS_TO]->(c)
         RETURN d.id AS id
         """
@@ -2245,7 +2242,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # LLM concept-relation extraction) follows the SAME pass discriminator:
         # skipped only when the whole batch is the empty-vector staging pass.
         batch_is_staging = bool(points) and all(staging_flags)
-        if self._enable_derived_graph and not batch_is_staging:
+        if not batch_is_staging:
             sources: Dict[str, List[PointStruct]] = {}
             for p in points:
                 meta = (p.payload or {}).get("metadata", {}) or {}
@@ -2973,10 +2970,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         profiles gracefully — only creates structure that the available metadata
         supports.
 
-        Always created (require only source; chunk_index is used when present,
-        otherwise derived from the arrival order of the points):
+        Always created (require only source; ordering uses start_index when the
+        chunker provides it, falling back to chunk_index, and finally to the
+        arrival order of the points):
           - :SourceFile node + [:PART_OF] from each document
-          - [:NEXT] edges between consecutive chunks (ordered by chunk_index)
+          - [:NEXT] edges between consecutive chunks (ordered by start_index,
+            then chunk_index)
 
         Created when chunker provides rich metadata:
           - :Section / :Paragraph labels on documents with chunk_level
@@ -3004,6 +3003,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 regular_points.append({
                     "id": p.id,
                     "chunk_index": ci,
+                    "start_index": meta.get("start_index"),
                     "chunk_level": meta.get("chunk_level"),
                     "parent_id": meta.get("parent_id"),
                     "has_formula": meta.get("has_formula", False),
@@ -3022,6 +3022,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 regular_points.append({
                     "id": p.id,
                     "chunk_index": len(regular_points),
+                    "start_index": meta.get("start_index"),
                     "chunk_level": meta.get("chunk_level"),
                     "parent_id": meta.get("parent_id"),
                     "has_formula": meta.get("has_formula", False),
@@ -3029,7 +3030,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if not regular_points:
                 return
 
-        regular_points.sort(key=lambda x: x["chunk_index"])
+        regular_points.sort(
+            key=lambda x: x["start_index"]
+            if x.get("start_index") is not None
+            else x["chunk_index"]
+        )
         point_ids = [rp["id"] for rp in regular_points]
 
         async with self._get_session() as session:
@@ -4211,10 +4216,6 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     graph_retrieval_depth: int = Field(default=2, description="Max depth for graph traversal", ge=1, le=5)
     graph_decay_factor: float = Field(default=0.8, description="Score decay factor per hop", ge=0.5, le=1.0)
 
-    enable_derived_graph: bool = Field(
-        default=False,
-        description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
-    )
     enable_concept_relations: bool = Field(
         default=False,
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
@@ -4267,8 +4268,14 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
 
     @classmethod
     def parse_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
-        # Merge stored config with model defaults so new fields (e.g.
-        # enable_derived_graph) appear in existing saved configs.
+        # ``enable_derived_graph`` is a RETIRED toggle: the document-structure
+        # graph (SourceFile/PART_OF/NEXT/HAS_SUMMARY) is now always built. The
+        # key may still be present in a saved config, so accept and IGNORE it
+        # (drop it before validation) — it has no effect on any path.
+        config = dict(config)
+        config.pop("enable_derived_graph", None)
+        # Merge stored config with model defaults so new fields appear in
+        # existing saved configs.
         config = super().parse_config(config)
         return cls(**config).model_dump()
 
