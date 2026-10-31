@@ -313,14 +313,36 @@ def _resolve_plugin_id() -> str | None:
     return None
 
 
+async def _agent_uses_graphrag_handler(agent_id: str) -> bool:
+    """Read-only: is the agent's saved vector DB the GraphRAG one?
+
+    Mirrors ``_bootstrap_agent``'s ``isinstance`` check WITHOUT bootstrapping
+    the agent (the dry-run plan must not create a ``CheshireCat``). The saved
+    ``vector_database`` setting names the active handler class; GraphRAG is
+    ``Neo4jGraphRAGConfig``. Returns False on any read error (fail-safe: the
+    graph op is then reported as ``handler-not-graphrag``).
+    """
+    from cat.db.cruds import settings as crud_settings
+
+    try:
+        entry = await crud_settings.get_settings_by_category(
+            agent_id, "vector_database"
+        )
+    except Exception:  # noqa: BLE001 - a read error must not crash the plan
+        return False
+    return (entry or {}).get("name") == "Neo4jGraphRAGConfig"
+
+
 async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
     """Build the per-agent ops plan.
 
     ``--agent <id>`` validates the id against the live agent list (aborts
-    with exit 2 when unknown); ``--all`` expands to every agent minus
-    ``system``. When ``--graph`` is requested, the agent set is intersected
-    with the agents that have the GraphRAG plugin active; the others get a
-    ``skip_reason="plugin-not-active"`` entry.
+    with exit 2 when unknown);     ``--all`` expands to every agent minus
+    ``system``. When ``--graph`` is the ONLY requested op, an agent is
+    skipped with ``skip_reason="plugin-not-active"`` (plugin off) or
+    ``skip_reason="handler-not-graphrag"`` (plugin on, vector backend not
+    GraphRAG). With a mixed plan the engine ops still run, so the graph op is
+    skipped per-op in ``_run_agent`` instead.
     """
     agents = await _list_agents()
 
@@ -345,6 +367,11 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
 
         active = set(await crud_plugins.get_agents_plugin_keys(plugin_id))
 
+    # A whole-agent plan-level skip is only correct when EVERY requested op is
+    # graph-level. With a mixed plan (e.g. --reingest --graph) the engine op
+    # must still run, so the graph op is skipped per-op in _run_agent instead.
+    graph_ops_only = args.ops == ["graph"]
+
     plan: list[_PlanEntry] = []
     for agent_id in agent_ids:
         entry: _PlanEntry = {
@@ -352,8 +379,12 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
             "ops": list(args.ops),
             "collection": args.collection,
         }
-        if "graph" in args.ops and agent_id not in active:
+        if graph_ops_only and agent_id not in active:
             entry["skip_reason"] = "plugin-not-active"
+        elif graph_ops_only and not await _agent_uses_graphrag_handler(agent_id):
+            # GraphRAG plugin loaded but the agent's vector backend is not the
+            # GraphRAG handler (e.g. Qdrant): the graph op cannot run.
+            entry["skip_reason"] = "handler-not-graphrag"
         plan.append(entry)
     return plan
 
@@ -431,8 +462,11 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
     vector-db setting entry.
 
     Returns ``(ccat, handler, None)`` on success, or
-    ``(ccat, None, "handler-not-graphrag")`` when the agent's vector memory
-    handler is not a ``GraphRAGHandler``.
+    ``(ccat, None, "handler-not-graphrag")`` when the agent's vector
+    memory handler is not a ``GraphRAGHandler``. That reason only gates the
+    GRAPH-level ops (``--graph``); the ENGINE-level ops (``--reembed`` /
+    ``--reingest``) run anyway and resolve the vector handler from ``ccat``
+    themselves when ``handler`` is None.
     """
     from cat.looking_glass.cheshire_cat import CheshireCat
 
@@ -625,9 +659,11 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     doc + no points → ``PHASE_PARSING_CHUNKING`` (clean re-parse, Metis #9).
     Deleting the status doc ALONE would leave the source's points in place and
     silently chunk-reuse (``PHASE_EMBEDDING``) — so the points MUST be deleted
-    FIRST, per source, via ``handler.delete_tenant_points(str(collection),
-    metadata={"source": name})`` (which also triggers the provenance-cascade
-    graph cleanup), and only THEN the status doc. URL sources are passed
+    FIRST, per source, via the active vector handler's
+    ``delete_tenant_points(str(collection), metadata={"source": name})`` (which
+    also triggers the provenance-cascade graph cleanup), and only THEN the
+    status doc. ``handler`` may be None (non-GraphRAG agent): the live vector
+    handler is resolved from ``ccat`` in that case. URL sources are passed
     through as-is: the engine re-downloads them (the ``content=None`` path in
     ``_source_from_entry``), so their points are NOT deleted by source name —
     each pass-through is logged (``detail=url-pass-through``).
@@ -641,6 +677,13 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     from cat.utils import is_url
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+
+    # The points-first wipe only needs the active VECTOR handler's
+    # delete_tenant_points, which every vector backend exposes. ``handler`` is
+    # the GraphRAG handler only for GraphRAG agents; for any other backend the
+    # caller passes None, so resolve the live vector handler here. The graph
+    # phases themselves are engine-level and no-op when GraphRAG is inactive.
+    vector_handler = handler if handler is not None else ccat.vector_memory_handler
 
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
@@ -665,7 +708,7 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
                 f"detail=url-pass-through source={source.name}"
             )
             continue
-        await handler.delete_tenant_points(
+        await vector_handler.delete_tenant_points(
             str(collection), metadata={"source": source.name}
         )
         await delete_status(agent_id, "agent", source.name)
@@ -934,20 +977,26 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     #23) and then run the embedding phase via ``_op_reembed`` / the points-
     first wipe + clean re-parse via ``_op_reingest``; ``--graph`` runs Part A
     (fixed graph wipe-then-rebuild, ``_op_graph_part_a``) then Part B (LLM
-    concept relations with the latest-wins flip, ``_op_graph_part_b``). Skip
-    reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
-    ``graphrag-not-enabled`` (the ``--graph`` op requires the
-    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
+    concept relations with the latest-wins flip, ``_op_graph_part_b``).
+
+    The skip reason from ``_bootstrap_agent`` only gates the GRAPH ops:
+    ``handler-not-graphrag`` (no GraphRAG handler) skips ``--graph`` but NOT
+    ``--reembed`` / ``--reingest``, whose phases are engine-level and no-op
+    their graph steps via ``ingestion_phase_run`` (returns ``done`` when the
+    active handler is not GraphRAG). ``graphrag-not-enabled`` (the ``--graph``
+    op requires the ``Neo4jGraphRAGConfig`` setting with
+    ``enable_concept_relations``) likewise skips only ``--graph``.
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
-    if reason is not None:
-        for op in ops:
-            print(f"[maintenance] agent={agent_id} op={op} result=skip reason={reason}")
-        return True
 
     ok = True
     for op in ops:
+        if op == "graph" and reason is not None:
+            print(
+                f"[maintenance] agent={agent_id} op={op} result=skip reason={reason}"
+            )
+            continue
         if op == "graph" and not (
             getattr(handler, "_graphrag_detected", False)
             and getattr(handler, "_concept_relations_enabled", False)
