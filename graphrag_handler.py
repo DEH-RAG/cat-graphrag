@@ -2899,6 +2899,59 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             record = await result.single()
             return record["count"] if record else 0
 
+    async def count_source_chunk_points(
+        self, collection_name: str, source: str, chat_id: str | None = None
+    ) -> int:
+        """Count the stored CHUNK points of ONE source (catalogue cards excluded).
+
+        This is the store-grounded freshness probe: the completed-phases diary
+        is bookkeeping, not proof the points still exist, so a wipe that leaves
+        the diary intact must be detectable. It is ONE bounded query per source
+        (``LIMIT 1`` before the count), never a per-chunk query.
+
+        The catalogue card and its segments carry ``is_catalogue_card: true``
+        and are NOT chunks: a source whose only stored point is a card must
+        read as EMPTY, otherwise a wiped source with an intact diary would look
+        populated and its embed phase would never re-run.
+
+        Args:
+            collection_name: The vector collection (e.g. ``"declarative"``).
+            source: The source file name / URL.
+            chat_id: The conversation scope, or None for the agent KB. When
+                set, only points of that conversation are counted.
+
+        Returns:
+            The number of matching chunk points (0 when none).
+        """
+        await self._ensure_connected()
+
+        where_clauses = [
+            "d.tenant_id = $tenant_id",
+            "c.name = $collection_name",
+            "d.metadata CONTAINS $source_frag",
+            "NOT d.metadata CONTAINS $card_frag",
+        ]
+        params: Dict = {
+            "tenant_id": self.agent_id,
+            "collection_name": collection_name,
+            "source_frag": f'"source": {json.dumps(source)}',
+            "card_frag": '"is_catalogue_card": true',
+        }
+        if chat_id:
+            where_clauses.append("d.metadata CONTAINS $chat_frag")
+            params["chat_frag"] = f'"chat_id": {json.dumps(chat_id)}'
+
+        query = f"""
+        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})<-[:BELONGS_TO]-(d:Document)
+        WHERE {' AND '.join(where_clauses)}
+        WITH d LIMIT 1
+        RETURN count(d) AS count
+        """
+        async with self._get_session() as session:
+            result = await session.run(cast(LiteralString, query), **params)
+            record = await result.single()
+            return record["count"] if record else 0
+
     # ========== SEARCH METHODS ==========
 
     @ensure_version
