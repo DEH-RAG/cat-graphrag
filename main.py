@@ -329,6 +329,30 @@ async def ingestion_phase_run(phase, source, completed_phases, cat):
 
 
 @hook(priority=10)
+async def ingestion_phase_purge(phase, source, cat) -> Any:
+    """Purge the graph artifacts derived from ``source`` (phase purge hook).
+
+    EffING calls this before re-running an abandoned (expired-lease) graph
+    phase. Only the graph-derived entities/relations/provenance of THIS source
+    are removed (``GraphRAGHandler.purge_source_graph_artifacts``); chunk
+    Documents and every other source are untouched. Both graph phases derive
+    from the same graph, so either phase's purge removes the source's graph
+    artifacts (the re-run rebuilds them).
+
+    Returns ``None`` for non-graph phases (hook abstention) and a truthy
+    status dict otherwise. When GraphRAG is not the active handler there is
+    nothing to purge: ``{"status": "done"}``.
+    """
+    if phase not in ("graph_spacy_extraction", "graph_llm_extraction"):
+        return None
+    handler = _graphrag_handler(cat)
+    if handler is None:
+        return {"status": "done"}
+    await handler.purge_source_graph_artifacts(source)
+    return {"status": "done"}
+
+
+@hook(priority=10)
 async def before_ingestion_status_completed(source, cat) -> None:
     """Completion gate (T5): fail-hard when graph work is still pending.
 

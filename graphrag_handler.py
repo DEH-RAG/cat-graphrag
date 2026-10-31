@@ -2356,6 +2356,95 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    async def purge_source_graph_artifacts(self, source: str) -> int:
+        """Delete the graph artifacts ONE source contributed to this tenant.
+
+        Source-scoped phase purge used by the EffING ``ingestion_phase_purge``
+        hook before an abandoned graph phase is re-run. It removes ONLY what
+        the graph phases derived from ``source`` and leaves:
+          - the chunk Documents themselves (owned by parsing/embedding),
+          - entities/relations still referenced by OTHER sources,
+          - every other tenant's data.
+
+        Steps (all tenant-filtered):
+          1. delete PROVENANCE / MENTIONS edges from this source's Documents;
+          2. delete SIMILAR_TO_* edges touching this source's Documents;
+          3. strip ``source`` from RELATED_TO ``source_files`` and drop edges
+             that existed only because of it;
+          4. prune entities left with no PROVENANCE and no MENTIONS;
+          5. drop the source's SourceFile node.
+
+        Returns the number of Document nodes that belonged to the source (0 is
+        a valid "nothing was derived" result, not an error).
+        """
+        await self._ensure_connected()
+        tenant_id = self.agent_id
+        meta_fragment = f'"source": {json.dumps(source)}'
+        async with self._get_session() as session:
+            result = await session.run(
+                """
+                MATCH (d:Document {tenant_id: $tenant_id})
+                WHERE d.metadata CONTAINS $meta
+                RETURN count(d) AS count
+                """,
+                tenant_id=tenant_id,
+                meta=meta_fragment,
+            )
+            record = await result.single()
+            doc_count = (record["count"] if record else 0) or 0
+
+            await session.run(
+                """
+                MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
+                WHERE d.metadata CONTAINS $meta
+                  AND type(r) IN ['PROVENANCE', 'MENTIONS']
+                DELETE r
+                """,
+                tenant_id=tenant_id,
+                meta=meta_fragment,
+            )
+            await session.run(
+                """
+                MATCH (d:Document {tenant_id: $tenant_id})-[r]-(:Document {tenant_id: $tenant_id})
+                WHERE d.metadata CONTAINS $meta AND type(r) STARTS WITH 'SIMILAR_TO'
+                DELETE r
+                """,
+                tenant_id=tenant_id,
+                meta=meta_fragment,
+            )
+            await session.run(
+                """
+                MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+                WHERE r.source_files IS NOT NULL AND $source IN r.source_files
+                SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                WITH r WHERE size(r.source_files) = 0
+                DELETE r
+                """,
+                tenant_id=tenant_id,
+                source=source,
+            )
+            await session.run(
+                """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE NOT (e)<-[:PROVENANCE]-() AND NOT (e)<-[:MENTIONS]-()
+                DETACH DELETE e
+                """,
+                tenant_id=tenant_id,
+            )
+            await session.run(
+                """
+                MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                DETACH DELETE sf
+                """,
+                tenant_id=tenant_id,
+                source=source,
+            )
+        log.info(
+            f"[GraphRAG] Purged graph artifacts for source '{source}' "
+            f"({doc_count} document(s), tenant {tenant_id})"
+        )
+        return doc_count
+
     async def delete_tenant_points_by_ids(self, collection_name: str, points_ids: List) -> UpdateResult:
         await self._ensure_connected()
 
