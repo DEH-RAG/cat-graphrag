@@ -353,7 +353,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     # key does not exist") that Neo4j emits on a fresh database before any
                     # schema elements have been written.  These are harmless — queries that
                     # match nothing simply return zero rows — but pollute the log on startup.
-                    notifications_disabled_categories=["UNRECOGNIZED"],
+                    notifications_disabled_classifications=["UNRECOGNIZED"],
                     **self._neo4j_kwargs,
                 )
                 assert isinstance(self._driver, AsyncDriver)
