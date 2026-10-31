@@ -58,6 +58,58 @@ from typing import Any, NoReturn, NotRequired, TypedDict
 _EFFING_MODULE = "cat.core_plugins.cat_efficient_ingestion"
 
 
+# Per-agent maintenance marker shared with the EffING resume sweep. The sweep
+# skips an agent while this marker is present, so the CLI and the periodic
+# app sweep never process the same agent's sources concurrently. Written
+# through ``cat.db.crud`` (never a raw Redis client). A generous TTL makes a
+# crashed CLI fail safe: the marker expires on its own and the sweep resumes.
+_MAINTENANCE_MARKER_TTL_SECONDS = 2 * 60 * 60
+
+
+def _maintenance_marker_key(agent_id: str) -> str:
+    """Redis key of the CLI maintenance marker for one agent."""
+    return f"agents:{agent_id}:ingestion:maintenance"
+
+
+async def _set_maintenance_marker(agent_id: str) -> None:
+    """Write/refresh the per-agent maintenance marker with a 2h TTL.
+
+    Best-effort: a marker write failure is reported but never aborts the
+    maintenance op (the TTL then simply is not renewed).
+    """
+    from cat.db import crud
+    from cat.db.models import generate_timestamp
+
+    try:
+        await crud.store(
+            _maintenance_marker_key(agent_id),
+            {"owner": "maintenance", "started_at": generate_timestamp()},
+            expire=_MAINTENANCE_MARKER_TTL_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - coordination is best-effort
+        print(
+            f"[maintenance] agent={agent_id} result=warn "
+            f"detail=maintenance-marker-write-failed error={exc}"
+        )
+
+
+async def _clear_maintenance_marker(agent_id: str) -> None:
+    """Delete the per-agent maintenance marker (also on failure).
+
+    A failed delete is only logged: the marker's TTL guarantees it cannot
+    block the resume sweep forever.
+    """
+    from cat.db import crud
+
+    try:
+        await crud.delete(_maintenance_marker_key(agent_id))
+    except Exception as exc:  # noqa: BLE001 - TTL is the fail-safe
+        print(
+            f"[maintenance] agent={agent_id} result=warn "
+            f"detail=maintenance-marker-delete-failed error={exc}"
+        )
+
+
 def _abort_missing_effing(exc: ImportError) -> NoReturn:
     """Report the absent EffING dependency and abort (exit code 2, no traceback).
 
@@ -610,6 +662,9 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
 
     # Metis #9: no doc + points exist → PHASE_EMBEDDING (chunk reuse).
     for source in sources:
+        # Refresh the maintenance marker per source: a long run must stay
+        # protected even if it outlives the initial TTL.
+        await _set_maintenance_marker(agent_id)
         await delete_status(agent_id, "agent", source.name)
 
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
@@ -702,6 +757,8 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     # Metis #9 points-first: delete the source's points, THEN the status doc,
     # so reembed_sources sees no doc + no points → PHASE_PARSING_CHUNKING.
     for source in sources:
+        # Refresh the maintenance marker per source (long runs outlive the TTL).
+        await _set_maintenance_marker(agent_id)
         if is_url(source.name):
             print(
                 f"[maintenance] agent={agent_id} op=reingest result=warn "
@@ -1198,6 +1255,10 @@ async def main() -> None:
         # Sequential per-agent execution (Metis #18): agents are processed one
         # at a time, so no two ops ever run concurrently on the same agent.
         print(f"[maintenance] agent={entry['agent_id']} progress=start")
+        # Coordinate with the EffING periodic sweep: while this marker exists
+        # the sweep skips the agent, so it can never steal/retry the rows this
+        # CLI is processing. Deleted at the end, on success AND on failure.
+        await _set_maintenance_marker(entry["agent_id"])
         try:
             ok = await _run_agent(
                 entry["agent_id"], entry["ops"], entry["collection"]
@@ -1205,6 +1266,8 @@ async def main() -> None:
         except Exception as exc:  # noqa: BLE001 - per-agent isolation
             print(f"[maintenance] agent={entry['agent_id']} result=fail detail={exc}")
             ok = False
+        finally:
+            await _clear_maintenance_marker(entry["agent_id"])
         print(f"[maintenance] agent={entry['agent_id']} progress=done")
         results.append(ok)
 

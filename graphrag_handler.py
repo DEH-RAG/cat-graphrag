@@ -1173,6 +1173,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         metadata: Dict = None,
         id_point: str | None = None,
         skip_graph: bool = False,
+        point_index: int | None = None,
         **kwargs,
     ) -> PointStruct | None:
         """
@@ -1205,9 +1206,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # backfill phase set the vector later.
         vector_valid = self._is_valid_vector(vector_list)
         if not vector_valid:
+            # The chunk is intentionally kept (graph reachability), but a
+            # source whose chunks ALL have zero/non-finite vectors must stay
+            # visible: log the source, the chunk index/id and a running counter
+            # (dense stores drop these points silently).
+            source = (metadata or {}).get("source")
+            self._zero_norm_dropped = getattr(self, "_zero_norm_dropped", 0) + 1
             log.warning(
                 f"[GraphRAG] Storing point {point_id} WITHOUT embedding: "
-                "embedding vector has zero or non-finite L2-norm. The embedder may "
+                "embedding vector has zero or non-finite L2-norm. "
+                f"source={source!r} chunk_index={point_index} "
+                f"zero_norm_dropped={self._zero_norm_dropped}. The embedder may "
                 "have returned a fallback zero tensor (e.g. empty input, cold-start "
                 "failure, or unreachable model). The chunk is kept (graph relations "
                 "still find it) and the embedding can be backfilled later."
@@ -2229,7 +2238,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
             staging_flags.append(staging_cache[key])
 
-        for point, is_staging in zip(points, staging_flags):
+        for index, (point, is_staging) in enumerate(zip(points, staging_flags)):
             await self.add_point_to_tenant(
                 collection_name,
                 point.payload.get("page_content", ""),  # type: ignore[arg-type]
@@ -2237,6 +2246,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 point.payload.get("metadata", {}),  # type: ignore[arg-type]
                 str(point.id),
                 skip_graph=is_staging,
+                point_index=index,
             )
 
         # Derived graph (SourceFile / NEXT / Section / ... and, in step 8, the

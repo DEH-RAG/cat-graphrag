@@ -423,6 +423,22 @@ A few things are worth knowing before production use:
 | `tests/` | Standalone, import-safe behavioral harnesses (run as scripts) |
 | `scripts/` | `maintenance_agent.py` and `cleanup_null_vectors.py` utilities |
 
+### Maintenance CLI coordination
+
+Before each per-agent run `maintenance_agent.py` writes
+`agents:<agent_id>:ingestion:maintenance` (`{"owner": "maintenance",
+"started_at": ...}`, TTL 2h, refreshed per source) through `cat.db.crud`, and
+deletes it in a `finally` (success or failure). While the marker exists the
+EffING periodic sweep skips that agent, so the app never steals/retries rows
+the CLI is rebuilding. A crashed CLI's marker expires by TTL; a failed delete
+never blocks the sweep forever.
+
+Run the coordination harness as a plain script (it is import-safe, no Redis):
+
+```bash
+uv run python test_ingestion_safety_fixes.py
+```
+
 ---
 
 ## Best fit use cases
