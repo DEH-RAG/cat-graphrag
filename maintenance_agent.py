@@ -492,22 +492,42 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
 async def _resolve_ingestion_engine(ccat, op: str = "reembed") -> str | None:
     """Resolve the active ingestion engine; refuse anything but the efficient one.
 
-    Reads the ``ingestion`` settings category (the saved config name) and
-    resolves it against the allowed classes via ``cat.services.factory.ingestion``
-    (``resolved_config_name``: saved entry, else first plugin class, else the
-    base). Only the efficient engine (``EfficientIngestionConfiguration`` /
-    ``EfficientIngestionEngine``) is supported by ``--reembed``/``--reingest``:
-    the base engine's re-embed path (``embed_all_in_cheshire_cats``) is
-    destructive and out of scope, so it is refused with a message naming the
-    active engine (Metis #23).
+    Mirrors ``main.py``: the current core does not expose
+    ``resolved_config_name``; when a host provides it the saved entry is
+    resolved against the allowed classes via
+    ``cat.services.factory.ingestion``, otherwise the same SYSTEM-level
+    ``ingestion`` category entry (``DEFAULT_SYSTEM_KEY``) is read directly, so
+    both paths return the same value. Only the efficient engine
+    (``EfficientIngestionConfiguration`` / ``EfficientIngestionEngine``) is
+    supported by ``--reembed``/``--reingest``: the base engine's re-embed path
+    (``embed_all_in_cheshire_cats``) is destructive and out of scope, so it is
+    refused with a message naming the active engine (Metis #23).
 
     Returns the active config name when the efficient engine is active, else
     None (the caller marks the op failed → exit 1).
     """
-    from cat.services.factory.ingestion import resolved_config_name
+    from cat.log import log
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
-    name = await resolved_config_name(ccat)
+
+    try:
+        from cat.services.factory.ingestion import resolved_config_name
+    except ImportError:
+        resolved_config_name = None
+
+    if resolved_config_name is not None:
+        log.debug("[maintenance] ingestion engine resolved via resolved_config_name")
+        name = await resolved_config_name(ccat)
+    else:
+        from cat.db.cruds import settings as crud_settings
+        from cat.db.database import DEFAULT_SYSTEM_KEY
+
+        log.debug("[maintenance] ingestion engine resolved via system settings fallback")
+        saved = await crud_settings.get_settings_by_category(
+            DEFAULT_SYSTEM_KEY, "ingestion"
+        )
+        name = (saved or {}).get("name")
+
     if name != "EfficientIngestionConfiguration":
         print(
             f"[maintenance] agent={agent_id} op={op} result=fail "

@@ -183,10 +183,11 @@ async def _resolved_system_ingestion_config_name(cat) -> "str | None":
 
     The ``ingestion`` category is one of the two system-level services (the
     other is ``embedder``), so its selection is read against
-    ``DEFAULT_SYSTEM_KEY`` — never the agent key. ``resolved_config_name`` is
-    the canonical resolver (signature: ``resolved_config_name(lizard) -> str``);
-    a host that predates it is handled by reading the same single system-level
-    category entry directly, so both paths return the same value.
+    ``DEFAULT_SYSTEM_KEY`` — never the agent key. The current core does not
+    expose ``resolved_config_name``; when a host provides it (signature
+    ``resolved_config_name(lizard) -> str``) it is used, otherwise the same
+    single system-level ``ingestion`` category entry is read directly. Both
+    paths return the same value.
     """
     try:
         from cat.services.factory.ingestion import resolved_config_name
