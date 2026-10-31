@@ -4038,11 +4038,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             SET t.metadata = $t_metadata
                             MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                             SET r.concept_gen = CASE WHEN $r_gen IS NOT NULL THEN $r_gen ELSE r.concept_gen END
-                            # Idempotent weight: re-running the graph phase for the
-                            # same source+gen must not mutate the edge. The old
-                            # `+ 0.5` accumulated on every re-run; the weight is
-                            # write-only (never read by recall), so first-write
-                            # behavior (1.0) is preserved and re-runs are no-ops.
+                            // Idempotent weight: re-running the graph phase for the
+                            // same source+gen must not mutate the edge. The old
+                            // `+ 0.5` accumulated on every re-run; the weight is
+                            // write-only (never read by recall), so first-write
+                            // behavior (1.0) is preserved and re-runs are no-ops.
                             SET r.weight = coalesce(r.weight, 1.0)
                             SET r.text = $rel_text
                             SET r.source_files = CASE
