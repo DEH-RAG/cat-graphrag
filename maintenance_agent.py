@@ -138,6 +138,7 @@ def _abort_missing_effing(exc: ImportError) -> NoReturn:
 _DESTRUCTIVE_STEPS: dict[str, list[str]] = {
     "reingest": [
         "delete_tenant_points per source (points-first wipe)",
+        "clear_completed_phases per source (drop the lying diary)",
         "delete_status per source",
         "reembed_sources re-ingest (re-parse + re-embed)",
     ],
@@ -716,16 +717,23 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     silently chunk-reuse (``PHASE_EMBEDDING``) — so the points MUST be deleted
     FIRST, per source, via the active vector handler's
     ``delete_tenant_points(str(collection), metadata={"source": name})`` (which
-    also triggers the provenance-cascade graph cleanup), and only THEN the
-    status doc. ``handler`` may be None (non-GraphRAG agent): the live vector
-    handler is resolved from ``ccat`` in that case. URL sources are passed
-    through as-is: the engine re-downloads them (the ``content=None`` path in
-    ``_source_from_entry``), so their points are NOT deleted by source name —
-    each pass-through is logged (``detail=url-pass-through``).
+    also triggers the provenance-cascade graph cleanup), THEN clear the
+    completed-phases diary (``clear_completed_phases``), and only THEN the
+    status doc. The diary is bookkeeping, not proof the points exist: clearing
+    it before ``delete_status`` guarantees the phases re-run even if the status
+    row survives a failed delete. ``handler`` may be None (non-GraphRAG agent):
+    the live vector handler is resolved from ``ccat`` in that case. URL sources
+    are passed through as-is: the engine re-downloads them (the
+    ``content=None`` path in ``_source_from_entry``), so their points are NOT
+    deleted by source name — each pass-through is logged
+    (``detail=url-pass-through``).
     """
     try:
         from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
-        from cat.core_plugins.cat_efficient_ingestion.registry import delete_status
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            clear_completed_phases,
+            delete_status,
+        )
     except ImportError as exc:
         _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
@@ -768,6 +776,12 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
         await vector_handler.delete_tenant_points(
             str(collection), metadata={"source": source.name}
         )
+        # The points are gone: the completed-phases diary MUST go too, or the
+        # phases look fresh against the intact diary and never re-run (the
+        # source would keep 0 chunk points and ``catalog_cards`` would fail
+        # forever). Clear it BEFORE delete_status so a failing delete_status
+        # cannot leave a lying diary next to wiped points.
+        await clear_completed_phases(agent_id, "agent", source.name)
         await delete_status(agent_id, "agent", source.name)
 
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
