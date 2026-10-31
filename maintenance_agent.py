@@ -582,6 +582,42 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     return True
 
 
+async def _preflight_reembed_path(ccat) -> str | None:
+    """Return why the re-embed path cannot rebuild, or None when it can.
+
+    Runs BEFORE any destructive wipe: ``_op_reingest`` deletes the source
+    points first, so a parse/embed path that cannot run must abort before
+    touching storage (incident: a ``None`` RabbitHole wiped the points and
+    then failed at ``rabbit_hole.cat = ccat``, leaving nothing to rebuild).
+    """
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.reembed import (
+            _resolve_rabbit_hole,
+        )
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+
+    try:
+        rabbit_hole = await _resolve_rabbit_hole(ccat)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return f"rabbit-hole-unavailable: {exc}"
+    if rabbit_hole is None or getattr(rabbit_hole, "cat", None) is None:
+        return "rabbit-hole-unbound"
+    if getattr(ccat, "chunker", None) is None:
+        return "chunker-unavailable"
+
+    try:
+        handlers = await ccat.file_handlers()
+        embedder = await ccat.embedder()
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return f"parsing-engine-unavailable: {exc}"
+    if not handlers:
+        return "no-file-handlers"
+    if embedder is None:
+        return "embedder-unavailable"
+    return None
+
+
 async def _op_reingest(ccat, handler, collection: str) -> bool:
     """Re-ingest from scratch: delete points per source, then re-parse + re-embed.
 
@@ -608,6 +644,17 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
 
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
+
+    # PREFLIGHT: never wipe when the re-embed path cannot rebuild. This runs
+    # before the points-first delete loop below, so a broken path aborts the
+    # agent with everything still in place.
+    preflight_reason = await _preflight_reembed_path(ccat)
+    if preflight_reason is not None:
+        print(
+            f"[maintenance] agent={agent_id} op=reingest result=fail "
+            f"detail=preflight-reembed-path-unusable reason={preflight_reason}"
+        )
+        return False
 
     # Metis #9 points-first: delete the source's points, THEN the status doc,
     # so reembed_sources sees no doc + no points → PHASE_PARSING_CHUNKING.
@@ -926,9 +973,14 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
             continue
         if op == "reingest":
             try:
-                await _op_reingest(ccat, handler, collection)
+                reingest_ok = await _op_reingest(ccat, handler, collection)
             except Exception as exc:  # noqa: BLE001 - per-op isolation
                 print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
+                ok = False
+                continue
+            if not reingest_ok:
+                # _op_reingest already logged the preflight failure; nothing
+                # was deleted, so this agent/op is a failure, not a success.
                 ok = False
                 continue
             print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reingested")
