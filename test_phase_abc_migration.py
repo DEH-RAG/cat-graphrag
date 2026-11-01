@@ -249,11 +249,32 @@ if __name__ == "__main__":
         handler._extract_concept_relations.assert_not_awaited()
         print("PASS (d) process() delegates to the existing ingestion path")
 
+    async def test_e_phase_module_owns_no_protocol_logic():
+        """The plugin must NOT re-implement the phase-ingestion protocol.
+
+        Diary writes, staleness, locks, retries and status derivation all
+        belong to EffING; the plugin only declares + executes + cleans up.
+        Guard the module source so a future edit cannot reintroduce them.
+        """
+        import inspect
+
+        source = inspect.getsource(phases)
+        forbidden = (
+            "record_phase_",
+            "should_abandon",
+            "distributed_lock",
+            "derive_source_status",
+        )
+        found = [name for name in forbidden if name in source]
+        assert not found, f"phase module re-implements protocol logic: {found}"
+        print("PASS (e) phase module contains no diary/state/lock/retry protocol")
+
     async def _main():
         await test_a_vector_only_agent_is_skipped()
         await test_b_delete_source_scoped_and_idempotent()
         await test_c_tag_follows_config_only()
         await test_d_process_delegates_to_existing_path()
+        await test_e_phase_module_owns_no_protocol_logic()
 
     try:
         asyncio.run(_main())

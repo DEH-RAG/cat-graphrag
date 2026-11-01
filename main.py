@@ -277,6 +277,15 @@ def ingestion_phase_specs(specs, cat) -> list:
     return specs
 
 
+def _phases_module():
+    """The plugin's phase module, or ``None`` when it cannot be imported."""
+    try:
+        from . import phases
+    except Exception:  # noqa: BLE001 - keep main.py import-safe
+        return None
+    return phases
+
+
 @hook(priority=10)
 def ingestion_phase_objects(cat=None) -> list:
     """Contribute the two graph phases as ``IngestionPhase`` instances.
@@ -284,91 +293,77 @@ def ingestion_phase_objects(cat=None) -> list:
     Class path (phase-contract v2): EffING merges these instances BEFORE the
     legacy ``ingestion_phase_specs`` adapters, so for the two graph ids the
     class implementation is the one exercised by the registry (``applies_to``,
-    ``delete``, ``tag``). The legacy hooks stay registered for one release as
-    the compatibility adapter and for hosts that still call them directly.
+    ``delete``, ``tag``). The legacy hooks below stay registered for one release
+    as the compatibility adapter and for hosts that still call them directly.
     Lazy import keeps ``main.py`` import-safe when the class module is
     unavailable, and returns an empty list so the legacy specs remain the
     fallback (never a crash at activation).
     """
-    try:
-        from .phases import GraphConceptPhase, GraphSpacyPhase
-    except Exception:  # noqa: BLE001 - legacy hooks remain the fallback
+    phases = _phases_module()
+    if phases is None:
         return []
-    return [GraphSpacyPhase(cat), GraphConceptPhase(cat)]
+    return [phases.GraphSpacyPhase(cat), phases.GraphConceptPhase(cat)]
 
 
 @hook(priority=10)
 async def ingestion_phase_settings_marker(phase, cat) -> Any:
-    """Material marker for the graph phases (T5).
+    """Material marker for the graph phases (thin delegate to ``tag``).
 
-    The marker IS the settings fingerprint: ``_spacy_fingerprint`` for
-    ``graph_spacy_extraction`` (spaCy models + technology terminology +
-    ``enable_entity_extraction``) and ``await _concept_fingerprint`` for
-    ``graph_llm_extraction`` (concept/relation definitions + prompt +
-    agent-level LLM identity + ``enable_concept_relations``). EffING compares
-    markers across runs to decide staleness — no timestamps, no full settings
-    dumps.
+    The marker IS the class's configuration fingerprint
+    (``_spacy_fingerprint`` / ``_concept_fingerprint``): configuration only,
+    no LLM call. Delegating to ``phases.phase_fingerprint`` keeps ONE
+    implementation shared with ``IngestionPhase.tag``.
     """
-    handler = _graphrag_handler(cat)
-    if handler is None:
+    phases = _phases_module()
+    if phases is None:
         return None
-    if phase == "graph_spacy_extraction":
-        return handler._spacy_fingerprint()
-    if phase == "graph_llm_extraction":
-        return await handler._concept_fingerprint()
-    return None
+    return await phases.phase_fingerprint(phase, cat)
 
 
 @hook(priority=10)
 async def ingestion_phase_run(phase, source, completed_phases, cat):
-    """Phase executor (T5): dispatch the two graph phases inline and awaited.
+    """Phase executor (thin delegate to ``IngestionPhase.process``).
 
-    ``graph_spacy_extraction`` -> ``run_spacy_extraction_phase`` (NER + link +
-    similarity, awaited); ``graph_llm_extraction`` ->
-    ``run_llm_extraction_phase`` (LLM concept relations). Returns the
-    documented tri-state status dict:
+    Returns the documented tri-state status dict:
 
-    - ``{"status": "done"}`` when there is nothing to do (the active handler is
-      not ``GraphRAGHandler``) — a registered-but-inactive graph phase must NOT
-      turn a successful ingestion into an ERROR;
-    - whatever the phase executor returns (``done`` / ``not_ready``) when the
+    - ``{"status": "done"}`` when there is nothing to do (the graph backend is
+      not active) — a registered-but-inactive graph phase must NOT turn a
+      successful ingestion into an ERROR;
+    - whatever the phase body returns (``done`` / ``not_ready``) when the
       handler is active;
     - ``None`` for an UNKNOWN phase (fail-hard: the core maps ``None`` ->
       status=error, so an unhandled phase never silently succeeds).
 
-    Exceptions propagate (the core maps them to status=error).
+    Exceptions propagate (the core maps them to status=error). The phase BODY
+    is ``phases.run_phase``, the same one ``process`` uses; this hook only
+    adapts the raw status dict (which carries ``retry_after``) back to EffING.
     """
-    handler = _graphrag_handler(cat)
-    if handler is None:
-        return {"status": "done"}
-    if phase == "graph_spacy_extraction":
-        return await handler.run_spacy_extraction_phase(source, cat=cat)
-    if phase == "graph_llm_extraction":
-        return await handler.run_llm_extraction_phase(source, cat=cat)
-    return None
+    phases = _phases_module()
+    if phases is None or phases.phase_for(phase, cat) is None:
+        return None
+    raw = await phases.run_phase(phase, source, cat)
+    return {"status": "done"} if raw is None else raw
 
 
 @hook(priority=10)
 async def ingestion_phase_purge(phase, source, cat) -> Any:
     """Purge the graph artifacts derived from ``source`` (phase purge hook).
 
-    EffING calls this before re-running an abandoned (expired-lease) graph
-    phase. Only the graph-derived entities/relations/provenance of THIS source
-    are removed (``GraphRAGHandler.purge_source_graph_artifacts``); chunk
-    Documents and every other source are untouched. Both graph phases derive
-    from the same graph, so either phase's purge removes the source's graph
-    artifacts (the re-run rebuilds them).
+    Thin delegate to ``IngestionPhase.delete``: only the graph-derived
+    entities/relations/provenance of THIS source are removed
+    (``GraphRAGHandler.purge_source_graph_artifacts``); chunk Documents and
+    every other source are untouched. Both graph phases derive from the same
+    graph, so either phase's purge removes the source's graph artifacts (the
+    re-run rebuilds them).
 
     Returns ``None`` for non-graph phases (hook abstention) and a truthy
     status dict otherwise. When GraphRAG is not the active handler there is
-    nothing to purge: ``{"status": "done"}``.
+    nothing to purge and ``delete`` is an idempotent no-op.
     """
-    if phase not in ("graph_spacy_extraction", "graph_llm_extraction"):
+    phases = _phases_module()
+    if phases is None or phases.phase_for(phase, cat) is None:
         return None
-    handler = _graphrag_handler(cat)
-    if handler is None:
-        return {"status": "done"}
-    await handler.purge_source_graph_artifacts(source)
+    await phases.delete_phase(phase, source, cat)
     return {"status": "done"}
 
 

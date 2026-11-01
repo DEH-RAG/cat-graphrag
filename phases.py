@@ -169,6 +169,17 @@ class _GraphPhase(IngestionPhase):
     async def _fingerprint(self, handler) -> str:
         raise NotImplementedError
 
+    async def _execute(self, handler, source: str, cat) -> Any:
+        """Delegate the phase body to the existing ingestion code."""
+        raise NotImplementedError
+
+    async def _run(self, source: str, cat) -> Any:
+        """Raw status dict of the phase body, or ``None`` when inactive."""
+        handler = graphrag_handler(cat if cat is not None else self._cat)
+        if handler is None:
+            return None
+        return await self._execute(handler, source, cat)
+
     async def tag(self, settings: Any = None) -> str:
         """Stable tag of the phase's OWN material configuration.
 
@@ -189,12 +200,13 @@ class GraphSpacyPhase(_GraphPhase):
     id = "graph_spacy_extraction"
 
     async def process(self, source: str, cat) -> PhaseResult:
-        handler = graphrag_handler(cat if cat is not None else self._cat)
-        if handler is None:
+        raw = await self._run(source, cat)
+        if raw is None:
             return PhaseResult(status="skipped", reason="graph backend inactive")
-        return _to_result(
-            self.id, await handler.run_spacy_extraction_phase(source, cat=cat)
-        )
+        return _to_result(self.id, raw)
+
+    async def _execute(self, handler, source: str, cat) -> Any:
+        return await handler.run_spacy_extraction_phase(source, cat=cat)
 
     async def _fingerprint(self, handler) -> str:
         return handler._spacy_fingerprint()
@@ -206,15 +218,55 @@ class GraphConceptPhase(_GraphPhase):
     id = "graph_llm_extraction"
 
     async def process(self, source: str, cat) -> PhaseResult:
-        handler = graphrag_handler(cat if cat is not None else self._cat)
-        if handler is None:
+        raw = await self._run(source, cat)
+        if raw is None:
             return PhaseResult(status="skipped", reason="graph backend inactive")
-        return _to_result(
-            self.id, await handler.run_llm_extraction_phase(source, cat=cat)
-        )
+        return _to_result(self.id, raw)
+
+    async def _execute(self, handler, source: str, cat) -> Any:
+        return await handler.run_llm_extraction_phase(source, cat=cat)
 
     async def _fingerprint(self, handler) -> str:
         return await handler._concept_fingerprint()
+
+
+_PHASE_CLASSES: dict[str, type[_GraphPhase]] = {
+    GraphSpacyPhase.id: GraphSpacyPhase,
+    GraphConceptPhase.id: GraphConceptPhase,
+}
+
+
+def phase_for(phase_id: str, cat=None) -> _GraphPhase | None:
+    """The phase instance for ``phase_id``, or ``None`` for an unknown id."""
+    cls = _PHASE_CLASSES.get(phase_id)
+    return None if cls is None else cls(cat)
+
+
+async def phase_fingerprint(phase_id: str, cat) -> Any:
+    """Raw configuration fingerprint for ``phase_id`` (no LLM call)."""
+    phase = phase_for(phase_id, cat)
+    if phase is None:
+        return None
+    handler = graphrag_handler(cat if cat is not None else phase._cat)
+    if handler is None:
+        return None
+    return await phase._fingerprint(handler)
+
+
+async def run_phase(phase_id: str, source: str, cat) -> Any:
+    """Run the phase body: the legacy status dict, or ``None`` when inactive."""
+    phase = phase_for(phase_id, cat)
+    if phase is None:
+        return None
+    return await phase._run(source, cat)
+
+
+async def delete_phase(phase_id: str, source: str, cat) -> None:
+    """Remove ``source``'s artifacts for ``phase_id`` (idempotent no-op if inactive)."""
+    phase = phase_for(phase_id, cat)
+    if phase is None:
+        return
+    await phase.delete(source, cat)
 
 
 __all__ = [
@@ -222,4 +274,8 @@ __all__ = [
     "GraphConceptPhase",
     "IngestionPhase",
     "PhaseResult",
+    "delete_phase",
+    "phase_fingerprint",
+    "phase_for",
+    "run_phase",
 ]
