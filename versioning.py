@@ -26,12 +26,6 @@ from typing import Any, Awaitable, Callable
 
 from cat.log import log
 
-try:
-    from neo4j.exceptions import TransientError
-except ImportError:  # pragma: no cover - standalone harnesses stub neo4j
-    class TransientError(Exception):  # type: ignore[no-redef]
-        """Fallback base for the import-safe standalone test harnesses."""
-
 # Upper bound for a single backoff sleep, independent of the attempt number.
 _MAX_RETRY_DELAY = 1.0
 
@@ -64,6 +58,11 @@ async def with_transient_retry(
     ``coro_factory`` must be a zero-argument callable returning a FRESH
     awaitable, so every attempt starts a new coroutine.
     """
+    # Lazy import: keeps this module importable by the standalone harnesses
+    # whose neo4j stub only defines ``Neo4jError`` (the helper is never called
+    # there), while production always resolves the real exception class.
+    from neo4j.exceptions import TransientError
+
     if attempts < 1:
         attempts = 1
 

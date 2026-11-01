@@ -573,6 +573,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
+            raise
 
     async def _gc_generation(self, tenant_id: str, gen: str) -> None:
         """Drop the old generation's index, SIMILAR_TO edges and embedding property.
@@ -1722,6 +1723,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
         except Exception as e:
             log.error(f"Failed to extract entities for {document_id}: {e}")
+            raise
 
     async def refresh_technology_entities(self, tenant_id: str) -> None:
         """
@@ -2233,6 +2235,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
+            raise
 
     async def add_points_to_tenant(
         self, collection_name: str, points: List[PointStruct]
@@ -4279,6 +4282,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         f"[GraphRAG] Failed to store relation "
                         f"'{rel.get('origin')} -[{rel.get('type')}]-> {rel.get('destination')}': {e}"
                     )
+                    raise
 
 
 DEFAULT_CONCEPT_DEFINITIONS = """## Concept types (assign each extracted concept exactly one type)
