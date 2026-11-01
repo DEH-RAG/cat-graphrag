@@ -30,7 +30,7 @@ from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
 from .structured_llm import StructuredLLM, StructuredLLMError
-from .versioning import ensure_version, retry_on_generation_change
+from .versioning import ensure_version, retry_on_generation_change, with_transient_retry
 
 # Last-known GraphRAG connection config per agent, captured in ``_connect``
 # whenever a handler connects. Used by the old-store cleanup on vector-memory
@@ -558,13 +558,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if not similar:
                 return
             similar.sort(key=lambda s: s["id"])
-            async with self._neo4j_write_semaphore:
-                async with self._get_session() as session:
-                    await session.run(
-                        cast(LiteralString, self._compile_query("create_similar_rel", gen)),
-                        similar=similar,
-                        point_id=point_id,
-                    )
+
+            async def _write_similar():
+                async with self._neo4j_write_semaphore:
+                    async with self._get_session() as session:
+                        await session.run(
+                            cast(LiteralString, self._compile_query("create_similar_rel", gen)),
+                            similar=similar,
+                            point_id=point_id,
+                        )
+
+            await with_transient_retry(
+                _write_similar, operation="create similarity relationships"
+            )
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
 
@@ -1700,9 +1706,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         tenant_id=self.agent_id,
                     )
 
-            async with self._neo4j_write_semaphore:
-                async with self._get_session() as session:
-                    await session.execute_write(_write_entities)
+            async def _write_all():
+                async with self._neo4j_write_semaphore:
+                    async with self._get_session() as session:
+                        await session.execute_write(_write_entities)
+
+            await with_transient_retry(
+                _write_all,
+                operation=f"extract/link entities for document {document_id}",
+            )
 
             log.debug(
                 f"Linked {len(entities_batch)} entities and {len(relations_batch)} relations "
@@ -1946,9 +1958,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 tenant_id=tenant_id,
             )
 
-        async with self._neo4j_write_semaphore:
-            async with self._get_session() as session:
-                await session.execute_write(_write_refresh)
+        async def _write_all():
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.execute_write(_write_refresh)
+
+        await with_transient_retry(
+            _write_all,
+            operation=f"refresh technology entities for tenant {tenant_id}",
+        )
 
         log.info(
             f"[GraphRAG] Refreshed Technology entities for tenant_id={tenant_id} "
@@ -2194,17 +2212,22 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             similar.sort(key=lambda s: s["id"])
 
             # Write phase — plain auto-commit session.run (no managed
-            # transaction): correctness is guaranteed by the
-            # retry_on_generation_change decorator (detect-and-rerun-once),
-            # not by driver-managed tx. The semaphore caps concurrent writers
-            # to reduce contention.
-            async with self._neo4j_write_semaphore:
-                async with self._get_session() as session:
-                    await session.run(
-                        cast(LiteralString, self._compile_query("create_similar_rel", self._generation)),
-                        similar=similar,
-                        point_id=point_id,
-                    )
+            # transaction), so transient errors (e.g. DeadlockDetected) are
+            # retried explicitly by with_transient_retry. The semaphore caps
+            # concurrent writers to reduce contention.
+            async def _write_similarity():
+                async with self._neo4j_write_semaphore:
+                    async with self._get_session() as session:
+                        await session.run(
+                            cast(LiteralString, self._compile_query("create_similar_rel", self._generation)),
+                            similar=similar,
+                            point_id=point_id,
+                        )
+
+            await with_transient_retry(
+                _write_similarity,
+                operation=f"create similarity relationships for {point_id}",
+            )
 
             log.debug(f"Created {len(similar) * 2} similarity relationships for {point_id}")
 
@@ -4080,7 +4103,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         metadata=metadata,
                     )
 
-                await session.execute_write(_write_concept)
+                await with_transient_retry(
+                    lambda: session.execute_write(_write_concept),
+                    operation=f"store concept '{c_name}' for tenant {tenant_id}",
+                )
 
             for rel in rels:
                 try:
@@ -4220,7 +4246,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             source_files=source_files,
                         )
 
-                    await session.execute_write(_write_relation)
+                    await with_transient_retry(
+                        lambda: session.execute_write(_write_relation),
+                        operation="store concept relations",
+                    )
 
                     # PROVENANCE edges from every producing document to both
                     # concept entities (concepts carry no MENTIONS edges, so
@@ -4228,8 +4257,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     # the RESOLVED endpoint id, not the raw name, so the
                     # deletion cascade always lands on the surviving node.
                     if document_ids:
-                        await session.run(
-                            """
+                        await with_transient_retry(
+                            lambda: session.run(
+                                """
                             UNWIND $doc_ids AS did
                             MATCH (d:Document {id: did, tenant_id: $tenant_id})
                             MATCH (s:Entity {id: $subject_id, tenant_id: $tenant_id})
@@ -4237,10 +4267,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             MERGE (d)-[:PROVENANCE]->(s)
                             MERGE (d)-[:PROVENANCE]->(t)
                             """,
-                            doc_ids=document_ids,
-                            tenant_id=tenant_id,
-                            subject_id=subject_id,
-                            object_id=object_id,
+                                doc_ids=document_ids,
+                                tenant_id=tenant_id,
+                                subject_id=subject_id,
+                                object_id=object_id,
+                            ),
+                            operation="store concept relations",
                         )
                 except Exception as e:
                     log.warning(
