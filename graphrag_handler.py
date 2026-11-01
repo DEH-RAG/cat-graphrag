@@ -149,6 +149,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
         self._enable_concept_relations = enable_concept_relations
+        # Per-source LLM-extraction attempt counter (process-local). The diary
+        # ``attempt`` is not exposed to the phase body (EffING passes only
+        # completed phases to ``ingestion_phase_run`` and the handler has no
+        # scope to read the current ``processing`` entry), so the first
+        # ``not_ready`` -> ``error`` transition is tracked here. Reset when the
+        # extraction succeeds (or terminally fails) so a later re-ingestion
+        # starts a fresh budget.
+        self._concept_attempts: Dict[str, int] = {}
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
         self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
@@ -1460,9 +1468,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         Returns ``{"status": "done"}`` on success and
         ``{"status": "not_ready", "retry_after": <s>}`` when the source's
-        points are not yet in the store. Exceptions propagate (the core maps
-        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
-        so re-running after a retry never duplicates data.
+        points are not yet in the store OR the LLM outcome is transient
+        (timeout / 429 / 5xx / dropped connection / first empty response).
+        A permanent LLM failure (no LLM configured, repeated empty/unparsable
+        output, partial extraction) returns ``{"status": "error", "reason"}``
+        so the phase is recorded as ``error``, never as a silent ``done``.
+        All writes are idempotent MERGEs, so re-running after a retry never
+        duplicates data.
         """
         await self.drain_source_tasks(source)
 
@@ -1475,7 +1487,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             all_points.extend(points)
 
         if self._enable_concept_relations:
-            await self._extract_concept_relations(source, all_points, stray_cat=cat)
+            outcome = await self._extract_concept_relations(
+                source, all_points, stray_cat=cat
+            )
+            if isinstance(outcome, dict) and outcome.get("status") in (
+                "not_ready",
+                "error",
+            ):
+                return outcome
 
         return {"status": "done"}
 
@@ -3340,11 +3359,29 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if self._enable_concept_relations:
             try:
                 if stray_cat is not None:
-                    await self._extract_concept_relations(source, stored_points, stray_cat)
+                    outcome = await self._extract_concept_relations(
+                        source, stored_points, stray_cat
+                    )
                 else:
+                    # Vector-db path (no stray_cat): resolve the agent LLM
+                    # explicitly so a missing LLM is a configuration ERROR,
+                    # never a silent no-op.
                     llm = await self._resolve_agent_llm()
                     if llm is not None:
-                        await self._extract_concept_relations(source, stored_points, llm=llm)
+                        outcome = await self._extract_concept_relations(
+                            source, stored_points, llm=llm
+                        )
+                    else:
+                        outcome = {
+                            "status": "error",
+                            "reason": "no LLM configured for graph concept extraction",
+                        }
+                if isinstance(outcome, dict) and outcome.get("status") != "done":
+                    log.error(
+                        f"[GraphRAG] Concept relation extraction for '{source}' "
+                        f"did not complete: status={outcome.get('status')} "
+                        f"reason={outcome.get('reason')}"
+                    )
             except Exception as e:
                 log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
 
@@ -3373,9 +3410,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ``context_execute_hook == "cat"``. Imports are lazy (plugin import-safe
         rule).
 
-        Returns None when the agent has no LLM or resolution fails (step 8
-        degrades to a no-op); the resolved LLM is cached on the handler so a
-        multi-file ingestion resolves it once.
+        Returns None when the agent has no LLM or resolution fails; callers
+        treat that as a configuration error, never as a silent no-op. The
+        resolved LLM is cached on the handler so a multi-file ingestion
+        resolves it once.
         """
         cached = getattr(self, "_llm", None)
         if cached is not None:
@@ -3413,19 +3451,36 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         stray_cat=None,
         gen: str | None = None,
         llm=None,
-    ) -> None:
+    ) -> Dict[str, Any]:
+        """Run LLM concept/relation extraction for one source.
+
+        Returns a ``PhaseResult``-compatible dict: ``{"status": "done"}`` with
+        the extracted product on success, ``{"status": "not_ready"}`` for a
+        transient LLM failure (retried inside the phase's budget) and
+        ``{"status": "error", "reason": ...}`` for a permanent one. It NEVER
+        returns an empty success: a phase that produced nothing because the LLM
+        failed must not be recorded as ``done``.
+        """
         tenant_id = self.agent_id
 
         # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
         # LLM (hook path), then a self-contained resolve from the agent config
-        # (vector-db path, no stray_cat). None -> skip silently.
+        # (vector-db path, no stray_cat). A missing/default LLM is a
+        # CONFIGURATION error, never a silent no-op.
         if llm is None:
             if stray_cat is not None:
                 llm = getattr(stray_cat, "large_language_model", None)
-            if llm is None:
+            if not self._is_usable_llm(llm):
                 llm = await self._resolve_agent_llm()
-        if llm is None:
-            return
+        if not self._is_usable_llm(llm):
+            log.error(
+                "[GraphRAG] No usable LLM configured for graph concept "
+                f"extraction of '{source}'"
+            )
+            return {
+                "status": "error",
+                "reason": "no LLM configured for graph concept extraction",
+            }
 
         # Join full section texts (no per-chunk truncation), up to a total limit
         texts: List[str] = []
@@ -3442,14 +3497,29 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         combined = "\n\n".join(texts)
         if not combined.strip():
-            return
+            # No input text is not an LLM failure: there is simply nothing to
+            # extract. A phase over empty input truthfully produced no product.
+            return {"status": "done", "processed": 0}
 
         if len(combined) > max_chars:
             combined = combined[:max_chars] + " [truncated]"
 
-        relations = await self._llm_extract_relations(combined, llm=llm)
-        if not relations.get("concepts") and not relations.get("relations"):
-            return
+        attempt = self._next_concept_attempt(source)
+        outcome = await self._llm_extract_relations(combined, llm=llm, attempt=attempt)
+        status = outcome.get("status")
+        if status != "done":
+            log.warning(
+                f"[GraphRAG] Concept relation extraction for '{source}' did not "
+                f"complete: status={status} reason={outcome.get('reason')}"
+            )
+            if status == "error":
+                self._clear_concept_attempt(source)
+            return outcome
+
+        relations = {
+            "concepts": outcome.get("concepts", []),
+            "relations": outcome.get("relations", []),
+        }
 
         # Every concept created from this source is provenance-linked to the
         # documents (the file's chunks) that produced it, so the deletion
@@ -3466,22 +3536,60 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             document_ids=document_ids,
             concept_gen=gen or await self._concept_fingerprint(),
         )
+        self._clear_concept_attempt(source)
         log.info(
             f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
         )
+        return {"status": "done", "processed": len(relations.get("relations", []))}
+
+    @staticmethod
+    def _is_usable_llm(llm: Any) -> bool:
+        """A configured LLM that can actually extract (never the dumb default)."""
+        return llm is not None and type(llm).__name__ != "LLMDefault"
+
+    def _next_concept_attempt(self, source: str) -> int:
+        """Increment and return the per-source LLM-extraction attempt count."""
+        attempt = self._concept_attempts.get(source, 0) + 1
+        self._concept_attempts[source] = attempt
+        return attempt
+
+    def _clear_concept_attempt(self, source: str) -> None:
+        """Forget the per-source attempt counter after a terminal outcome."""
+        self._concept_attempts.pop(source, None)
 
     async def _llm_extract_relations(
-        self, text: str, stray_cat=None, llm=None
-    ) -> Dict[str, list]:
-        # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
-        # LLM. The self-contained resolve happens one level up
-        # (``_extract_concept_relations``); a None here means no LLM is
-        # available -> return empty (step 8 no-op).
+        self, text: str, stray_cat=None, llm=None, attempt: int = 1
+    ) -> Dict[str, Any]:
+        """Extract ``{"concepts","relations"}`` or report a truthful phase state.
+
+        Every LLM outcome maps onto a ``PhaseResult``-compatible dict:
+
+        - clean extraction -> ``{"status": "done", concepts, relations}``;
+        - no usable LLM -> ``error`` (configuration, never ``skipped``);
+        - ``StructuredLLMError`` with NO raw text (the native client failed
+          before producing output: timeout / 429 / 5xx / dropped connection)
+          -> ``not_ready`` (transient);
+        - unparsable ``StructuredLLMError`` raw / empty-but-valid output on
+          non-empty text -> ``not_ready`` on the FIRST attempt (transient,
+          retried inside the phase's budget), ``error`` afterwards with the
+          raw model text in the reason;
+        - partial lenient parse (items dropped by the whitelist/shape rules) ->
+          ``error`` carrying ``dropped=<n>``;
+        - any other exception escaping the client -> ``not_ready`` (transient).
+
+        ``attempt`` is the per-source counter maintained by
+        ``_extract_concept_relations`` (the diary ``attempt`` is not exposed to
+        the phase body).
+        """
         if llm is None:
             if stray_cat is not None:
                 llm = getattr(stray_cat, "large_language_model", None)
-        if llm is None:
-            return {"concepts": [], "relations": []}
+        if not self._is_usable_llm(llm):
+            log.error("[GraphRAG] No usable LLM configured for graph concept extraction")
+            return {
+                "status": "error",
+                "reason": "no LLM configured for graph concept extraction",
+            }
         # Use the per-agent prompt from settings; fall back to the built-in
         # default when it is not configured (None / empty). The document text
         # is concatenated after the prompt (no {text} placeholder anymore).
@@ -3510,29 +3618,144 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 data = model.model_dump()
             else:
                 data = model or {}
-            if not data.get("concepts") and not data.get("relations"):
+            concepts = data.get("concepts") or []
+            relations = data.get("relations") or []
+            raw = getattr(result, "text", "") or ""
+            if not concepts and not relations:
                 log.warning(
-                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
-                    f"raw={result.text[:300]!r}"
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations "
+                    f"(attempt {attempt}); raw={raw[:300]!r}"
                 )
-            return {
-                "concepts": data.get("concepts", []),
-                "relations": data.get("relations", []),
-            }
+                if attempt <= 1:
+                    return {
+                        "status": "not_ready",
+                        "reason": (
+                            "empty LLM extraction on non-empty text "
+                            f"(attempt {attempt}); raw={raw[:300]!r}"
+                        ),
+                        "retry_after": 5,
+                    }
+                return {
+                    "status": "error",
+                    "reason": (
+                        "empty LLM extraction on non-empty text "
+                        f"after {attempt} attempt(s); raw={raw[:300]!r}"
+                    ),
+                }
+            return {"status": "done", "concepts": concepts, "relations": relations}
         except StructuredLLMError as e:
-            log.warning(
-                f"[GraphRAG] Structured LLM extraction failed, falling back to "
-                f"lenient parsing: {e}"
-            )
-            # Lenient fallback: the parser now returns the {"concepts","relations"}
-            # dict natively (todo 5), so the result feeds straight into the store.
-            data = self._parse_concept_relations(e.raw_text)
-            if not data.get("concepts") and not data.get("relations"):
+            raw = e.raw_text or ""
+            if not raw.strip():
+                # No model text at all: the native client failed before
+                # producing output (timeout / 429 / 5xx / dropped connection).
+                # That is the transient class, never a terminal parse error.
                 log.warning(
-                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
-                    f"raw={e.raw_text[:300]!r}"
+                    f"[GraphRAG] Transient structured LLM failure (attempt "
+                    f"{attempt}): {e}"
                 )
-            return data
+                return {
+                    "status": "not_ready",
+                    "reason": f"transient structured LLM failure: {e}",
+                    "retry_after": 5,
+                }
+            log.warning(
+                f"[GraphRAG] Structured LLM extraction failed (attempt {attempt}), "
+                f"falling back to lenient parsing: {e}"
+            )
+            # Lenient fallback: the parser returns the {"concepts","relations"}
+            # dict natively (todo 5), so a fully-parsed result feeds straight
+            # into the store.
+            data = self._parse_concept_relations(raw)
+            concepts = data.get("concepts", [])
+            relations = data.get("relations", [])
+            if not concepts and not relations:
+                log.warning(
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations "
+                    f"(attempt {attempt}); raw={raw[:300]!r}"
+                )
+                if attempt <= 1:
+                    return {
+                        "status": "not_ready",
+                        "reason": (
+                            "unparsable LLM extraction "
+                            f"(attempt {attempt}); raw={raw[:300]!r}"
+                        ),
+                        "retry_after": 5,
+                    }
+                return {
+                    "status": "error",
+                    "reason": (
+                        "unparsable LLM extraction "
+                        f"after {attempt} attempt(s); raw={raw[:300]!r}"
+                    ),
+                }
+            dropped = self._count_dropped_items(raw, concepts, relations)
+            if dropped > 0:
+                return {
+                    "status": "error",
+                    "reason": (
+                        f"partial LLM extraction: dropped={dropped} item(s); "
+                        f"raw={raw[:300]!r}"
+                    ),
+                }
+            return {"status": "done", "concepts": concepts, "relations": relations}
+        except Exception as e:  # noqa: BLE001 - transient client failure
+            log.warning(
+                f"[GraphRAG] Transient LLM extraction failure (attempt {attempt}): "
+                f"{type(e).__name__}: {e}"
+            )
+            return {
+                "status": "not_ready",
+                "reason": (
+                    "transient LLM extraction failure: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                "retry_after": 5,
+            }
+
+    def _count_dropped_items(
+        self, raw: str, concepts: List[Dict], relations: List[Dict]
+    ) -> int:
+        """Items the lenient parse rejected from a raw LLM payload.
+
+        Counts candidate records in the raw JSON (new ``{concepts,relations}``
+        contract or the legacy bare list) and subtracts the records the parse
+        kept. Concepts synthesized from a legacy list are not counted as raw
+        candidates, so only genuinely dropped relation records are reported.
+        """
+        raw_concepts, raw_relations = self._raw_item_counts(raw)
+        dropped = max(0, raw_concepts - len(concepts))
+        dropped += max(0, raw_relations - len(relations))
+        return dropped
+
+    @staticmethod
+    def _raw_item_counts(raw: str) -> Tuple[int, int]:
+        """``(concept_items, relation_items)`` present in a raw LLM payload."""
+        text = (raw or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\[[\s\S]*\]", text)
+            if not match:
+                return 0, 0
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                return 0, 0
+        if isinstance(data, list):
+            return 0, len(data)
+        if not isinstance(data, dict):
+            return 0, 0
+        raw_concepts = data.get("concepts")
+        raw_relations = data.get("relations")
+        return (
+            len(raw_concepts) if isinstance(raw_concepts, list) else 0,
+            len(raw_relations) if isinstance(raw_relations, list) else 0,
+        )
 
     def _parse_concept_relations(self, raw: str) -> Dict[str, list]:
         """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
@@ -3953,7 +4176,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 for p in by_source[source]
             ]
-            await self._extract_concept_relations(source, payloads, stray_cat, gen=gen)
+            outcome = await self._extract_concept_relations(
+                source, payloads, stray_cat, gen=gen
+            )
+            if isinstance(outcome, dict) and outcome.get("status") != "done":
+                log.error(
+                    f"[GraphRAG] Concept recompute for '{source}' did not "
+                    f"complete: status={outcome.get('status')} "
+                    f"reason={outcome.get('reason')}"
+                )
 
     def _build_llm_output_model(self) -> type[BaseModel]:
         """Dynamically build the Pydantic output model for structured LLM
