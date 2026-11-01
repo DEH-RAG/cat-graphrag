@@ -72,6 +72,23 @@ if __name__ == "__main__":
             depends_on = ()
             settings_category = None
             settings_check = None
+            not_ready_budget_seconds = None
+            not_ready_budget_env = None
+
+            def not_ready_budget(self):
+                """Resolve the phase's own budget (same order as EffING)."""
+                import os
+
+                if self.not_ready_budget_env:
+                    try:
+                        value = float(os.environ[self.not_ready_budget_env])
+                    except (KeyError, TypeError, ValueError):
+                        value = None
+                    if value is not None and value >= 0:
+                        return value
+                if self.not_ready_budget_seconds is not None:
+                    return float(self.not_ready_budget_seconds)
+                return None
 
             @property
             def name(self):
@@ -299,6 +316,38 @@ if __name__ == "__main__":
         assert phases.phase_for(None, cat) is None
         print("PASS (f) phase_for() accepts a string id, a dict or an object")
 
+    async def test_g_concept_phase_declares_llm_budget():
+        """The concept phase declares its own 300s LLM not-ready budget."""
+        import os
+
+        env = "CAT_INGESTION_LLM_NOT_READY_MAX_SECONDS"
+        concept = phases.GraphConceptPhase(FakeCat(FakeGraphHandler()))
+
+        assert concept.not_ready_budget_seconds == 300.0, (
+            concept.not_ready_budget_seconds
+        )
+        assert concept.not_ready_budget_env == env, concept.not_ready_budget_env
+
+        saved = os.environ.pop(env, None)
+        try:
+            # no override: the declared value wins over the generic 3600s hour
+            assert concept.not_ready_budget() == 300.0, concept.not_ready_budget()
+
+            # a declared env var overrides the declared value when set
+            os.environ[env] = "120"
+            assert concept.not_ready_budget() == 120.0, concept.not_ready_budget()
+
+            # a negative/invalid override falls back to the declared value
+            os.environ[env] = "-5"
+            assert concept.not_ready_budget() == 300.0, concept.not_ready_budget()
+            os.environ[env] = "not-a-number"
+            assert concept.not_ready_budget() == 300.0, concept.not_ready_budget()
+        finally:
+            os.environ.pop(env, None)
+            if saved is not None:
+                os.environ[env] = saved
+        print("PASS (g) concept phase declares the 300s LLM not-ready budget")
+
     async def _main():
         await test_a_vector_only_agent_is_skipped()
         await test_b_delete_source_scoped_and_idempotent()
@@ -306,10 +355,11 @@ if __name__ == "__main__":
         await test_d_process_delegates_to_existing_path()
         await test_e_phase_module_owns_no_protocol_logic()
         await test_f_phase_for_accepts_spec_or_id()
+        await test_g_concept_phase_declares_llm_budget()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK phase ABC migration (six tests)")
+    print("OK phase ABC migration (seven tests)")

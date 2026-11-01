@@ -216,6 +216,9 @@ class GraphConceptPhase(_GraphPhase):
     """LLM concept-relations phase."""
 
     id = "graph_llm_extraction"
+    # An LLM-backed phase must not hold a source for the generic hour.
+    not_ready_budget_seconds = 300.0
+    not_ready_budget_env = "CAT_INGESTION_LLM_NOT_READY_MAX_SECONDS"
 
     async def process(self, source: str, cat) -> PhaseResult:
         raw = await self._run(source, cat)
