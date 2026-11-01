@@ -278,6 +278,26 @@ def ingestion_phase_specs(specs, cat) -> list:
 
 
 @hook(priority=10)
+def ingestion_phase_objects(cat=None) -> list:
+    """Contribute the two graph phases as ``IngestionPhase`` instances.
+
+    Class path (phase-contract v2): EffING merges these instances BEFORE the
+    legacy ``ingestion_phase_specs`` adapters, so for the two graph ids the
+    class implementation is the one exercised by the registry (``applies_to``,
+    ``delete``, ``tag``). The legacy hooks stay registered for one release as
+    the compatibility adapter and for hosts that still call them directly.
+    Lazy import keeps ``main.py`` import-safe when the class module is
+    unavailable, and returns an empty list so the legacy specs remain the
+    fallback (never a crash at activation).
+    """
+    try:
+        from .phases import GraphConceptPhase, GraphSpacyPhase
+    except Exception:  # noqa: BLE001 - legacy hooks remain the fallback
+        return []
+    return [GraphSpacyPhase(cat), GraphConceptPhase(cat)]
+
+
+@hook(priority=10)
 async def ingestion_phase_settings_marker(phase, cat) -> Any:
     """Material marker for the graph phases (T5).
 

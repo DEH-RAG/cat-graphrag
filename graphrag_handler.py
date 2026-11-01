@@ -2367,12 +2367,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
           - every other tenant's data.
 
         Steps (all tenant-filtered):
-          1. delete PROVENANCE / MENTIONS edges from this source's Documents;
+          1. delete PROVENANCE / MENTIONS edges from this source's Documents
+             and prune ONLY the entities those edges pointed at once they have
+             no other provenance/mention (entities untouched by this source are
+             never candidates);
           2. delete SIMILAR_TO_* edges touching this source's Documents;
           3. strip ``source`` from RELATED_TO ``source_files`` and drop edges
              that existed only because of it;
-          4. prune entities left with no PROVENANCE and no MENTIONS;
-          5. drop the source's SourceFile node.
+          4. drop the source's SourceFile node.
 
         Returns the number of Document nodes that belonged to the source (0 is
         a valid "nothing was derived" result, not an error).
@@ -2398,7 +2400,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
                 WHERE d.metadata CONTAINS $meta
                   AND type(r) IN ['PROVENANCE', 'MENTIONS']
-                DELETE r
+                WITH collect(DISTINCT e) AS candidates, collect(r) AS rels
+                FOREACH (rel IN rels | DELETE rel)
+                WITH candidates
+                UNWIND candidates AS e
+                WITH DISTINCT e
+                WHERE NOT (e)<-[:PROVENANCE]-() AND NOT (e)<-[:MENTIONS]-()
+                DETACH DELETE e
                 """,
                 tenant_id=tenant_id,
                 meta=meta_fragment,
@@ -2422,14 +2430,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 """,
                 tenant_id=tenant_id,
                 source=source,
-            )
-            await session.run(
-                """
-                MATCH (e:Entity {tenant_id: $tenant_id})
-                WHERE NOT (e)<-[:PROVENANCE]-() AND NOT (e)<-[:MENTIONS]-()
-                DETACH DELETE e
-                """,
-                tenant_id=tenant_id,
             )
             await session.run(
                 """
