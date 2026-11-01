@@ -11,7 +11,10 @@ Covers the phase-contract v2 migration of the two graph phases:
       and it never calls the LLM;
   (d) ``process()`` DELEGATES to the existing
       ``run_spacy_extraction_phase`` / ``run_llm_extraction_phase`` path
-      instead of re-implementing extraction.
+      instead of re-implementing extraction;
+  (e) the module owns no diary/state/lock/retry protocol logic;
+  (f) ``phase_for()`` resolves the same class from a string id, a mapping
+      carrying ``"id"`` (legacy PhaseSpec payload) or an object with ``.id``.
 
 The Cat plugin loader imports every ``.py`` under a plugin folder at
 activation, so the whole file is inert on import: every import, class and test
@@ -269,16 +272,44 @@ if __name__ == "__main__":
         assert not found, f"phase module re-implements protocol logic: {found}"
         print("PASS (e) phase module contains no diary/state/lock/retry protocol")
 
+    async def test_f_phase_for_accepts_spec_or_id():
+        """``phase_for`` resolves the same class from an id, a dict or an object.
+
+        The legacy hooks receive the PhaseSpec payload (a dict), while the
+        class API passes the string id; both forms must resolve identically.
+        """
+        cat = FakeCat(FakeGraphHandler())
+
+        class SpecWithId:
+            id = "graph_spacy_extraction"
+
+        from_id = phases.phase_for("graph_spacy_extraction", cat)
+        from_dict = phases.phase_for({"id": "graph_spacy_extraction"}, cat)
+        from_obj = phases.phase_for(SpecWithId(), cat)
+
+        assert from_id is not None and from_dict is not None and from_obj is not None
+        assert type(from_id) is phases.GraphSpacyPhase
+        assert type(from_dict) is type(from_id)
+        assert type(from_obj) is type(from_id)
+
+        # the unknown forms keep the None contract
+        assert phases.phase_for("does_not_exist", cat) is None
+        assert phases.phase_for({"id": "does_not_exist"}, cat) is None
+        assert phases.phase_for({}, cat) is None
+        assert phases.phase_for(None, cat) is None
+        print("PASS (f) phase_for() accepts a string id, a dict or an object")
+
     async def _main():
         await test_a_vector_only_agent_is_skipped()
         await test_b_delete_source_scoped_and_idempotent()
         await test_c_tag_follows_config_only()
         await test_d_process_delegates_to_existing_path()
         await test_e_phase_module_owns_no_protocol_logic()
+        await test_f_phase_for_accepts_spec_or_id()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK phase ABC migration (four tests)")
+    print("OK phase ABC migration (six tests)")

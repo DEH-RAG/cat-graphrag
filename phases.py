@@ -236,9 +236,28 @@ _PHASE_CLASSES: dict[str, type[_GraphPhase]] = {
 }
 
 
-def phase_for(phase_id: str, cat=None) -> _GraphPhase | None:
-    """The phase instance for ``phase_id``, or ``None`` for an unknown id."""
-    cls = _PHASE_CLASSES.get(phase_id)
+def _phase_id(value: Any) -> str | None:
+    """Normalize a phase id, mapping/spec or object with ``.id`` to its id.
+
+    The legacy hooks still receive the EffING PhaseSpec payload (a dict), while
+    the class API passes the string id; both must resolve the same class.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        candidate = value.get("id")
+        return candidate if isinstance(candidate, str) else None
+    candidate = getattr(value, "id", None)
+    return candidate if isinstance(candidate, str) else None
+
+
+def phase_for(phase_id: Any, cat=None) -> _GraphPhase | None:
+    """The phase instance for ``phase_id``, or ``None`` for an unknown id.
+
+    ``phase_id`` may be a string id, a mapping carrying ``"id"`` (the legacy
+    PhaseSpec payload) or any object exposing ``.id``.
+    """
+    cls = _PHASE_CLASSES.get(_phase_id(phase_id))
     return None if cls is None else cls(cat)
 
 
