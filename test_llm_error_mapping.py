@@ -2,7 +2,7 @@
 
 Covers the graph concept phase contract (``_extract_concept_relations`` /
 ``_llm_extract_relations``): a failed LLM call must never become a silent
-``done``. The five cases:
+``done``. The cases:
 
   (a) ``StructuredLLMError`` with unparsable raw -> ``not_ready`` on the first
       attempt, ``error`` afterwards (never ``done``);
@@ -10,7 +10,17 @@ Covers the graph concept phase contract (``_extract_concept_relations`` /
   (c) empty-but-valid output on non-empty text -> ``not_ready`` then ``error``
       carrying the raw model text;
   (d) a clean extraction still yields ``done`` with the product;
-  (e) a partial lenient parse (items dropped) -> ``error`` with ``dropped=<n>``.
+  (e) a partial lenient parse (items dropped) -> ``error`` with ``dropped=<n>``;
+  (f) NATIVE structured output, schema-valid but effectively empty product
+      (whitespace-only text/endpoints) -> ``not_ready`` then ``error``, never
+      ``done`` (only the native seam is faked, the wrapper validates);
+  (g) NATIVE empty strings: the output model's ``min_length=1`` rejects them
+      (never ``done``);
+  (h) a non-list ``concepts``/``relations`` container counts as dropped items,
+      not as zero candidates (MAJOR-1 MINOR-4);
+  (i) ``enable_concept_relations=False`` -> ``skipped`` with a reason, never
+      ``done`` (MAJOR-1 MINOR-5), and the fingerprint covers the toggle;
+  (j) a clean NATIVE product still yields ``done`` with the product.
 
 The Cat plugin loader imports every ``.py`` under a plugin folder at
 activation, so this whole file is inert on import: every import, class and
@@ -120,6 +130,12 @@ if __name__ == "__main__":
         docs.Document = type("Document", (), {})
         sys.modules["langchain_core.documents"] = docs
 
+        # The NATIVE structured-output branch imports RunnableConfig lazily;
+        # a plain callable class is enough for the harness.
+        runnables = types.ModuleType("langchain_core.runnables")
+        runnables.RunnableConfig = type("RunnableConfig", (), {})
+        sys.modules["langchain_core.runnables"] = runnables
+
     def _install_langdetect_stub():
         langdetect_mod = types.ModuleType("langdetect")
 
@@ -160,6 +176,20 @@ if __name__ == "__main__":
         sys.modules["spacy.tokens"] = tokens_mod
 
     def _install_pydantic_stub():
+        """Keep real pydantic when importable (real field validation).
+
+        Returns ``True`` when the real package is in use. The minimal stub is
+        only a fallback for harnesses that run without pydantic installed; it
+        does NOT enforce field constraints, so the ``min_length=1`` assertion
+        is gated on the returned flag.
+        """
+        try:
+            import pydantic  # noqa: F401 - real validation when available
+        except ImportError:
+            pass
+        else:
+            return True
+
         pydantic_mod = types.ModuleType("pydantic")
 
         class Field:
@@ -187,13 +217,14 @@ if __name__ == "__main__":
         setattr(pydantic_mod, "BeforeValidator", BeforeValidator)
         setattr(pydantic_mod, "create_model", create_model)
         sys.modules["pydantic"] = pydantic_mod
+        return False
 
     _install_cat_stub()
     _install_neo4j_stub()
     _install_langchain_stub()
     _install_langdetect_stub()
     _install_spacy_stubs()
-    _install_pydantic_stub()
+    _REAL_PYDANTIC = _install_pydantic_stub()
 
     _pkg = types.ModuleType(PKG)
     _pkg.__path__ = [REPO_ROOT]
@@ -246,6 +277,25 @@ if __name__ == "__main__":
     def _reset_fake():
         _FakeStructuredLLM.calls = 0
         _FakeStructuredLLM.behavior = None
+
+    class _NativeSeamLLM:
+        """LLM exposing ``with_structured_output``: the NATIVE seam.
+
+        ``StructuredLLM`` therefore takes its native branch and its own
+        validation runs; only the bound runnable's ``ainvoke`` is faked.
+        """
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def with_structured_output(self, output_model):
+            payload = self._payload
+
+            class _BoundRunnable:
+                async def ainvoke(self, prompt, config=None):
+                    return payload
+
+            return _BoundRunnable()
 
     # ------------------------------------------------------------------
     # Tests
@@ -375,16 +425,181 @@ if __name__ == "__main__":
         handler._store_concept_relations.assert_not_awaited()
         print("PASS (e) partial extraction -> error with dropped=2")
 
+    # ------------------------------------------------------------------
+    # MAJOR-1: the NATIVE structured LLM path must not report an empty
+    # product as ``done`` either.
+    # ------------------------------------------------------------------
+
+    async def test_f_native_empty_product_is_never_done():
+        """Schema-valid but effectively empty native product -> not_ready then
+        error. NOT patching StructuredLLM: its native branch + validation run."""
+        _reset_fake()
+        payload = {
+            "concepts": [{"type": "DEFINITION", "text": "   "}],
+            "relations": [
+                {"type": "IS_A", "origin": " ", "destination": " ", "text": " "}
+            ],
+        }
+        handler = _make_handler()
+
+        first = await handler._extract_concept_relations(
+            "src-f", _points(), llm=_NativeSeamLLM(payload)
+        )
+        second = await handler._extract_concept_relations(
+            "src-f", _points(), llm=_NativeSeamLLM(payload)
+        )
+
+        assert first["status"] == "not_ready", first
+        assert first["status"] != "done", first
+        assert "empty LLM extraction" in (first.get("reason") or ""), first
+        assert second["status"] == "error", second
+        assert json.dumps(payload) in (second.get("reason") or ""), second
+        handler._store_concept_relations.assert_not_awaited()
+        print("PASS (f) native empty product -> not_ready then error, never done")
+
+    async def test_g_native_empty_strings_are_rejected():
+        """The output model declares ``min_length=1``: empty strings must not
+        pass validation (so the native path can never store them)."""
+        _reset_fake()
+        payload = {"concepts": [{"type": "DEFINITION", "text": ""}], "relations": []}
+        handler = _make_handler()
+
+        outcome = await handler._extract_concept_relations(
+            "src-g", _points(), llm=_NativeSeamLLM(payload)
+        )
+
+        assert outcome["status"] != "done", outcome
+        handler._store_concept_relations.assert_not_awaited()
+        if _REAL_PYDANTIC:
+            output_model = handler._build_llm_output_model()
+            try:
+                output_model(
+                    concepts=[{"type": "DEFINITION", "text": ""}], relations=[]
+                )
+            except Exception:
+                pass
+            else:
+                raise AssertionError(
+                    "the output model must reject an empty concept text"
+                )
+        print("PASS (g) native empty strings are rejected, never done")
+
+    async def test_h_non_list_items_count_as_dropped():
+        """MINOR-4: a non-list concepts/relations container is a malformed
+        payload whose items were ALL dropped — never 0 candidates."""
+        handler = _make_handler()
+        raw_bad_concepts = json.dumps(
+            {
+                "concepts": {"Algebra": "a branch of mathematics"},
+                "relations": [
+                    {"type": "IS_A", "origin": "A", "destination": "B", "text": "A is a B"}
+                ],
+            }
+        )
+        raw_bad_relations = json.dumps(
+            {
+                "concepts": [{"type": "DEFINITION", "text": "A"}],
+                "relations": {"A": "B"},
+            }
+        )
+        for raw in (raw_bad_concepts, raw_bad_relations):
+            _reset_fake()
+            _FakeStructuredLLM.behavior = lambda raw=raw: (_ for _ in ()).throw(
+                StructuredLLMError("schema validation failed", raw)
+            )
+            handler._store_concept_relations.reset_mock()
+            with patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+                outcome = await handler._extract_concept_relations(
+                    "src-h", _points(), llm=object()
+                )
+            assert outcome["status"] == "error", (raw, outcome)
+            assert "dropped=1" in (outcome.get("reason") or ""), (raw, outcome)
+            handler._store_concept_relations.assert_not_awaited()
+        print("PASS (h) non-list payload containers count as dropped")
+
+    async def test_i_disabled_feature_is_skipped_not_done():
+        """MINOR-5: with the feature off there is no product, so the phase is
+        ``skipped`` with a reason. The fingerprint still covers the toggle, so
+        enabling it later re-runs the phase."""
+        disabled = graphrag_handler.GraphRAGHandler(
+            neo4j_uri="bolt://fake",
+            neo4j_user="u",
+            neo4j_password="p",
+            enable_concept_relations=False,
+        )
+        disabled.agent_id = "agent_test"
+
+        with patch.object(type(disabled), "drain_source_tasks", new=AsyncMock()), \
+             patch.object(
+                 type(disabled),
+                 "get_source_points_by_collection",
+                 new=AsyncMock(return_value={"declarative": _points()}),
+             ), \
+             patch.object(
+                 type(disabled), "_extract_concept_relations", new=AsyncMock()
+             ) as extract:
+            outcome = await disabled.run_llm_extraction_phase("src-i")
+
+        assert outcome["status"] == "skipped", outcome
+        assert outcome["status"] != "done", outcome
+        assert "disabled" in (outcome.get("reason") or ""), outcome
+        extract.assert_not_awaited()
+
+        enabled = graphrag_handler.GraphRAGHandler(
+            neo4j_uri="bolt://fake",
+            neo4j_user="u",
+            neo4j_password="p",
+            enable_concept_relations=True,
+        )
+        enabled.agent_id = "agent_test"
+        assert await disabled._concept_fingerprint() != await enabled._concept_fingerprint(), (
+            "the concept fingerprint must include the enable toggle"
+        )
+        print("PASS (i) disabled feature -> skipped with a reason; toggle in fingerprint")
+
+    async def test_j_native_clean_product_is_done():
+        """A clean NATIVE product still yields ``done`` with the product."""
+        _reset_fake()
+        payload = {
+            "concepts": [{"type": "DEFINITION", "text": "Algebra"}],
+            "relations": [
+                {
+                    "type": "PREREQUISITE_FOR",
+                    "origin": "Algebra",
+                    "destination": "Calculus",
+                    "text": "Algebra precedes Calculus",
+                }
+            ],
+        }
+        handler = _make_handler()
+
+        outcome = await handler._extract_concept_relations(
+            "src-j", _points(), llm=_NativeSeamLLM(payload)
+        )
+
+        assert outcome["status"] == "done", outcome
+        assert outcome["processed"] == 1, outcome
+        handler._store_concept_relations.assert_awaited_once()
+        stored = handler._store_concept_relations.await_args.args[1]
+        assert len(stored["concepts"]) == 1, stored
+        assert len(stored["relations"]) == 1, stored
+        print("PASS (j) clean native extraction -> done with the product")
+
     async def _main():
         await test_a_structured_error_is_never_done()
         await test_b_no_llm_is_configuration_error()
         await test_c_empty_valid_is_not_ready_then_error()
         await test_d_clean_extraction_is_done_with_product()
         await test_e_partial_extraction_reports_dropped_count()
+        await test_f_native_empty_product_is_never_done()
+        await test_g_native_empty_strings_are_rejected()
+        await test_h_non_list_items_count_as_dropped()
+        await test_i_disabled_feature_is_skipped_not_done()
+        await test_j_native_clean_product_is_done()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM error mapping (five tests)")
+    print("OK LLM error mapping (ten tests, native path included)")

@@ -1473,6 +1473,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         A permanent LLM failure (no LLM configured, repeated empty/unparsable
         output, partial extraction) returns ``{"status": "error", "reason"}``
         so the phase is recorded as ``error``, never as a silent ``done``.
+        With ``enable_concept_relations`` off the phase produces no product by
+        definition, so it reports ``{"status": "skipped", "reason"}``; the
+        toggle is part of ``_concept_fingerprint``, so enabling it later
+        re-runs the phase.
         All writes are idempotent MERGEs, so re-running after a retry never
         duplicates data.
         """
@@ -1486,15 +1490,22 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         for collection_name, points in by_collection.items():
             all_points.extend(points)
 
-        if self._enable_concept_relations:
-            outcome = await self._extract_concept_relations(
-                source, all_points, stray_cat=cat
-            )
-            if isinstance(outcome, dict) and outcome.get("status") in (
-                "not_ready",
-                "error",
-            ):
-                return outcome
+        if not self._enable_concept_relations:
+            # The feature is off: no product exists to produce, so the phase is
+            # inapplicable (``skipped``), not a silent success.
+            return {
+                "status": "skipped",
+                "reason": "concept-relations extraction disabled",
+            }
+
+        outcome = await self._extract_concept_relations(
+            source, all_points, stray_cat=cat
+        )
+        if isinstance(outcome, dict) and outcome.get("status") in (
+            "not_ready",
+            "error",
+        ):
+            return outcome
 
         return {"status": "done"}
 
@@ -3572,15 +3583,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         - unparsable ``StructuredLLMError`` raw / empty-but-valid output on
           non-empty text -> ``not_ready`` on the FIRST attempt (transient,
           retried inside the phase's budget), ``error`` afterwards with the
-          raw model text in the reason;
-        - partial lenient parse (items dropped by the whitelist/shape rules) ->
-          ``error`` carrying ``dropped=<n>``;
+          raw model text in the reason. The SAME gate applies to the native
+          structured-output branch: a schema-valid payload whose items are all
+          unstorable (whitespace-only text/endpoints) is an empty product;
+        - partial extraction (lenient items dropped by the whitelist/shape
+          rules, or native items the store would skip) -> ``error`` carrying
+          ``dropped=<n>``;
         - any other exception escaping the client -> ``not_ready`` (transient).
 
         ``attempt`` is the per-source counter maintained by
         ``_extract_concept_relations`` (the diary ``attempt`` is not exposed to
         the phase body).
         """
+        # Public-entry guard: the only caller (the phase body) always passes a
+        # resolved, usable llm; this keeps a direct call with a stray_cat sane.
         if llm is None:
             if stray_cat is not None:
                 llm = getattr(stray_cat, "large_language_model", None)
@@ -3621,6 +3637,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             concepts = data.get("concepts") or []
             relations = data.get("relations") or []
             raw = getattr(result, "text", "") or ""
+            # The output model only enforces non-empty STRINGS, so a
+            # whitespace-only concept text / relation endpoint is schema-valid
+            # yet unstorable (``_store_concept_relations`` skips it). Drop what
+            # the store would skip and demand a real product before ``done``.
+            concepts, relations = self._drop_unstorable_items(concepts, relations)
             if not concepts and not relations:
                 log.warning(
                     f"[GraphRAG] LLM extraction produced empty concepts/relations "
@@ -3640,6 +3661,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     "reason": (
                         "empty LLM extraction on non-empty text "
                         f"after {attempt} attempt(s); raw={raw[:300]!r}"
+                    ),
+                }
+            # Same dropped-item gate as the lenient path: stale items the
+            # schema let through but the store skipped are a partial
+            # extraction, never a quiet ``done``.
+            dropped = self._count_dropped_items(raw, concepts, relations)
+            if dropped > 0:
+                return {
+                    "status": "error",
+                    "reason": (
+                        f"partial LLM extraction: dropped={dropped} item(s); "
+                        f"raw={raw[:300]!r}"
                     ),
                 }
             return {"status": "done", "concepts": concepts, "relations": relations}
@@ -3713,6 +3746,34 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 "retry_after": 5,
             }
 
+    @staticmethod
+    def _drop_unstorable_items(
+        concepts: List[Dict], relations: List[Dict]
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Items the STORE would skip, removed from a validated native product.
+
+        ``_store_concept_relations`` skips a concept with a blank ``text`` and a
+        relation with a blank ``origin``/``destination``, while the output model
+        only rejects the empty string. Removing them here keeps the returned
+        product truthful: ``done`` means the store will actually write
+        something.
+        """
+
+        def _text(value: Any) -> str:
+            return str(value or "").strip()
+
+        kept_concepts = [
+            c for c in concepts if isinstance(c, dict) and _text(c.get("text"))
+        ]
+        kept_relations = [
+            r
+            for r in relations
+            if isinstance(r, dict)
+            and _text(r.get("origin"))
+            and _text(r.get("destination"))
+        ]
+        return kept_concepts, kept_relations
+
     def _count_dropped_items(
         self, raw: str, concepts: List[Dict], relations: List[Dict]
     ) -> int:
@@ -3728,8 +3789,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         dropped += max(0, raw_relations - len(relations))
         return dropped
 
-    @staticmethod
-    def _raw_item_counts(raw: str) -> Tuple[int, int]:
+    def _raw_item_counts(self, raw: str) -> Tuple[int, int]:
         """``(concept_items, relation_items)`` present in a raw LLM payload."""
         text = (raw or "").strip()
         if text.startswith("```"):
@@ -3753,9 +3813,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         raw_concepts = data.get("concepts")
         raw_relations = data.get("relations")
         return (
-            len(raw_concepts) if isinstance(raw_concepts, list) else 0,
-            len(raw_relations) if isinstance(raw_relations, list) else 0,
+            self._raw_container_count(raw_concepts),
+            self._raw_container_count(raw_relations),
         )
+
+    @staticmethod
+    def _raw_container_count(value: Any) -> int:
+        """Candidate record count of one raw payload container.
+
+        A list counts its records. ``None``/absent counts zero. Any other
+        present value (a dict, a string, a number) is a MALFORMED container:
+        its records were all dropped, so it must count as at least one
+        candidate — never as zero, which would hide the loss.
+        """
+        if isinstance(value, list):
+            return len(value)
+        if value is None:
+            return 0
+        if isinstance(value, dict):
+            return max(1, len(value))
+        return 1
 
     def _parse_concept_relations(self, raw: str) -> Dict[str, list]:
         """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
@@ -4211,14 +4288,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Concept = create_model(
             "Concept",
             type=(ConceptType, ...),
-            text=(str, ...),
+            text=(str, Field(min_length=1)),
         )
         Relation = create_model(
             "Relation",
             type=(RelationType, ...),
-            origin=(str, ...),
-            destination=(str, ...),
-            text=(str, ...),
+            origin=(str, Field(min_length=1)),
+            destination=(str, Field(min_length=1)),
+            text=(str, Field(min_length=1)),
         )
         return create_model(
             "ExtractionResult",
