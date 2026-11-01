@@ -3575,21 +3575,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         Every LLM outcome maps onto a ``PhaseResult``-compatible dict:
 
-        - clean extraction -> ``{"status": "done", concepts, relations}``;
-        - no usable LLM -> ``error`` (configuration, never ``skipped``);
-        - ``StructuredLLMError`` with NO raw text (the native client failed
-          before producing output: timeout / 429 / 5xx / dropped connection)
-          -> ``not_ready`` (transient);
-        - unparsable ``StructuredLLMError`` raw / empty-but-valid output on
-          non-empty text -> ``not_ready`` on the FIRST attempt (transient,
-          retried inside the phase's budget), ``error`` afterwards with the
-          raw model text in the reason. The SAME gate applies to the native
-          structured-output branch: a schema-valid payload whose items are all
-          unstorable (whitespace-only text/endpoints) is an empty product;
-        - partial extraction (lenient items dropped by the whitelist/shape
-          rules, or native items the store would skip) -> ``error`` carrying
-          ``dropped=<n>``;
-        - any other exception escaping the client -> ``not_ready`` (transient).
+        - clean extraction -> ``{"status": "done", concepts, relations}``.
+          ``done`` always carries at least one storable item on BOTH the
+          lenient and the native structured-output branch;
+        - no usable LLM -> ``error`` (a configuration problem, never
+          ``skipped``);
+        - transient failure — ``StructuredLLMError`` with NO raw text (the
+          client failed before producing output: timeout / 429 / 5xx / dropped
+          connection) or any other exception escaping the client ->
+          ``not_ready``;
+        - empty product on non-empty text (unparsable raw, an empty-but-valid
+          native payload, or every item unstorable) -> ``not_ready`` on the
+          FIRST attempt (transient, retried inside the phase's budget), then
+          ``error`` carrying a raw prefix;
+        - partial extraction (items dropped: a non-whitelisted type, blank
+          endpoints, a blank concept text, a blank relation text, or a
+          malformed non-list ``concepts``/``relations`` container) ->
+          ``error`` carrying ``dropped=<n>`` and a raw prefix.
+
+        The empty/partial gate runs on both branches. A non-list container
+        (``null``, a number, a dict, a string) is coerced to zero parsed items
+        but counted as at least one dropped candidate, so it can neither raise
+        nor pass silently.
 
         ``attempt`` is the per-source counter maintained by
         ``_extract_concept_relations`` (the diary ``attempt`` is not exposed to
@@ -3750,13 +3757,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     def _drop_unstorable_items(
         concepts: List[Dict], relations: List[Dict]
     ) -> Tuple[List[Dict], List[Dict]]:
-        """Items the STORE would skip, removed from a validated native product.
+        """Items dropped from a validated native product, before the gate.
 
         ``_store_concept_relations`` skips a concept with a blank ``text`` and a
-        relation with a blank ``origin``/``destination``, while the output model
-        only rejects the empty string. Removing them here keeps the returned
-        product truthful: ``done`` means the store will actually write
-        something.
+        relation with a blank ``origin``/``destination``; the output model only
+        rejects a blank concept text/endpoint (a blank relation ``text`` is
+        allowed). Everything removed here is subtractively counted by
+        ``_count_dropped_items``, so the returned product is truthful: ``done``
+        means at least one storable item and zero dropped ones.
+
+        A blank relation ``text`` is dropped HERE even though the store would
+        still write the edge: the model must not reject the whole payload for
+        it, but it must not silently pass as a clean extraction either, so it
+        becomes a counted drop.
         """
 
         def _text(value: Any) -> str:
@@ -3771,6 +3784,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if isinstance(r, dict)
             and _text(r.get("origin"))
             and _text(r.get("destination"))
+            and _text(r.get("text"))
         ]
         return kept_concepts, kept_relations
 
@@ -3810,8 +3824,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return 0, len(data)
         if not isinstance(data, dict):
             return 0, 0
-        raw_concepts = data.get("concepts")
-        raw_relations = data.get("relations")
+        # A MISSING key means "no candidates", but a PRESENT key with a
+        # malformed non-list value (``null``, a number, a dict, a string) means
+        # its records were all dropped and must count as at least one.
+        raw_concepts = data["concepts"] if "concepts" in data else []
+        raw_relations = data["relations"] if "relations" in data else []
         return (
             self._raw_container_count(raw_concepts),
             self._raw_container_count(raw_relations),
@@ -3821,15 +3838,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     def _raw_container_count(value: Any) -> int:
         """Candidate record count of one raw payload container.
 
-        A list counts its records. ``None``/absent counts zero. Any other
-        present value (a dict, a string, a number) is a MALFORMED container:
-        its records were all dropped, so it must count as at least one
-        candidate — never as zero, which would hide the loss.
+        A list counts its records. Any other PRESENT value (``null``, a dict, a
+        string, a number) is a MALFORMED container: its records were all
+        dropped, so it counts as at least one candidate — never as zero, which
+        would hide the loss. A missing key is handled by the caller, which
+        passes an empty list.
         """
         if isinstance(value, list):
             return len(value)
-        if value is None:
-            return 0
         if isinstance(value, dict):
             return max(1, len(value))
         return 1
@@ -3849,7 +3865,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ``concepts`` derived from the unique subjects/objects.
 
         Never raises: malformed JSON / non-dict payloads yield
-        ``{"concepts": [], "relations": []}``.
+        ``{"concepts": [], "relations": []}``. A non-list ``concepts`` /
+        ``relations`` container (``null``, a number, a dict, a string) is a
+        malformed payload, not an iterable: it is coerced to zero parsed
+        candidates here, while ``_raw_container_count`` still counts it as a
+        dropped item in the partial-extraction gate.
         """
         import re
         import json
@@ -3907,8 +3927,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not isinstance(data, dict):
             return {"concepts": [], "relations": []}
 
+        # A non-list container must never be iterated: ``null`` / ``0`` raise
+        # ``TypeError`` and would skip the dropped-item count below. Coerce it
+        # to an empty candidate list; the raw count still sees the key present
+        # and counts it as a dropped item.
+        raw_concepts = data.get("concepts", [])
+        if not isinstance(raw_concepts, list):
+            raw_concepts = []
+        raw_relations = data.get("relations", [])
+        if not isinstance(raw_relations, list):
+            raw_relations = []
+
         concepts = []
-        for item in data.get("concepts", []):
+        for item in raw_concepts:
             if not isinstance(item, dict):
                 continue
             ctype = str(item.get("type", "")).strip().upper()
@@ -3922,7 +3953,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
 
         relations = []
-        for item in data.get("relations", []):
+        for item in raw_relations:
             if not isinstance(item, dict):
                 continue
             rtype = str(item.get("type", "")).strip().upper()
@@ -4274,6 +4305,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         may emit lowercase/mixed-case types. If a parsed definitions dict is
         empty (e.g. an all-comment settings field), the built-in defaults are
         used for the model build ONLY — the stored dicts are left untouched.
+
+        Constraint choice: ``min_length=1`` guards the concept ``text`` and the
+        relation endpoints, because an empty one produces no node/edge. The
+        relation ``text`` deliberately has NO minimum length: the store
+        tolerates a blank relation text, so rejecting the WHOLE payload for it
+        would be stricter than the writer. Such an item is instead dropped and
+        counted by ``_drop_unstorable_items``/``_count_dropped_items``, so one
+        blank text becomes a ``dropped=<n>`` partial result, never a schema
+        rejection and never a silent ``done``.
         """
         concept_keys = sorted(self._concept_definitions.keys()) or sorted(
             parse_definitions(DEFAULT_CONCEPT_DEFINITIONS).keys()
@@ -4295,7 +4335,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             type=(RelationType, ...),
             origin=(str, Field(min_length=1)),
             destination=(str, Field(min_length=1)),
-            text=(str, Field(min_length=1)),
+            # No min_length: the store writes the edge even with a blank text.
+            # A blank text is dropped and counted downstream instead of
+            # rejecting the whole payload at validation time.
+            text=(str, ...),
         )
         return create_model(
             "ExtractionResult",

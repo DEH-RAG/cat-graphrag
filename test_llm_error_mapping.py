@@ -20,7 +20,14 @@ Covers the graph concept phase contract (``_extract_concept_relations`` /
       not as zero candidates (MAJOR-1 MINOR-4);
   (i) ``enable_concept_relations=False`` -> ``skipped`` with a reason, never
       ``done`` (MAJOR-1 MINOR-5), and the fingerprint covers the toggle;
-  (j) a clean NATIVE product still yields ``done`` with the product.
+  (j) a clean NATIVE product still yields ``done`` with the product;
+  (k) a non-list ``concepts``/``relations`` container (``null``/``0``) is
+      coerced to zero parsed items, counted as dropped, and never iterated
+      into a ``TypeError``;
+  (l) an empty relation ``text`` is allowed by the output model but dropped
+      and counted, never a whole-payload schema failure and never ``done``;
+  (m) a NATIVE payload with SOME items dropped -> ``error`` with
+      ``dropped>=1``, never ``done``.
 
 The Cat plugin loader imports every ``.py`` under a plugin folder at
 activation, so this whole file is inert on import: every import, class and
@@ -585,6 +592,127 @@ if __name__ == "__main__":
         assert len(stored["relations"]) == 1, stored
         print("PASS (j) clean native extraction -> done with the product")
 
+    # ------------------------------------------------------------------
+    # F2 MINOR/INFO items: malformed containers, empty relation text and
+    # the NATIVE partial-drop gap.
+    # ------------------------------------------------------------------
+
+    async def test_k_non_iterable_container_is_dropped_not_raised():
+        """MINOR (a): a ``concepts: null`` (or ``concepts: 0``) payload must
+        not raise while being iterated. It is a malformed container whose
+        items were all dropped, so the result is ``error`` with
+        ``dropped>=1`` and the raw prefix — never an exception, never ``done``."""
+        for bad in (None, 0):
+            _reset_fake()
+            raw = json.dumps(
+                {
+                    "concepts": bad,
+                    "relations": [
+                        {
+                            "type": "IS_A",
+                            "origin": "A",
+                            "destination": "B",
+                            "text": "A is a B",
+                        }
+                    ],
+                }
+            )
+            _FakeStructuredLLM.behavior = lambda raw=raw: (_ for _ in ()).throw(
+                StructuredLLMError("schema validation failed", raw)
+            )
+            handler = _make_handler()
+
+            with patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+                outcome = await handler._extract_concept_relations(
+                    "src-k", _points(), llm=object()
+                )
+
+            assert outcome["status"] == "error", (bad, outcome)
+            assert outcome["status"] != "done", (bad, outcome)
+            assert "dropped=1" in (outcome.get("reason") or ""), (bad, outcome)
+            assert raw[:120] in (outcome.get("reason") or ""), (bad, outcome)
+            handler._store_concept_relations.assert_not_awaited()
+        print("PASS (k) non-iterable concepts container -> error, dropped>=1")
+
+    async def test_l_empty_relation_text_is_dropped_not_schema_failure():
+        """MINOR (b): the model allows an empty relation ``text`` (the store
+        tolerates it), but such an item is DROPPED and counted, so one empty
+        text yields ``error`` with ``dropped>=1`` instead of rejecting the
+        whole payload at validation time or silently passing as ``done``."""
+        _reset_fake()
+        payload = {
+            "concepts": [{"type": "DEFINITION", "text": "Algebra"}],
+            "relations": [
+                {
+                    "type": "IS_A",
+                    "origin": "Algebra",
+                    "destination": "Mathematics",
+                    "text": "",
+                }
+            ],
+        }
+        handler = _make_handler()
+
+        if _REAL_PYDANTIC:
+            model = handler._build_llm_output_model()
+            instance = model(**payload)  # must NOT raise
+            assert instance.relations[0].text == "", instance
+            try:
+                model(
+                    concepts=[{"type": "DEFINITION", "text": ""}], relations=[]
+                )
+            except Exception:
+                pass
+            else:
+                raise AssertionError(
+                    "concept text must stay constrained by min_length=1"
+                )
+
+        outcome = await handler._extract_concept_relations(
+            "src-l", _points(), llm=_NativeSeamLLM(payload)
+        )
+
+        assert outcome["status"] == "error", outcome
+        assert outcome["status"] != "done", outcome
+        assert "dropped=1" in (outcome.get("reason") or ""), outcome
+        assert json.dumps(payload)[:120] in (outcome.get("reason") or ""), outcome
+        handler._store_concept_relations.assert_not_awaited()
+        print(
+            "PASS (l) empty relation text -> dropped=1, never a schema failure"
+        )
+
+    async def test_m_native_partial_drop_is_error_not_done():
+        """MINOR (e): a NATIVE payload with SOME items dropped (one storable
+        concept + one whitespace-only concept) must be ``error`` with
+        ``dropped>=1`` and the raw prefix, never ``done``."""
+        _reset_fake()
+        payload = {
+            "concepts": [
+                {"type": "DEFINITION", "text": "Algebra"},
+                {"type": "DEFINITION", "text": "   "},
+            ],
+            "relations": [
+                {
+                    "type": "PREREQUISITE_FOR",
+                    "origin": "Algebra",
+                    "destination": "Calculus",
+                    "text": "Algebra precedes Calculus",
+                }
+            ],
+        }
+        handler = _make_handler()
+
+        outcome = await handler._extract_concept_relations(
+            "src-m", _points(), llm=_NativeSeamLLM(payload)
+        )
+
+        assert outcome["status"] == "error", outcome
+        assert outcome["status"] != "done", outcome
+        assert "dropped=1" in (outcome.get("reason") or ""), outcome
+        assert json.dumps(payload)[:120] in (outcome.get("reason") or ""), outcome
+        handler._store_concept_relations.assert_not_awaited()
+        print("PASS (m) native partial drop -> error with dropped=1, never done")
+
     async def _main():
         await test_a_structured_error_is_never_done()
         await test_b_no_llm_is_configuration_error()
@@ -596,10 +724,13 @@ if __name__ == "__main__":
         await test_h_non_list_items_count_as_dropped()
         await test_i_disabled_feature_is_skipped_not_done()
         await test_j_native_clean_product_is_done()
+        await test_k_non_iterable_container_is_dropped_not_raised()
+        await test_l_empty_relation_text_is_dropped_not_schema_failure()
+        await test_m_native_partial_drop_is_error_not_done()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM error mapping (ten tests, native path included)")
+    print("OK LLM error mapping (thirteen tests, native path included)")
