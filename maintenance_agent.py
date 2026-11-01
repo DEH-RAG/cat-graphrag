@@ -490,13 +490,19 @@ def _print_plan(plan: list[_PlanEntry]) -> None:
                 )
             elif op == "graph":
                 print("    steps:")
-                print("      1. A0 wipe Cypher (5 tenant-filtered statements):")
+                print(
+                    "      1. A0 wipe Cypher (5 tenant-filtered statements):"
+                )
                 for stmt in _graph_wipe_statements("<gen>"):
                     print(f"         {stmt}")
                 print(
-                    "      2. re-walk documents (NER + similarity + derived)"
+                    "      2. reset the graph phases' diary entries for every "
+                    "source (data deleted first, state last)"
                 )
-                print("      3. LLM concept relations (if enabled)")
+                print(
+                    "      3. re-walk documents (NER + similarity + derived)"
+                )
+                print("      4. LLM concept relations (if enabled)")
     print("(dry-run: exiting 2, nothing was written)")
 
 
@@ -731,8 +737,7 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     try:
         from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
         from cat.core_plugins.cat_efficient_ingestion.registry import (
-            clear_completed_phases,
-            delete_status,
+            purge_source_for_reingest,
         )
     except ImportError as exc:
         _abort_missing_effing(exc)
@@ -773,16 +778,19 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
                 f"detail=url-pass-through source={source.name}"
             )
             continue
-        await vector_handler.delete_tenant_points(
-            str(collection), metadata={"source": source.name}
+        # DATA FIRST, STATE LAST — through the shared EffING helper so the two
+        # sides can never be reordered: the points are deleted, THEN the diary
+        # is cleared (every phase, not a hardcoded pair), THEN the status row.
+        # If the vector delete raises, neither the diary nor the row is
+        # touched, and the source re-runs from its current checkpoint.
+        await purge_source_for_reingest(
+            agent_id,
+            "agent",
+            source.name,
+            lambda: vector_handler.delete_tenant_points(
+                str(collection), metadata={"source": source.name}
+            ),
         )
-        # The points are gone: the completed-phases diary MUST go too, or the
-        # phases look fresh against the intact diary and never re-run (the
-        # source would keep 0 chunk points and ``catalog_cards`` would fail
-        # forever). Clear it BEFORE delete_status so a failing delete_status
-        # cannot leave a lying diary next to wiped points.
-        await clear_completed_phases(agent_id, "agent", source.name)
-        await delete_status(agent_id, "agent", source.name)
 
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
     return True
@@ -891,6 +899,53 @@ async def _graph_walk_batch(handler, batch: list[dict[str, Any]], collection: st
             await handler._create_similarity_relationships(doc_id, vector, collection)
 
 
+async def _graph_phase_ids(ccat) -> list[str]:
+    """The graph phases THIS plugin registers with EffING (never hardcoded).
+
+    Reads the same ``ingestion_phase_specs`` accumulator the plugin registers
+    at activation, so adding/renaming a graph phase updates the ``--graph``
+    invalidation automatically. Returns ``[]`` when the plugin module (or
+    EffING) is unavailable.
+    """
+    plugin_id = _resolve_plugin_id()
+    if plugin_id is None:
+        return []
+    try:
+        plugin_main = importlib.import_module(f"cat.plugins.{plugin_id}.main")
+        specs = plugin_main.ingestion_phase_specs([], ccat)
+    except Exception:  # noqa: BLE001 - invalidation must not abort the wipe
+        return []
+    return [spec.id for spec in specs if getattr(spec, "id", None)]
+
+
+async def _reset_graph_phase_entries(ccat, tenant_id: str) -> int:
+    """Drop the graph phases' diary entries after the graph data was wiped.
+
+    **DATA FIRST, STATE LAST**: called only after ``_graph_wipe`` succeeded.
+    The tenant-wide wipe removes every source's graph edges/entities, so EVERY
+    status doc of this agent (all scopes) must stop recording the graph phases
+    as ``complete`` — otherwise the next ingestion trusts a diary whose data is
+    gone and skips the rebuild. EffING enumerates the docs; this helper only
+    supplies the phase ids it owns.
+    """
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            reset_phase_entries_for_agent,
+        )
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+
+    phase_ids = await _graph_phase_ids(ccat)
+    if not phase_ids:
+        return 0
+    changed = await reset_phase_entries_for_agent(tenant_id, phase_ids)
+    print(
+        f"[maintenance] agent={tenant_id} op=graph detail=phase-state-reset "
+        f"phases={phase_ids} docs={changed}"
+    )
+    return changed
+
+
 async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
     """Rebuild the FIXED graph part: wipe-then-re-walk (NER + similarity + derived).
 
@@ -923,6 +978,11 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
 
     # ── Phase A0: wipe ────────────────────────────────────────────────────
     await _graph_wipe(handler, tenant_id, gen)
+    # The graph data is gone: immediately drop the graph phases' diary entries
+    # (state LAST). A later crash in the rebuild then leaves the phases
+    # pending, so the next ingestion re-runs them instead of trusting a
+    # ``complete`` entry over deleted graph artifacts.
+    await _reset_graph_phase_entries(ccat, tenant_id)
 
     # ── Phase A1: fetch ───────────────────────────────────────────────────
     docs = await _graph_fetch_docs(handler, tenant_id, gen)
