@@ -26,6 +26,19 @@ from typing import Any, Awaitable, Callable
 
 from cat.log import log
 
+# Only transient failures are retried. ``TransientError`` covers the lock /
+# leader / termination family (``DeadlockDetected``, ``LockClientStopped``,
+# ``LeaderSwitch``, ``Termination``); anything else must propagate untouched.
+# The guarded alias keeps this module importable by the standalone harnesses
+# whose neo4j stub only defines ``Neo4jError``; the empty-tuple fallback
+# matches nothing, so an unresolved class never causes retry-everything.
+_TRANSIENT_ERROR_TYPES: tuple[type[BaseException], ...]
+try:  # pragma: no cover - the fallback only matters for those test stubs
+    from neo4j.exceptions import TransientError as _TransientError
+    _TRANSIENT_ERROR_TYPES = (_TransientError,)
+except ImportError:  # pragma: no cover
+    _TRANSIENT_ERROR_TYPES = ()
+
 # Upper bound for a single backoff sleep, independent of the attempt number.
 _MAX_RETRY_DELAY = 1.0
 
@@ -58,18 +71,13 @@ async def with_transient_retry(
     ``coro_factory`` must be a zero-argument callable returning a FRESH
     awaitable, so every attempt starts a new coroutine.
     """
-    # Lazy import: keeps this module importable by the standalone harnesses
-    # whose neo4j stub only defines ``Neo4jError`` (the helper is never called
-    # there), while production always resolves the real exception class.
-    from neo4j.exceptions import TransientError
-
     if attempts < 1:
         attempts = 1
 
     for attempt in range(1, attempts + 1):
         try:
             return await coro_factory()
-        except TransientError as exc:
+        except _TRANSIENT_ERROR_TYPES as exc:
             if attempt >= attempts:
                 raise
             delay = _retry_delay(attempt, base_delay, max_delay)
