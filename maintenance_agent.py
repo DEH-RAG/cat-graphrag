@@ -714,6 +714,68 @@ async def _preflight_reembed_path(ccat) -> str | None:
     return None
 
 
+def _union_with_stored_files(ccat, agent_id: str | None, sources: list) -> list:
+    """Union the vector-store sources with the agent's stored files.
+
+    ``get_stored_sources_with_metadata`` reads the VECTOR STORE, so a source
+    whose points were already wiped by a failed re-ingest is invisible and can
+    never be recovered. The bytes still live in the file manager, so every
+    stored file missing from the vector enumeration is appended, built through
+    EffING's existing ``_source_from_entry`` loader (the same ``BytesIO`` shape
+    the vector-store enumeration produces). Dedup is by ``name``.
+
+    Derived image artifacts (``<stem>_img_<index>_<digest>.<ext>``, produced by
+    cat-multimodal-ingestion) are NOT sources: they are artifacts of their
+    parent file. They are skipped explicitly and logged; re-ingesting them
+    would mint duplicate image sources next to the parent PDF.
+
+    Read-only and fail-open: a missing/unusable file manager or an
+    unreadable file only logs, leaving the vector-store sources untouched.
+    """
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.resume import _source_from_entry
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+
+    if not agent_id:
+        return sources
+    file_manager = getattr(ccat, "file_manager", None)
+    if file_manager is None:
+        return sources
+
+    try:
+        stored_files = file_manager.list_files(agent_id)
+    except Exception as exc:  # noqa: BLE001 - enumeration must never abort reingest
+        print(
+            f"[maintenance] agent={agent_id} op=reingest result=warn "
+            f"detail=file-manager-list-failed error={exc!r}"
+        )
+        return sources
+
+    merged = list(sources)
+    seen = {source.name for source in merged}
+    for entry in stored_files:
+        name = getattr(entry, "name", None)
+        if not name or name in seen:
+            continue
+        if "_img_" in name:
+            print(
+                f"[maintenance] agent={agent_id} op=reingest result=warn "
+                f"detail=derived-image-skip source={name}"
+            )
+            continue
+        source = _source_from_entry(ccat, agent_id, "agent", name, "file")
+        if source is None:
+            print(
+                f"[maintenance] agent={agent_id} op=reingest result=warn "
+                f"detail=stored-file-unreadable source={name}"
+            )
+            continue
+        merged.append(source)
+        seen.add(name)
+    return merged
+
+
 async def _op_reingest(ccat, handler, collection: str) -> bool:
     """Re-ingest from scratch: delete points per source, then re-parse + re-embed.
 
@@ -733,6 +795,15 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     ``content=None`` path in ``_source_from_entry``), so their points are NOT
     deleted by source name — each pass-through is logged
     (``detail=url-pass-through``).
+
+    Enumeration is the UNION of the vector-store sources and the agent's
+    stored files (``ccat.file_manager.list_files(agent_id)``): a source whose
+    points were already deleted by a failed re-ingest is invisible to the
+    vector store, so a points-only enumeration could never recover it. Stored
+    files without points are added through the existing EffING
+    ``_source_from_entry`` loader (no second content loader); derived image
+    artifacts (``*_img_*.jpg``-style names) are skipped and logged, since they
+    belong to their parent PDF.
     """
     try:
         from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
@@ -755,6 +826,7 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
 
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
+    sources = _union_with_stored_files(ccat, agent_id, sources)
 
     # PREFLIGHT: never wipe when the re-embed path cannot rebuild. This runs
     # before the points-first delete loop below, so a broken path aborts the
