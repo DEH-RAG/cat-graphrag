@@ -1,5 +1,6 @@
 import random
 import math
+import os
 import uuid
 import json
 import re
@@ -49,6 +50,100 @@ from .versioning import ensure_version, retry_on_generation_change, with_transie
 # the wipe must reconnect with the params the handler last used. Import-safe:
 # plain module-level dict, no side effects.
 _last_graphrag_config: Dict[str, Dict[str, Any]] = {}
+
+
+#: Default wall-clock deadline (seconds) for ONE structured LLM call. A
+#: streaming response has no overall deadline, so the phase must bound the
+#: await itself; without it a stalled socket keeps the phase ``processing``
+#: forever and the not-ready budget never gets a chance to run.
+LLM_CALL_TIMEOUT_DEFAULT_SECONDS = 180.0
+
+
+def llm_call_timeout_seconds() -> float:
+    """Wall-clock deadline for one structured LLM extraction call.
+
+    ``CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS`` overrides the 180 s default.
+    Invalid (non-numeric, non-finite or non-positive) values fall back to the
+    default, the same validation the plugin's other budgets apply.
+    """
+    raw = os.environ.get("CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS")
+    if raw is None:
+        return LLM_CALL_TIMEOUT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            f"[GraphRAG] Invalid CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS={raw!r}; "
+            f"using default {LLM_CALL_TIMEOUT_DEFAULT_SECONDS:.0f}s"
+        )
+        return LLM_CALL_TIMEOUT_DEFAULT_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        log.warning(
+            f"[GraphRAG] Non-positive/non-finite "
+            f"CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS={value}; "
+            f"using default {LLM_CALL_TIMEOUT_DEFAULT_SECONDS:.0f}s"
+        )
+        return LLM_CALL_TIMEOUT_DEFAULT_SECONDS
+    return value
+
+
+class _NonStreamingStructuredLLM:
+    """LLM view that disables streaming for ONE structured extraction call.
+
+    The LangChain idiom ``llm.bind(streaming=False)`` does NOT survive the
+    native structured path: a ``RunnableBinding`` forwards
+    ``with_structured_output`` to the UNBOUND model
+    (``RunnableBinding.__getattr__``), so the binding's kwargs never reach the
+    call. This view applies a falsy ``stream`` kwarg to the runnable that is
+    actually invoked (``BaseChatModel._streaming_disabled`` honors it), with a
+    ``bind`` fallback for models whose ``with_structured_output`` rejects extra
+    kwargs. The agent's global LLM is never mutated.
+    """
+
+    #: Exposed so a caller/test can assert streaming is off for this view.
+    streaming = False
+
+    def __init__(self, llm: Any):
+        self._llm = llm
+
+    def with_structured_output(self, output_model: Any) -> Any:
+        try:
+            # ChatOpenAI/OpenRouterLLM pass extra kwargs through to
+            # ``bind_tools``, so ``stream=False`` reaches the invocation.
+            return self._llm.with_structured_output(output_model, stream=False)
+        except (AttributeError, TypeError, ValueError):
+            bounded = self._llm.with_structured_output(output_model)
+            try:
+                return bounded.bind(stream=False)
+            except (AttributeError, TypeError):
+                return bounded
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            bound = self._llm.bind(stream=False)
+        except (AttributeError, TypeError):
+            return await self._llm.ainvoke(*args, **kwargs)
+        return await bound.ainvoke(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._llm, name)
+
+
+def _without_streaming(llm: Any) -> Any:
+    """Return a streaming-disabled view of ``llm`` for the structured call."""
+    if hasattr(llm, "with_structured_output"):
+        return _NonStreamingStructuredLLM(llm)
+    try:
+        return llm.bind(stream=False)
+    except (AttributeError, TypeError):
+        return llm
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    """Whether ``error`` is a wall-clock or client-side timeout."""
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    return "timeout" in type(error).__name__.lower()
 
 
 def _upper_str(value: Any) -> str:
@@ -3761,6 +3856,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
           client failed before producing output: timeout / 429 / 5xx / dropped
           connection) or any other exception escaping the client ->
           ``not_ready``;
+        - wall-clock/client timeout -> ``not_ready`` on the FIRST attempt
+          (retried inside the phase's budget), then ``error`` naming the
+          timeout. The await itself is bounded by
+          ``CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS`` (default 180 s), so a
+          stalled streaming socket can never keep the phase ``processing``;
         - empty product on non-empty text (unparsable raw, an empty-but-valid
           native payload, or every item unstorable) -> ``not_ready`` on the
           FIRST attempt (transient, retried inside the phase's budget), then
@@ -3809,9 +3909,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # model (todo 2) whitelist-enforces concept/relation types at
         # validation time.
         output_model = self._build_llm_output_model()
+        call_timeout = llm_call_timeout_seconds()
         try:
-            result = await StructuredLLM().run(
-                full_prompt, llm, output_model
+            # Wall-clock deadline: streaming responses have no overall
+            # deadline, so the await itself must be bounded or a stalled
+            # socket keeps the phase ``processing`` forever. The structured
+            # call also runs with streaming disabled: structured output only
+            # needs the final payload, and streaming is what made the client
+            # timeout ineffective.
+            result = await asyncio.wait_for(
+                StructuredLLM().run(
+                    full_prompt, _without_streaming(llm), output_model
+                ),
+                timeout=call_timeout,
             )
             model = result.model
             if hasattr(model, "model_dump"):
@@ -3916,7 +4026,33 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     ),
                 }
             return {"status": "done", "concepts": concepts, "relations": relations}
-        except Exception as e:  # noqa: BLE001 - transient client failure
+        except Exception as e:  # noqa: BLE001 - client failure or timeout
+            if _is_timeout_error(e):
+                # Transient on the first attempt (the phase's own not-ready
+                # budget then governs retries); a repeat timeout in the same
+                # handler is terminal and names the timeout so the phase can
+                # never stay ``processing`` forever.
+                log.warning(
+                    f"[GraphRAG] LLM extraction timed out after "
+                    f"{call_timeout:.0f}s (attempt {attempt}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                if attempt <= 1:
+                    return {
+                        "status": "not_ready",
+                        "reason": (
+                            f"LLM extraction timed out after {call_timeout:.0f}s "
+                            f"(attempt {attempt}); retrying"
+                        ),
+                        "retry_after": 5,
+                    }
+                return {
+                    "status": "error",
+                    "reason": (
+                        f"LLM extraction timed out after {call_timeout:.0f}s "
+                        f"after {attempt} attempt(s)"
+                    ),
+                }
             log.warning(
                 f"[GraphRAG] Transient LLM extraction failure (attempt {attempt}): "
                 f"{type(e).__name__}: {e}"
