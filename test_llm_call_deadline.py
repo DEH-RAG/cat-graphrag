@@ -10,9 +10,10 @@ the phase ``processing`` forever. These cases lock the fix:
   (c) a normal fast LLM still returns ``done`` with the product;
   (d) the deadline is bounded by ``CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS``
       (a small value is set in the test);
-  (e) streaming is disabled for the structured call (the view passed to
-      ``StructuredLLM`` is streaming-off and the native structured invocation
-      carries ``stream=False``).
+  (e) streaming is disabled AND reasoning is turned off for the structured
+      call (the view passed to ``StructuredLLM`` carries a falsy ``stream`` kwarg
+      and the OpenRouter ``reasoning`` override), while the original LLM object
+      is left unmodified.
 
 The Cat plugin loader imports every ``.py`` under a plugin folder at
 activation, so this whole file is inert on import: every import, class and
@@ -222,9 +223,14 @@ if __name__ == "__main__":
             return _Result(_PRODUCT, json.dumps(_PRODUCT))
 
     class _StreamingLLM:
-        """LLM recording how the structured call is invoked."""
+        """ChatOpenAI-like LLM recording how the structured call is invoked."""
 
         streaming = True
+        extra_body = None
+        reasoning = None
+        # ChatOpenAI exposes ``extra_body`` as a pydantic field; the plugin only
+        # sends the OpenRouter reasoning override to models that accept it.
+        model_fields = {"extra_body": None, "reasoning": None}
 
         def __init__(self):
             self.structured_kwargs = None
@@ -239,6 +245,24 @@ if __name__ == "__main__":
             clone = _StreamingLLM()
             clone.streaming = kwargs.get("stream", kwargs.get("streaming", True))
             return clone
+
+    class _NonNativeLLM:
+        """LLM without native structured output: exercises the fallback path."""
+
+        streaming = True
+        extra_body = None
+        reasoning = None
+        model_fields = {"extra_body": None, "reasoning": None}
+
+        def __init__(self):
+            self.bind_kwargs = None
+
+        def bind(self, **kwargs):
+            self.bind_kwargs = kwargs
+            return self
+
+        async def ainvoke(self, *args, **kwargs):
+            return _Result(_PRODUCT, json.dumps(_PRODUCT))
 
     def _make_handler():
         handler = graphrag_handler.GraphRAGHandler(
@@ -351,7 +375,7 @@ if __name__ == "__main__":
                 _set_env(None)
         print("PASS (d) deadline bounded by the env value; invalid values -> 180s")
 
-    async def test_e_structured_call_has_streaming_disabled():
+    async def test_e_structured_call_disables_streaming_and_reasoning():
         handler = _make_handler()
         llm = _StreamingLLM()
         _set_env("5")
@@ -368,22 +392,40 @@ if __name__ == "__main__":
         assert outcome["status"] == "done", outcome
         captured = _CapturingStructuredLLM.captured
         assert captured is not None, "StructuredLLM was not called"
+        # (a) the bound structured request carries stream + reasoning override.
         assert getattr(captured, "streaming", None) is False, captured
         assert llm.structured_kwargs is not None, "structured call not invoked"
         assert llm.structured_kwargs.get("stream") is False, llm.structured_kwargs
+        assert llm.structured_kwargs.get("extra_body") == {
+            "reasoning": {"enabled": False}
+        }, llm.structured_kwargs
+        # (c) the original LLM object is untouched by the per-call view.
         assert getattr(llm, "streaming", None) is True, "global LLM was mutated"
-        print("PASS (e) structured call runs with streaming disabled")
+        assert llm.extra_body is None, "global LLM extra_body was mutated"
+        assert llm.reasoning is None, "global LLM reasoning was mutated"
+        print("PASS (e) structured call disables streaming + reasoning, LLM untouched")
+
+    async def test_f_fallback_call_disables_reasoning():
+        llm = _NonNativeLLM()
+        view = graphrag_handler._without_streaming(llm)
+        assert view.bind_kwargs.get("stream") is False, view.bind_kwargs
+        assert view.bind_kwargs.get("extra_body") == {
+            "reasoning": {"enabled": False}
+        }, view.bind_kwargs
+        assert llm.extra_body is None, "global LLM extra_body was mutated"
+        print("PASS (f) fallback call disables streaming + reasoning, LLM untouched")
 
     async def _main():
         await test_a_never_returning_llm_is_not_ready()
         await test_b_budget_exhausted_is_error_naming_timeout()
         await test_c_fast_llm_still_done_with_product()
         await test_d_deadline_bounded_by_env()
-        await test_e_structured_call_has_streaming_disabled()
+        await test_e_structured_call_disables_streaming_and_reasoning()
+        await test_f_fallback_call_disables_reasoning()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM call deadline (five tests)")
+    print("OK LLM call deadline (six tests)")

@@ -87,8 +87,32 @@ def llm_call_timeout_seconds() -> float:
     return value
 
 
+#: Reasoning override applied to the structured extraction call ONLY.
+#:
+#: ``~deepseek/deepseek-flash-latest`` is a reasoning model whose alias defaults
+#: to reasoning enabled at effort ``high``. A real extraction generated ~6.6k
+#: hidden reasoning tokens — 79 % of the output — which made latency 23–93 s and
+#: occasionally pushed one call past the 180 s deadline. Disabling reasoning for
+#: this one call removes those tokens; concept/relation extraction only needs the
+#: final JSON, not a chain of thought. The agent's global LLM is never mutated.
+EXTRACTION_REASONING_OVERRIDE: Dict[str, Any] = {"enabled": False}
+
+
+def _supports_extra_body(llm: Any) -> bool:
+    """Whether ``llm`` accepts a per-call ``extra_body`` (ChatOpenAI/OpenRouter)."""
+    return "extra_body" in (getattr(type(llm), "model_fields", None) or {})
+
+
+def _extraction_call_kwargs(llm: Any) -> Dict[str, Any]:
+    """Per-call kwargs for the extraction invocation (never mutate ``llm``)."""
+    kwargs: Dict[str, Any] = {"stream": False}
+    if _supports_extra_body(llm):
+        kwargs["extra_body"] = {"reasoning": dict(EXTRACTION_REASONING_OVERRIDE)}
+    return kwargs
+
+
 class _NonStreamingStructuredLLM:
-    """LLM view that disables streaming for ONE structured extraction call.
+    """Per-call view: no streaming, no reasoning, for ONE extraction call.
 
     The LangChain idiom ``llm.bind(streaming=False)`` does NOT survive the
     native structured path: a ``RunnableBinding`` forwards
@@ -97,7 +121,11 @@ class _NonStreamingStructuredLLM:
     call. This view applies a falsy ``stream`` kwarg to the runnable that is
     actually invoked (``BaseChatModel._streaming_disabled`` honors it), with a
     ``bind`` fallback for models whose ``with_structured_output`` rejects extra
-    kwargs. The agent's global LLM is never mutated.
+    kwargs.
+
+    It also sends an OpenRouter ``reasoning`` override through ``extra_body``:
+    the extraction model reasons at effort ``high`` by default, spending most of
+    its output on hidden tokens. The agent's global LLM/config is never mutated.
     """
 
     #: Exposed so a caller/test can assert streaming is off for this view.
@@ -105,36 +133,41 @@ class _NonStreamingStructuredLLM:
 
     def __init__(self, llm: Any):
         self._llm = llm
+        #: Exposed so a caller/test can assert the per-call override.
+        self.call_kwargs = _extraction_call_kwargs(llm)
 
     def with_structured_output(self, output_model: Any) -> Any:
         try:
             # ChatOpenAI/OpenRouterLLM pass extra kwargs through to
-            # ``bind_tools``, so ``stream=False`` reaches the invocation.
-            return self._llm.with_structured_output(output_model, stream=False)
+            # ``bind_tools``, so ``stream`` and ``extra_body`` reach the request.
+            return self._llm.with_structured_output(
+                output_model, **self.call_kwargs
+            )
         except (AttributeError, TypeError, ValueError):
             bounded = self._llm.with_structured_output(output_model)
             try:
-                return bounded.bind(stream=False)
+                return bounded.bind(**self.call_kwargs)
             except (AttributeError, TypeError):
                 return bounded
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        call_kwargs = {**self.call_kwargs, **kwargs}
         try:
-            bound = self._llm.bind(stream=False)
+            bound = self._llm.bind(**call_kwargs)
         except (AttributeError, TypeError):
             return await self._llm.ainvoke(*args, **kwargs)
-        return await bound.ainvoke(*args, **kwargs)
+        return await bound.ainvoke(*args)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._llm, name)
 
 
 def _without_streaming(llm: Any) -> Any:
-    """Return a streaming-disabled view of ``llm`` for the structured call."""
+    """Return a no-streaming/no-reasoning view of ``llm`` for the structured call."""
     if hasattr(llm, "with_structured_output"):
         return _NonStreamingStructuredLLM(llm)
     try:
-        return llm.bind(stream=False)
+        return llm.bind(**_extraction_call_kwargs(llm))
     except (AttributeError, TypeError):
         return llm
 
@@ -3914,9 +3947,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Wall-clock deadline: streaming responses have no overall
             # deadline, so the await itself must be bounded or a stalled
             # socket keeps the phase ``processing`` forever. The structured
-            # call also runs with streaming disabled: structured output only
-            # needs the final payload, and streaming is what made the client
-            # timeout ineffective.
+            # call also runs with streaming disabled and reasoning turned off
+            # for this call only (``_without_streaming``): the model defaults
+            # to effort ``high``, and hidden reasoning tokens dominated the
+            # latency while the extraction only needs the final JSON.
             result = await asyncio.wait_for(
                 StructuredLLM().run(
                     full_prompt, _without_streaming(llm), output_model
