@@ -1523,12 +1523,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             self._pending_entity_tasks.append(sim_task)
             self._track_source_task((metadata or {}).get("source"), sim_task)
 
-        # Clean up completed tasks
+        # Clean up completed tasks in the FLAT view only (close() bookkeeping).
+        # The per-source view is deliberately NOT pruned here: ``drain_source_tasks``
+        # is what consumes those tasks and gathers their results into the single
+        # per-source write, so dropping a FINISHED task at this point would
+        # silently lose that chunk's entities/relations. A source's list is
+        # released when it is drained (pop), at close(), or when the source is
+        # explicitly deleted/purged (``_drop_source_tasks``).
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
-        # Mirror the prune in the per-source view so the dict does not grow
-        # with finished tasks of sources that never get drained.
-        for _src, _tasks in list(self._pending_source_tasks.items()):
-            self._pending_source_tasks[_src] = [t for t in _tasks if not t.done()]
 
         return PointStruct(
             id=point_id,
@@ -1549,9 +1551,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         The same task stays in the flat ``_pending_entity_tasks`` list (so
         ``close()`` still drains it); this dict is the per-source view the
         graph-building phase uses to join ONLY one source's work.
+
+        Tasks stay here until ``drain_source_tasks`` pops the list — including
+        tasks that already FINISHED. Their result is the graph payload, so it
+        must survive until the batch write, not be pruned on completion.
         """
         if source:
             self._pending_source_tasks.setdefault(source, []).append(task)
+
+    def _drop_source_tasks(self, source: Optional[str]) -> None:
+        """Forget a source's tracked tasks because its graph is being deleted.
+
+        Only the explicit delete/purge paths call this: their results are
+        irrelevant once the source's artifacts are gone. The tasks themselves
+        stay in the flat list so ``close()`` still cancels the running ones;
+        completed ones are pruned there. Together with ``close()`` (whole-dict
+        clear) and ``drain_source_tasks`` (pop) this is what keeps the dict from
+        growing without bound in a long-lived process.
+        """
+        if source:
+            self._pending_source_tasks.pop(source, None)
 
     def has_pending_source_tasks(self, source: str) -> bool:
         """Whether any LIVE background task remains for a source.
@@ -2620,6 +2639,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     @tenant_write_locked("delete tenant points")
     async def delete_tenant_points(self, collection_name: str, metadata: Dict | None = None) -> UpdateResult:
         await self._ensure_connected()
+        # The source is being deleted: any pending extraction result for it is
+        # irrelevant (the chunks and their artifacts are going away).
+        self._drop_source_tasks((metadata or {}).get("source"))
 
         operation_id = random.randint(1, 100000)
 
@@ -2734,6 +2756,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         a valid "nothing was derived" result, not an error).
         """
         await self._ensure_connected()
+        # The source's artifacts are being purged: drop its pending tasks so a
+        # late finished result cannot resurrect the graph that was just removed.
+        self._drop_source_tasks(source)
         tenant_id = self.agent_id
         meta_fragment = f'"source": {json.dumps(source)}'
         async with self._get_session() as session:
