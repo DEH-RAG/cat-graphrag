@@ -29,6 +29,10 @@ except ImportError:
 from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
+from .source_graph_writer import (
+    GRAPH_WRITE_BATCH_MAX_ITEMS,
+    write_source_graph,
+)
 from .structured_llm import StructuredLLM, StructuredLLMError
 from .tenant_write_lock import (
     TenantWriteLockTimeout,
@@ -182,10 +186,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # phase can join ONLY this source's work. Tasks are also in the flat
         # ``_pending_entity_tasks`` list (close() drains both).
         self._pending_source_tasks: Dict[str, List[asyncio.Task]] = {}
-        # Semaphore: caps concurrent Neo4j write transactions to reduce lock
-        # contention and deadlock probability during bulk PDF ingestion.
-        # Shared between entity extraction and similarity writes.
-        self._neo4j_write_semaphore = asyncio.Semaphore(4)
+        # Neo4j write transactions are serialised per tenant by the tenant
+        # write lock (see tenant_write_lock.py) and, on the graph path, by the
+        # one-transaction-per-source writer (source_graph_writer.py). This
+        # semaphore stays at 1 as a belt-and-braces guard: it must never allow
+        # more than one concurrent write transaction, which is exactly the
+        # condition that deadlocked on shared Entity nodes. Do not raise it and
+        # do not make it configurable.
+        self._neo4j_write_semaphore = asyncio.Semaphore(1)
         self._user_message = None
         self._embedder: Optional[Embeddings] = None
         # In-process fallback lock for reembed_tenant when the Cat distributed
@@ -1344,13 +1352,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
         # recorded ingestion phase); a direct/classic write defaults to False.
         if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
-            # ``detached_write_task`` clears the inherited write-lock context:
-            # this child must take the tenant write lock on its own, never write
-            # unlocked after the parent (add_point_to_tenant) releases it.
+            # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
+            # chunk of the source may extract in parallel. It returns the
+            # extracted batch; the source's ONE write happens in
+            # ``drain_source_tasks`` -> ``_write_source_graph`` when the batch
+            # is joined (never one concurrent write transaction per chunk).
             task = asyncio.create_task(
-                detached_write_task(
-                    self._extract_and_link_entities(point_id, content, metadata)
-                )
+                self._extract_document_graph(point_id, content, metadata)
             )
             self._pending_entity_tasks.append(task)
             self._track_source_task((metadata or {}).get("source"), task)
@@ -1407,23 +1415,46 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         tasks = self._pending_source_tasks.get(source) or []
         return any(not t.done() for t in tasks)
 
-    async def drain_source_tasks(self, source: str) -> None:
-        """Await (join) all background tasks spawned for one source, inline.
+    async def drain_source_tasks(self, source: str) -> bool:
+        """Join one source's background extraction and write it ONCE.
 
-        Pops the source's task list (both the per-source view and the flat
-        list) and gathers them. The underlying methods
-        (``_extract_and_link_entities`` / ``_create_similarity_relationships``)
-        already fail-soft internally, so a failure here is logged, not raised
-        — the deterministic phase work below re-runs the same steps awaited.
+        Extraction tasks are lock-free and run in parallel; their results are
+        accumulated here and flushed through ``_write_source_graph`` in ONE
+        transaction per source. Similarity tasks (which do write) are joined in
+        the same gather but return ``None`` and are ignored here.
+
+        Returns ``True`` when a graph write was performed, so the phase can
+        skip a redundant re-extraction after a completed background batch.
+        Failures are logged, never raised (the deterministic phase re-runs the
+        same steps awaited).
         """
         tasks = self._pending_source_tasks.pop(source, [])
         if not tasks:
-            return
+            return False
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        entities: List[Dict] = []
+        mentions: List[Dict] = []
+        relations: List[Dict] = []
         for r in results:
             if isinstance(r, Exception):
                 log.error(f"[GraphRAG] Background task for source '{source}' failed: {r}")
+            elif isinstance(r, dict) and "entities" in r:
+                entities.extend(r.get("entities") or [])
+                mentions.extend(r.get("mentions") or [])
+                relations.extend(r.get("relations") or [])
+
+        if not entities and not relations:
+            return False
+
+        await self._write_source_graph(
+            entities,
+            mentions,
+            relations,
+            operation=f"write source graph for '{source}'",
+        )
+        return True
 
     async def get_source_points_by_collection(self, source: str) -> Dict[str, List[Record]]:
         """Fetch all stored points of one source, grouped by collection.
@@ -1453,9 +1484,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         hook fired-and-forgot, but inline and awaited:
 
         1. joins the source's background NER/similarity tasks
-           (``drain_source_tasks``);
-        2. re-runs ``_extract_and_link_entities`` AWAITED for the source's
-           stored points (the NER + link that today runs in background);
+           (``drain_source_tasks``), which flushes the accumulated extraction
+           in ONE graph transaction (or sequential batches above the guard);
+        2. when no background batch was available (e.g. a phase retry after a
+           restart), extracts every stored chunk CONCURRENTLY (spaCy is
+           CPU-bound, no Neo4j locks) and writes the source's graph in ONE
+           transaction — never one concurrent transaction per chunk;
         3. re-runs ``_create_similarity_relationships`` for the source's
            stored points with valid vectors (needs valid vectors — that is
            why the embedding phase must precede).
@@ -1466,7 +1500,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         raise -> status=error, fail-hard). All writes are idempotent MERGEs,
         so re-running after a retry never duplicates data.
         """
-        await self.drain_source_tasks(source)
+        flushed = await self.drain_source_tasks(source)
 
         by_collection = await self.get_source_points_by_collection(source)
         if not by_collection:
@@ -1480,15 +1514,41 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if vector and self._is_valid_vector(vector):
                     await self._create_similarity_relationships(p.id, vector, collection_name)
 
-        # NER + link, awaited (mirrors the background spawner's guard).
-        if self._enable_entity_extraction and self._entity_extractor:
-            for p in all_points:
-                payload = getattr(p, "payload", None) or {}
-                content = payload.get("page_content", "")
-                if content:
-                    await self._extract_and_link_entities(
-                        p.id, content, payload.get("metadata", {})
+        # NER + link. When the background batch already produced the write,
+        # skip the redundant re-extraction. Otherwise extract every chunk
+        # CONCURRENTLY and write the source graph in ONE transaction.
+        if (
+            not flushed
+            and self._enable_entity_extraction
+            and self._entity_extractor
+        ):
+            extractions = await asyncio.gather(
+                *(
+                    self._extract_document_graph(
+                        p.id,
+                        (getattr(p, "payload", None) or {}).get("page_content", ""),
+                        (getattr(p, "payload", None) or {}).get("metadata", {}),
                     )
+                    for p in all_points
+                    if (getattr(p, "payload", None) or {}).get("page_content", "")
+                )
+            )
+            entities: List[Dict] = []
+            mentions: List[Dict] = []
+            relations: List[Dict] = []
+            for extracted in extractions:
+                if not extracted:
+                    continue
+                entities.extend(extracted["entities"])
+                mentions.extend(extracted["mentions"])
+                relations.extend(extracted["relations"])
+            if entities or relations:
+                await self._write_source_graph(
+                    entities,
+                    mentions,
+                    relations,
+                    operation=f"write source graph for '{source}'",
+                )
 
         return {"status": "done"}
 
@@ -1553,245 +1613,294 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         content: str,
         metadata: Dict,
     ) -> None:
-        """
-        Extracts entities from the document and links them to the graph.
-        Runs in the background.
+        """Extract ONE document and write it in ONE transaction.
 
-        Uses three batched UNWIND queries instead of N sequential calls:
-        one for entity nodes, one for MENTIONS edges, one for RELATED_TO edges.
-        Relations with the same (source, target, type) key are deduplicated
-        in Python before being sent, averaging their weights.
+        Kept for the single-document / classic call path. Batch ingestion
+        accumulates every chunk of a source first (see ``drain_source_tasks``
+        and ``run_spacy_extraction_phase``) and calls ``_write_source_graph``
+        ONCE per source instead of once per chunk.
         """
-        entity_embedding_prop = self._names["entity_embedding_prop"]
-        batch_entity_query = f"""
-        UNWIND $entities AS ent
-        MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
-        ON CREATE SET
-            e.name       = ent.name,
-            e.type       = ent.type,
-            e.types      = [ent.type],
-            e.created_at = datetime(),
-            e.metadata   = ent.metadata,
-            e.{entity_embedding_prop} = ent.embedding
-        ON MATCH SET
-            e.last_seen  = datetime(),
-            e.name       = ent.name,
-            e.types      = CASE WHEN ent.type IN coalesce(e.types, [])
-                THEN e.types ELSE coalesce(e.types, []) + ent.type END,
-            e.metadata   = ent.metadata,
-            e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
-                THEN ent.embedding ELSE e.{entity_embedding_prop} END
-        REMOVE e.concept_gen, e.concept_gen_active
-        """
+        extracted = await self._extract_document_graph(
+            document_id, content, metadata
+        )
+        if not extracted:
+            return
+        await self._write_source_graph(
+            extracted["entities"],
+            extracted["mentions"],
+            extracted["relations"],
+            operation=f"extract/link entities for document {document_id}",
+        )
 
-        batch_mention_query = """
-        MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
-        WITH d
-        UNWIND $mentions AS m
-        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
-        MERGE (d)-[r:MENTIONS]->(e)
-        ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
-        ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
-        """
+    async def _extract_document_graph(
+        self,
+        document_id: str,
+        content: str,
+        metadata: Dict,
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """Extract entities/mentions/relations for ONE document (NO DB writes).
 
-        batch_relation_query = """
-        UNWIND $relations AS rel
-        MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
-        MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
-        MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
-        ON CREATE SET
-            r.weight = rel.weight,
-            r.created_at = datetime(),
-            r.source_files = rel.source_files
-        ON MATCH SET
-            r.weight = (r.weight + rel.weight) / 2,
-            r.source_files = CASE
-                WHEN rel.source_files IS NULL THEN r.source_files
-                WHEN r.source_files IS NULL THEN rel.source_files
-                ELSE [x IN r.source_files WHERE NOT x IN rel.source_files] + rel.source_files
-            END
+        Pure extraction: spaCy is CPU-bound and takes no Neo4j locks, so this
+        may run concurrently for every chunk of a source. The write is deferred
+        to ``_write_source_graph`` (one transaction per source).
         """
-
-        # File-provenance edges: every entity created from this document's
-        # content gets a (Document)-[:PROVENANCE]->(Entity) edge, so a file
-        # deletion cascade can prune the entity exactly when ALL documents
-        # that referenced it are gone. `tracked_by_provenance` marks the
-        # entity as provenance-managed (legacy entities created before this
-        # migration are left untouched by the prune).
-        batch_provenance_query = """
-        UNWIND $mentions AS m
-        MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
-        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
-        MERGE (d)-[:PROVENANCE]->(e)
-        SET e.tracked_by_provenance = true
-        """
-
         # Which file produced this document? Used for the per-edge provenance
         # list on RELATED_TO relations (None for non-file memories such as
         # episodic points, which are never wiped per-source).
         _doc_source = (metadata or {}).get("source")
         _source_files = [_doc_source] if _doc_source else None
 
-        try:
-            extracted = await self._entity_extractor.extract(content, document_id, metadata)
-            if not extracted.entities:
-                return
+        extracted = await self._entity_extractor.extract(
+            content, document_id, metadata
+        )
+        if not extracted.entities:
+            return None
 
-            entity_type_map = {e.name: e.type for e in extracted.entities}
+        entity_type_map = {e.name: e.type for e in extracted.entities}
 
-            # Build batch payload for entities and mentions in one pass
-            entities_batch = []
-            mentions_batch = []
-            for entity in extracted.entities:
-                entity_id = self._entity_extractor.get_entity_hash(
-                    entity.name, entity.type, self.agent_id
+        # Build batch payload for entities and mentions in one pass.
+        entities_batch = []
+        mentions_batch = []
+        for entity in extracted.entities:
+            entity_id = self._entity_extractor.get_entity_hash(
+                entity.name, entity.type, self.agent_id
+            )
+            entities_batch.append({
+                "id":        entity_id,
+                "name":      _normalize_entity_name(entity.name),
+                "type":      entity.type.value,
+                # Serialise to JSON string: Neo4j does not support Map-type
+                # node properties (only primitives / arrays are allowed).
+                # Accumulated shape {"source_documents": [...],
+                # "confidence": <max>} — merged against the node's existing
+                # metadata inside _write_graph_plan_in_tx before it is persisted.
+                "metadata":  json.dumps({"source_documents": [document_id], "confidence": entity.confidence}),
+                "embedding": None,  # populated below when enable_entity_embeddings=True
+            })
+            mentions_batch.append({
+                "doc_id":     document_id,
+                "entity_id":  entity_id,
+                "confidence": entity.confidence,
+            })
+
+        # Batch-embed all entity names in one call (non-blocking via thread)
+        if self._enable_entity_embeddings and self._embedder is not None:
+            try:
+                names = [ent["name"] for ent in entities_batch]
+                embeddings = await asyncio.to_thread(
+                    self._embedder.embed_documents, names
                 )
-                entities_batch.append({
-                    "id":        entity_id,
-                    "name":      _normalize_entity_name(entity.name),
-                    "type":      entity.type.value,
-                    # Serialise to JSON string: Neo4j does not support Map-type
-                    # node properties (only primitives / arrays are allowed).
-                    # Accumulated shape {"source_documents": [...],
-                    # "confidence": <max>} — merged against the node's existing
-                    # metadata inside _write_entities before this is persisted.
-                    "metadata":  json.dumps({"source_documents": [document_id], "confidence": entity.confidence}),
-                    "embedding": None,  # populated below when enable_entity_embeddings=True
-                })
-                mentions_batch.append({
-                    "entity_id":  entity_id,
-                    "confidence": entity.confidence,
-                })
-
-            # Batch-embed all entity names in one call (non-blocking via thread)
-            if self._enable_entity_embeddings and self._embedder is not None:
-                try:
-                    names = [ent["name"] for ent in entities_batch]
-                    embeddings = await asyncio.to_thread(
-                        self._embedder.embed_documents, names
-                    )
-                    for ent, emb in zip(entities_batch, embeddings):
-                        if self._is_valid_vector(emb):
-                            ent["embedding"] = emb
-                        else:
-                            log.warning(
-                                f"[GraphRAG] Skipping entity embedding for {ent['name']}: "
-                                "zero or non-finite vector"
-                            )
-                except Exception as emb_err:
-                    log.warning(f"[GraphRAG] Entity embedding skipped: {emb_err}")
-
-            # Build and deduplicate relation payload (average weights on collision)
-            rel_map: Dict[Tuple, Dict] = {}
-            for relation in extracted.relations:
-                source_type = entity_type_map.get(relation.source_entity, EntityType.UNKNOWN)
-                target_type = entity_type_map.get(relation.target_entity, EntityType.UNKNOWN)
-                source_id = self._entity_extractor.get_entity_hash(
-                    relation.source_entity, source_type, self.agent_id
-                )
-                target_id = self._entity_extractor.get_entity_hash(
-                    relation.target_entity, target_type, self.agent_id
-                )
-                if not source_id or not target_id or source_id == target_id:
-                    continue
-                key = (source_id, target_id, relation.relation_type)
-                if key in rel_map:
-                    rel_map[key]["weight"] = (rel_map[key]["weight"] + relation.weight) / 2
-                else:
-                    rel_map[key] = {
-                        "source_id": source_id,
-                        "target_id": target_id,
-                        "rel_type":  relation.relation_type,
-                        "weight":    relation.weight,
-                        "source_files": _source_files,
-                    }
-            relations_batch = list(rel_map.values())
-
-            # Sort all batches by ID so every concurrent transaction acquires
-            # Neo4j node locks in the same order — breaks circular wait chains.
-            entities_batch.sort(key=lambda e: e["id"])
-            mentions_batch.sort(key=lambda m: m["entity_id"])
-            relations_batch.sort(key=lambda r: (r["source_id"], r["target_id"]))
-
-            # execute_write wraps all three queries in a single managed write
-            # transaction that the Neo4j driver automatically retries on
-            # TransientError (including DeadlockDetected).
-            # The semaphore caps concurrent write transactions to further
-            # reduce lock contention during bulk PDF ingestion.
-            async def _write_entities(tx):
-                # Metadata accumulation inside the write transaction: read each
-                # entity's existing metadata, merge it into the payload
-                # (source_documents dedup union + running max confidence) and let
-                # the ON CREATE / ON MATCH write below persist the merged
-                # JSON-string shape {"source_documents": [...], "confidence": m}.
-                # The bounded lost-update window under concurrent same-entity
-                # extractions is accepted — the write semaphore caps concurrency.
-                if entities_batch:
-                    meta_result = await tx.run(
-                        cast(
-                            LiteralString,
-                            """
-                            UNWIND $ids AS id
-                            MATCH (e:Entity {id: id, tenant_id: $tenant_id})
-                            RETURN id AS id, e.metadata AS metadata
-                            """,
-                        ),
-                        ids=[ent["id"] for ent in entities_batch],
-                        tenant_id=self.agent_id,
-                    )
-                    existing_metadata = {
-                        rec["id"]: rec["metadata"]
-                        async for rec in meta_result
-                    }
-                    for ent in entities_batch:
-                        ent["metadata"] = json.dumps(
-                            _merge_entity_metadata(
-                                existing_metadata.get(ent["id"]),
-                                json.loads(ent["metadata"]),
-                            )
+                for ent, emb in zip(entities_batch, embeddings):
+                    if self._is_valid_vector(emb):
+                        ent["embedding"] = emb
+                    else:
+                        log.warning(
+                            f"[GraphRAG] Skipping entity embedding for {ent['name']}: "
+                            "zero or non-finite vector"
                         )
+            except Exception as emb_err:
+                log.warning(f"[GraphRAG] Entity embedding skipped: {emb_err}")
 
-                await tx.run(
-                    cast(LiteralString, batch_entity_query),
-                    entities=entities_batch,
-                    tenant_id=self.agent_id,
-                )
-                await tx.run(
-                    cast(LiteralString, batch_mention_query),
-                    mentions=mentions_batch,
-                    doc_id=document_id,
-                    tenant_id=self.agent_id,
-                )
-                await tx.run(
-                    cast(LiteralString, batch_provenance_query),
-                    mentions=mentions_batch,
-                    doc_id=document_id,
-                    tenant_id=self.agent_id,
-                )
-                if relations_batch:
-                    await tx.run(
-                        cast(LiteralString, batch_relation_query),
-                        relations=relations_batch,
-                        tenant_id=self.agent_id,
-                    )
+        # Build and deduplicate relation payload (average weights on collision)
+        rel_map: Dict[Tuple, Dict] = {}
+        for relation in extracted.relations:
+            source_type = entity_type_map.get(relation.source_entity, EntityType.UNKNOWN)
+            target_type = entity_type_map.get(relation.target_entity, EntityType.UNKNOWN)
+            source_id = self._entity_extractor.get_entity_hash(
+                relation.source_entity, source_type, self.agent_id
+            )
+            target_id = self._entity_extractor.get_entity_hash(
+                relation.target_entity, target_type, self.agent_id
+            )
+            if not source_id or not target_id or source_id == target_id:
+                continue
+            key = (source_id, target_id, relation.relation_type)
+            if key in rel_map:
+                rel_map[key]["weight"] = (rel_map[key]["weight"] + relation.weight) / 2
+            else:
+                rel_map[key] = {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "rel_type":  relation.relation_type,
+                    "weight":    relation.weight,
+                    "source_files": _source_files,
+                }
 
-            async def _write_all():
-                async with self._neo4j_write_semaphore:
-                    async with self._get_session() as session:
-                        await session.execute_write(_write_entities)
+        return {
+            "entities": entities_batch,
+            "mentions": mentions_batch,
+            "relations": list(rel_map.values()),
+        }
 
+    @tenant_write_locked("write source graph")
+    async def _write_source_graph(
+        self,
+        entities: List[Dict],
+        mentions: List[Dict],
+        relations: List[Dict],
+        operation: str = "write source graph",
+    ) -> int:
+        """Write ONE source's graph in ONE transaction (sequential above guard).
+
+        Extraction stays parallel and lock-free; this is the single serialised
+        writer. ``source_graph_writer.write_source_graph`` deduplicates the
+        accumulated chunks (entities by id, relations by
+        ``(source_id, target_id, rel_type)``) and plans the transaction(s).
+        Below ``GRAPH_WRITE_BATCH_MAX_ITEMS`` that is exactly one transaction;
+        above it, transactions run strictly one after another, never concurrent.
+        """
+        if not entities and not relations:
+            return 0
+
+        async def _execute_plan(plan: Dict[str, List[Dict]]) -> None:
+            async with self._get_session() as session:
+                await session.execute_write(
+                    lambda tx: self._write_graph_plan_in_tx(tx, plan)
+                )
+
+        async def _execute_with_retry(plan: Dict[str, List[Dict]]) -> None:
+            # ``with_transient_retry`` stays the INNER layer of each batch.
             await with_transient_retry(
-                _write_all,
-                operation=f"extract/link entities for document {document_id}",
+                lambda: _execute_plan(plan),
+                operation=operation,
             )
 
-            log.debug(
-                f"Linked {len(entities_batch)} entities and {len(relations_batch)} relations "
-                f"for document {document_id}"
+        count = await write_source_graph(
+            entities,
+            mentions,
+            relations,
+            _execute_with_retry,
+            max_items=GRAPH_WRITE_BATCH_MAX_ITEMS,
+        )
+        log.debug(
+            f"[GraphRAG] Source graph written in {count} transaction(s) "
+            f"({len(entities)} entities, {len(relations)} relations): {operation}"
+        )
+        return count
+
+    async def _write_graph_plan_in_tx(self, tx, plan: Dict[str, List[Dict]]) -> None:
+        """Execute one planned transaction body (entities+mentions+relations)."""
+        entity_embedding_prop = self._names["entity_embedding_prop"]
+        entities = plan["entities"]
+        mentions = plan["mentions"]
+        relations = plan["relations"]
+
+        if entities:
+            # Metadata accumulation inside the write transaction: read each
+            # entity's existing metadata, merge the incoming (already deduped
+            # across chunks) payload and let ON CREATE / ON MATCH persist the
+            # accumulated {"source_documents": [...], "confidence": <max>}.
+            meta_result = await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $ids AS id
+                    MATCH (e:Entity {id: id, tenant_id: $tenant_id})
+                    RETURN id AS id, e.metadata AS metadata
+                    """,
+                ),
+                ids=[ent["id"] for ent in entities],
+                tenant_id=self.agent_id,
             )
-        except Exception as e:
-            log.error(f"Failed to extract entities for {document_id}: {e}")
-            raise
+            existing_metadata = {
+                rec["id"]: rec["metadata"]
+                async for rec in meta_result
+            }
+            for ent in entities:
+                ent["metadata"] = json.dumps(
+                    _merge_entity_metadata(
+                        existing_metadata.get(ent["id"]),
+                        json.loads(ent["metadata"]),
+                    )
+                )
+
+            await tx.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    UNWIND $entities AS ent
+                    MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
+                    ON CREATE SET
+                        e.name       = ent.name,
+                        e.type       = ent.type,
+                        e.types      = [ent.type],
+                        e.created_at = datetime(),
+                        e.metadata   = ent.metadata,
+                        e.{entity_embedding_prop} = ent.embedding
+                    ON MATCH SET
+                        e.last_seen  = datetime(),
+                        e.name       = ent.name,
+                        e.types      = CASE WHEN ent.type IN coalesce(e.types, [])
+                            THEN e.types ELSE coalesce(e.types, []) + ent.type END,
+                        e.metadata   = ent.metadata,
+                        e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
+                            THEN ent.embedding ELSE e.{entity_embedding_prop} END
+                    REMOVE e.concept_gen, e.concept_gen_active
+                    """,
+                ),
+                entities=entities,
+                tenant_id=self.agent_id,
+            )
+
+        if mentions:
+            # MENTIONS and PROVENANCE are per (document, entity): the document
+            # id rides in each mention so one transaction can cover every chunk
+            # of the source.
+            await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $mentions AS m
+                    MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+                    MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+                    MERGE (d)-[r:MENTIONS]->(e)
+                    ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
+                    ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
+                    """,
+                ),
+                mentions=mentions,
+                tenant_id=self.agent_id,
+            )
+            await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $mentions AS m
+                    MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+                    MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+                    MERGE (d)-[:PROVENANCE]->(e)
+                    SET e.tracked_by_provenance = true
+                    """,
+                ),
+                mentions=mentions,
+                tenant_id=self.agent_id,
+            )
+
+        if relations:
+            await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $relations AS rel
+                    MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
+                    MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
+                    MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
+                    ON CREATE SET
+                        r.weight = rel.weight,
+                        r.created_at = datetime(),
+                        r.source_files = rel.source_files
+                    ON MATCH SET
+                        r.weight = (r.weight + rel.weight) / 2,
+                        r.source_files = CASE
+                            WHEN rel.source_files IS NULL THEN r.source_files
+                            WHEN r.source_files IS NULL THEN rel.source_files
+                            ELSE [x IN r.source_files WHERE NOT x IN rel.source_files] + rel.source_files
+                        END
+                    """,
+                ),
+                relations=relations,
+                tenant_id=self.agent_id,
+            )
 
     @tenant_write_locked("refresh technology entities")
     async def refresh_technology_entities(self, tenant_id: str) -> None:

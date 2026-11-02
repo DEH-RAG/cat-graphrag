@@ -144,6 +144,12 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     # fire-and-forget must be a NO-OP (otherwise the graph is built twice).
     if await _phase_path_active(cat):
         return
+    # Join the lock-free per-chunk extraction spawned by add_point_to_tenant
+    # and flush it as ONE graph write for this source, then build the derived
+    # document-structure graph. Draining outside the tenant write lock keeps
+    # the source lock -> tenant write lock order intact and avoids waiting for
+    # write tasks while holding the lock they need.
+    await handler.drain_source_tasks(source)
     await handler.create_derived_graph_for_source(source, stored_points, cat)
 
 
