@@ -630,6 +630,84 @@ async def _resolve_ingestion_engine(ccat, op: str = "reembed") -> str | None:
     return name
 
 
+async def _read_ingestion_status(agent_id: str, source_name: str):
+    """Read one source's ingestion-status doc (lazy EffING import)."""
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.registry import get_status
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+    return await get_status(agent_id, "agent", source_name)
+
+
+async def _report_ingestion_outcome(
+    agent_id: str, op: str, sources: list
+) -> bool:
+    """Report the REAL per-source phase outcome after handing sources to EffING.
+
+    ``reembed_sources`` runs its serial dispatch loop synchronously but never
+    raises on a failed phase: a phase error only lives in the source's status
+    doc (``status=error`` plus the ``error`` entry in ``completed_phases``).
+    Printing ``result=ok`` right after the loop therefore claims success for
+    work the engine did not finish. This reads every processed source's status
+    doc back and owns the final summary line:
+
+      - all ``completed`` -> ``result=ok detail=reingested|reembedded``;
+      - any ``error`` -> ``result=fail detail=phase-failed`` with the verbatim
+        reason of each failing phase;
+      - anything not terminal (``processing`` / missing doc) -> ``result=fail
+        detail=still-processing``.
+
+    Returns True only when every processed source is ``completed``.
+    """
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            PHASE_STATE_ERROR,
+            phase_state,
+        )
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+
+    failures: dict[str, dict[str, Any]] = {}
+    still_processing: list[str] = []
+    for source in sources:
+        name = source.name
+        doc = await _read_ingestion_status(agent_id, name)
+        if not isinstance(doc, dict):
+            still_processing.append(name)
+            continue
+        diary = doc.get("completed_phases")
+        phase_errors: dict[str, Any] = {}
+        if isinstance(diary, dict):
+            for phase_id, entry in diary.items():
+                if phase_state(entry) == PHASE_STATE_ERROR:
+                    phase_errors[phase_id] = entry.get("reason")
+        status = doc.get("status")
+        if status == "error" or phase_errors:
+            if not phase_errors:
+                phase_errors[doc.get("phase") or "unknown"] = doc.get("error")
+            failures[name] = phase_errors
+        elif status != "completed":
+            still_processing.append(name)
+
+    if failures:
+        print(
+            f"[maintenance] agent={agent_id} op={op} result=fail "
+            f"detail=phase-failed failures="
+            f"{json.dumps(failures, ensure_ascii=False, default=str)}"
+        )
+        return False
+    if still_processing:
+        print(
+            f"[maintenance] agent={agent_id} op={op} result=fail "
+            f"detail=still-processing sources={','.join(still_processing)}"
+        )
+        return False
+
+    detail = "reembedded" if op == "reembed" else "reingested"
+    print(f"[maintenance] agent={agent_id} op={op} result=ok detail={detail}")
+    return True
+
+
 async def _op_reembed(ccat, handler, collection: str) -> bool:
     """Re-embed only: delete the status docs, then run the embedding phase.
 
@@ -675,7 +753,7 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
         await delete_status(agent_id, "agent", source.name)
 
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
-    return True
+    return await _report_ingestion_outcome(agent_id, "reembed", sources)
 
 
 async def _preflight_reembed_path(ccat) -> str | None:
@@ -865,7 +943,7 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
         )
 
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
-    return True
+    return await _report_ingestion_outcome(agent_id, "reingest", sources)
 
 
 def _graph_wipe_statements(gen) -> list[str]:
@@ -1216,12 +1294,14 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 continue
         if op == "reembed":
             try:
-                await _op_reembed(ccat, handler, collection)
+                reembed_ok = await _op_reembed(ccat, handler, collection)
             except Exception as exc:  # noqa: BLE001 - per-op isolation
                 print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
                 ok = False
                 continue
-            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reembedded")
+            if not reembed_ok:
+                # _op_reembed already logged the per-source outcome summary.
+                ok = False
             continue
         if op == "reingest":
             try:
@@ -1231,11 +1311,9 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 ok = False
                 continue
             if not reingest_ok:
-                # _op_reingest already logged the preflight failure; nothing
-                # was deleted, so this agent/op is a failure, not a success.
+                # _op_reingest already logged the failure: preflight, or the
+                # per-source phase-outcome summary. Nothing to add here.
                 ok = False
-                continue
-            print(f"[maintenance] agent={agent_id} op={op} result=ok detail=reingested")
             continue
         if op == "graph":
             try:

@@ -73,11 +73,21 @@ if __name__ == "__main__":
         async def fake_delete_status(agent_id, scope, source):
             calls.append(("delete_status", source))
 
+        async def fake_purge(agent_id, scope, source, delete_points):
+            await delete_points()
+            await fake_clear(agent_id, scope, source)
+            await fake_delete_status(agent_id, scope, source)
+
         async def fake_reembed(ccat, collection, sources):
             calls.append(("reembed", [s.name for s in sources]))
 
+        async def fake_outcome(agent_id, op, sources):
+            return True
+
         with patch.object(maintenance_agent, "_preflight_reembed_path", fake_preflight), \
              patch.object(maintenance_agent, "_set_maintenance_marker", fake_marker), \
+             patch.object(maintenance_agent, "_report_ingestion_outcome", fake_outcome), \
+             patch.object(effing_registry, "purge_source_for_reingest", fake_purge), \
              patch.object(effing_registry, "clear_completed_phases", fake_clear), \
              patch.object(effing_registry, "delete_status", fake_delete_status), \
              patch.object(effing_reembed, "reembed_sources", fake_reembed):
