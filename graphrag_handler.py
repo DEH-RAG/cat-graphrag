@@ -651,7 +651,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 tenant_id=tenant_id,
             )
 
-    @tenant_write_locked("reembed tenant")
     async def reembed_tenant(self, tenant_id: str, new_embedder) -> None:
         """Seamless shadow-swap of the tenant's embedding generation (P4, todo 12).
 
@@ -687,7 +686,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             async with self._reembed_lock:
                 await self._reembed_tenant_impl(tenant_id, new_embedder)
 
-    @tenant_write_locked("_reembed_tenant_impl")
     async def _reembed_tenant_impl(self, tenant_id: str, new_embedder) -> None:
         """The shadow-build -> flip -> GC sequence, run under the migration lock."""
         old_gen = await self._read_generation(tenant_id)
@@ -714,9 +712,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         if not docs:
             # Nothing to re-embed — still flip + GC so the schema stays
-            # consistent for the tenant.
-            await self._set_generation(tenant_id, new_gen)
-            await self._gc_generation(tenant_id, old_gen)
+            # consistent for the tenant. LOCK SCOPE: only these Neo4j writes
+            # run under the tenant write lock.
+            async with acquire_tenant_write_lock(
+                self, tenant_id, "_reembed_tenant_impl"
+            ):
+                await self._set_generation(tenant_id, new_gen)
+                await self._gc_generation(tenant_id, old_gen)
             log.info(
                 f"[GraphRAG] reembed_tenant({tenant_id}): no documents, "
                 f"flipped {old_gen} -> {new_gen}"
@@ -724,6 +726,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return
 
         # 2. Re-embed all contents with the new embedder (non-blocking).
+        # LOCK SCOPE: the embedding runs OUTSIDE the tenant write lock. The
+        # lock covers only the Neo4j writes below — holding it across the
+        # embedder call made other writers wait minutes and abort.
         contents = [content for _, content, _ in docs]
         vectors = await asyncio.to_thread(new_embedder.embed_documents, contents)
 
@@ -740,228 +745,237 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     "zero or non-finite vector"
                 )
 
-        if payload:
+        async with acquire_tenant_write_lock(self, tenant_id, "_reembed_tenant_impl"):
+            if payload:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            f"""
+                            UNWIND $docs AS d
+                            MATCH (doc:Document {{id: d.id, tenant_id: $tenant_id}})
+                            SET doc.{new_names["embedding_prop"]} = d.vector
+                            """,
+                        ),
+                        docs=payload,
+                        tenant_id=tenant_id,
+                    )
+
+            # 4. Create the new vector index at the new embedder's dimensions.
+            async with self._get_session() as session:
+                await self._ensure_vector_index_in_session(
+                    session,
+                    new_names["index"],
+                    new_names["embedding_prop"],
+                    new_embedder.size,
+                )
+
+            # 4b. Entity embeddings: doc embeddings are recomputed above, but entity
+            #     embeddings are NOT recomputed on a swap — carry them forward from
+            #     the old generation into the new one (same vectors, new property),
+            #     and create the new entity vector index.
+            old_names = self._versioned_names(old_gen)
             async with self._get_session() as session:
                 await session.run(
                     cast(
                         LiteralString,
                         f"""
-                        UNWIND $docs AS d
-                        MATCH (doc:Document {{id: d.id, tenant_id: $tenant_id}})
-                        SET doc.{new_names["embedding_prop"]} = d.vector
+                        MATCH (e:Entity {{tenant_id: $tenant_id}})
+                        WHERE e.{old_names["entity_embedding_prop"]} IS NOT NULL
+                        SET e.{new_names["entity_embedding_prop"]} =
+                            e.{old_names["entity_embedding_prop"]}
                         """,
                     ),
-                    docs=payload,
                     tenant_id=tenant_id,
                 )
+                await self._ensure_vector_index_in_session(
+                    session,
+                    new_names["entity_index"],
+                    new_names["entity_embedding_prop"],
+                    new_embedder.size,
+                    node_label="Entity",
+                )
 
-        # 4. Create the new vector index at the new embedder's dimensions.
-        async with self._get_session() as session:
-            await self._ensure_vector_index_in_session(
-                session,
-                new_names["index"],
-                new_names["embedding_prop"],
-                new_embedder.size,
-            )
+            # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
+            #    _create_similarity_relationships against the new index/relation).
+            for doc_id, vector, collection_name in valid_pairs:
+                await self._create_similarity_relationships_for_gen(
+                    doc_id, vector, collection_name, new_gen, tenant_id
+                )
 
-        # 4b. Entity embeddings: doc embeddings are recomputed above, but entity
-        #     embeddings are NOT recomputed on a swap — carry them forward from
-        #     the old generation into the new one (same vectors, new property),
-        #     and create the new entity vector index.
-        old_names = self._versioned_names(old_gen)
-        async with self._get_session() as session:
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"""
-                    MATCH (e:Entity {{tenant_id: $tenant_id}})
-                    WHERE e.{old_names["entity_embedding_prop"]} IS NOT NULL
-                    SET e.{new_names["entity_embedding_prop"]} =
-                        e.{old_names["entity_embedding_prop"]}
-                    """,
-                ),
-                tenant_id=tenant_id,
-            )
-            await self._ensure_vector_index_in_session(
-                session,
-                new_names["entity_index"],
-                new_names["entity_embedding_prop"],
-                new_embedder.size,
-                node_label="Entity",
-            )
+            # ── Phase B: flip the epoch (single atomic write) ────────────────
+            await self._set_generation(tenant_id, new_gen)
 
-        # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
-        #    _create_similarity_relationships against the new index/relation).
-        for doc_id, vector, collection_name in valid_pairs:
-            await self._create_similarity_relationships_for_gen(
-                doc_id, vector, collection_name, new_gen, tenant_id
-            )
-
-        # ── Phase B: flip the epoch (single atomic write) ────────────────
-        await self._set_generation(tenant_id, new_gen)
-
-        # ── Phase C: GC the old generation (flip-before-GC is mandatory) ─
-        await self._gc_generation(tenant_id, old_gen)
+            # ── Phase C: GC the old generation (flip-before-GC is mandatory) ─
+            await self._gc_generation(tenant_id, old_gen)
 
         log.info(
             f"[GraphRAG] Seamless re-embed swap for tenant_id={tenant_id}: "
             f"{old_gen} -> {new_gen} ({len(payload)} documents re-embedded)"
         )
 
-    @tenant_write_locked("initialize graph schema")
     async def initialize(self, embedder_name: str, embedder_size: int):
         await self._connect()
 
-        async with self._get_session() as session:
-            # Constraints are always idempotent — create them first.
-            await self._ensure_constraints_in_session(session)
+        # Phase 1 — constraints + embedder-change detection. LOCK SCOPE: the
+        # tenant write lock covers ONLY Neo4j work. The shadow re-embed in
+        # phase 2 runs OUTSIDE it (the embedder call takes minutes and must
+        # never hold the tenant write lock).
+        async with acquire_tenant_write_lock(self, None, "initialize graph schema"):
+            async with self._get_session() as session:
+                # Constraints are always idempotent — create them first.
+                await self._ensure_constraints_in_session(session)
 
-            # ── Detect embedder change ────────────────────────────────────────
-            # 1. Dimension mismatch → the HNSW index must be dropped and
-            #    recreated (Neo4j vector indexes are immutable once created).
-            index_dims = await self._get_index_dimensions(
-                session, self._document_vector_index
-            )
-            index_needs_rebuild = index_dims is not None and index_dims != embedder_size
-
-            # 2. Same dimension but different model → embeddings are in a
-            #    different vector space; stale data must be discarded too.
-            name_mismatch = False
-            if not index_needs_rebuild:
-                for collection_name in self._collection_names:
-                    stored = await self._get_collection_embedder_config(
-                        session, collection_name
-                    )
-                    if stored is not None:
-                        stored_name, stored_size = stored
-                        if stored_name != embedder_name or stored_size != embedder_size:
-                            name_mismatch = True
-                            break
-
-            if index_needs_rebuild or name_mismatch:
-                log.warning(
-                    f"[GraphRAG] Embedder change detected "
-                    f"(index_dims={index_dims} → {embedder_size}, "
-                    f"name_mismatch={name_mismatch}). "
-                    "Running seamless shadow-swap re-embed."
+                # ── Detect embedder change ────────────────────────────────
+                # 1. Dimension mismatch → the HNSW index must be dropped and
+                #    recreated (Neo4j vector indexes are immutable once created).
+                index_dims = await self._get_index_dimensions(
+                    session, self._document_vector_index
                 )
-                if self.save_memory_snapshots:
+                index_needs_rebuild = index_dims is not None and index_dims != embedder_size
+
+                # 2. Same dimension but different model → embeddings are in a
+                #    different vector space; stale data must be discarded too.
+                name_mismatch = False
+                if not index_needs_rebuild:
                     for collection_name in self._collection_names:
-                        await self.save_dump(collection_name)
+                        stored = await self._get_collection_embedder_config(
+                            session, collection_name
+                        )
+                        if stored is not None:
+                            stored_name, stored_size = stored
+                            if stored_name != embedder_name or stored_size != embedder_size:
+                                name_mismatch = True
+                                break
 
-                # Seamless swap instead of the old full wipe: shadow-build the
-                # new generation (embedding_v2 / document_embeddings_v2 /
-                # SIMILAR_TO_v2), flip the Epoch token, then GC the old set.
-                # No downtime — the old generation keeps serving reads until
-                # the flip, and no worker is stranded because GC runs after.
-                if self._embedder is not None:
-                    await self.reembed_tenant(self.agent_id, self._embedder)
-                else:
-                    log.warning(
-                        "[GraphRAG] Embedder change detected but no embedder "
-                        "injected; skipping the seamless re-embed swap."
-                    )
+        # Phase 2 — shadow-swap re-embed. OUTSIDE the tenant write lock.
+        if index_needs_rebuild or name_mismatch:
+            log.warning(
+                f"[GraphRAG] Embedder change detected "
+                f"(index_dims={index_dims} → {embedder_size}, "
+                f"name_mismatch={name_mismatch}). "
+                "Running seamless shadow-swap re-embed."
+            )
+            if self.save_memory_snapshots:
+                for collection_name in self._collection_names:
+                    await self.save_dump(collection_name)
 
+            # Seamless swap instead of the old full wipe: shadow-build the
+            # new generation (embedding_v2 / document_embeddings_v2 /
+            # SIMILAR_TO_v2), flip the Epoch token, then GC the old set.
+            # No downtime — the old generation keeps serving reads until
+            # the flip, and no worker is stranded because GC runs after.
+            if self._embedder is not None:
+                await self.reembed_tenant(self.agent_id, self._embedder)
+            else:
+                log.warning(
+                    "[GraphRAG] Embedder change detected but no embedder "
+                    "injected; skipping the seamless re-embed swap."
+                )
+
+        # Phase 3 — schema writes. Under the tenant write lock.
+        async with acquire_tenant_write_lock(self, None, "initialize graph schema"):
+            async with self._get_session() as session:
                 if index_needs_rebuild:
                     await self._drop_vector_indexes_in_session(session)
 
-            # Always ensure indexes exist with the correct dimensions (versioned
-            # schema, todo 11 P4): the read paths query the CURRENT generation's
-            # vector indexes (document_embeddings_{gen} / entity_embeddings_{gen}
-            # on embedding_{gen} / entity_embedding_{gen}). No legacy unversioned
-            # index is created anymore — the legacy `embedding` / `e.embedding`
-            # properties only feed the one-time backfill below.
-            gen = await self._read_generation()
-            if gen != self._generation:
-                self._rebuild_for_generation(gen)
-            names = self._names
+                # Always ensure indexes exist with the correct dimensions (versioned
+                # schema, todo 11 P4): the read paths query the CURRENT generation's
+                # vector indexes (document_embeddings_{gen} / entity_embeddings_{gen}
+                # on embedding_{gen} / entity_embedding_{gen}). No legacy unversioned
+                # index is created anymore — the legacy `embedding` / `e.embedding`
+                # properties only feed the one-time backfill below.
+                gen = await self._read_generation()
+                if gen != self._generation:
+                    self._rebuild_for_generation(gen)
+                names = self._names
 
-            if index_needs_rebuild:
-                await self._drop_vector_indexes_in_session(session, names)
+                if index_needs_rebuild:
+                    await self._drop_vector_indexes_in_session(session, names)
 
-            # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
-            # is a silent NO-OP when the index already exists at an OLD
-            # dimensionality. The versioned indexes are the ones all read paths
-            # actually use (find_similar / recall), so repair them synchronously
-            # HERE at boot — before any ingestion worker can race ahead and
-            # hit the dimension mismatch. embedder_size is a plain parameter,
-            # it does not require the embedder object (injected later by hooks).
-            # — Document index
-            v_index_dims = await self._get_index_dimensions(session, names["index"])
-            if v_index_dims is not None and v_index_dims != embedder_size:
-                log.warning(
-                    f"[GraphRAG] Versioned index {names['index']} has "
-                    f"{v_index_dims} dims but embedder is {embedder_size}; "
-                    "dropping and recreating it at boot (vectors already "
-                    "correct, no re-embed needed)."
+                # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
+                # is a silent NO-OP when the index already exists at an OLD
+                # dimensionality. The versioned indexes are the ones all read paths
+                # actually use (find_similar / recall), so repair them synchronously
+                # HERE at boot — before any ingestion worker can race ahead and
+                # hit the dimension mismatch. embedder_size is a plain parameter,
+                # it does not require the embedder object (injected later by hooks).
+                # — Document index
+                v_index_dims = await self._get_index_dimensions(session, names["index"])
+                if v_index_dims is not None and v_index_dims != embedder_size:
+                    log.warning(
+                        f"[GraphRAG] Versioned index {names['index']} has "
+                        f"{v_index_dims} dims but embedder is {embedder_size}; "
+                        "dropping and recreating it at boot (vectors already "
+                        "correct, no re-embed needed)."
+                    )
+                    await session.run(
+                        cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                    )
+                await self._ensure_vector_index_in_session(
+                    session, names["index"], names["embedding_prop"], embedder_size
                 )
+                # — Entity index (same generation scheme)
+                ev_index_dims = await self._get_index_dimensions(session, names["entity_index"])
+                if ev_index_dims is not None and ev_index_dims != embedder_size:
+                    log.warning(
+                        f"[GraphRAG] Versioned index {names['entity_index']} has "
+                        f"{ev_index_dims} dims but embedder is {embedder_size}; "
+                        "dropping and recreating it at boot (vectors already "
+                        "correct, no re-embed needed)."
+                    )
+                    await session.run(
+                        cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS")
+                    )
+                await self._ensure_vector_index_in_session(
+                    session, names["entity_index"], names["entity_embedding_prop"], embedder_size, node_label="Entity"
+                )
+                # Backfill: copy the legacy unversioned `embedding` property into the
+                # current generation's property for existing documents that lack it,
+                # BUT only when the stored vector already matches the embedder dims
+                # (a stale pre-change vector in the index property would poison the
+                # vector index). Once migrated, the legacy property is REMOVED so
+                # the schema converges to the versioned-only shape. (The driver
+                # suppresses the 01N52 "property does not exist" GQL warning on a
+                # fresh database, so the IS NOT NULL filter is safe.)
                 await session.run(
-                    cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                    cast(
+                        LiteralString,
+                        f"""
+                        MATCH (d:Document {{tenant_id: $tenant_id}})
+                        WHERE d.embedding IS NOT NULL
+                          AND d.{names["embedding_prop"]} IS NULL
+                          AND size(d.embedding) = $dims
+                        SET d.{names["embedding_prop"]} = d.embedding
+                        REMOVE d.embedding
+                        """,
+                    ),
+                    tenant_id=self.agent_id,
+                    dims=embedder_size,
                 )
-            await self._ensure_vector_index_in_session(
-                session, names["index"], names["embedding_prop"], embedder_size
-            )
-            # — Entity index (same generation scheme)
-            ev_index_dims = await self._get_index_dimensions(session, names["entity_index"])
-            if ev_index_dims is not None and ev_index_dims != embedder_size:
-                log.warning(
-                    f"[GraphRAG] Versioned index {names['entity_index']} has "
-                    f"{ev_index_dims} dims but embedder is {embedder_size}; "
-                    "dropping and recreating it at boot (vectors already "
-                    "correct, no re-embed needed)."
-                )
+                # Same one-time backfill for Entity nodes.
                 await session.run(
-                    cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS")
+                    cast(
+                        LiteralString,
+                        f"""
+                        MATCH (e:Entity {{tenant_id: $tenant_id}})
+                        WHERE e.embedding IS NOT NULL
+                          AND e.{names["entity_embedding_prop"]} IS NULL
+                          AND size(e.embedding) = $dims
+                        SET e.{names["entity_embedding_prop"]} = e.embedding
+                        REMOVE e.embedding
+                        """,
+                    ),
+                    tenant_id=self.agent_id,
+                    dims=embedder_size,
                 )
-            await self._ensure_vector_index_in_session(
-                session, names["entity_index"], names["entity_embedding_prop"], embedder_size, node_label="Entity"
-            )
-            # Backfill: copy the legacy unversioned `embedding` property into the
-            # current generation's property for existing documents that lack it,
-            # BUT only when the stored vector already matches the embedder dims
-            # (a stale pre-change vector in the index property would poison the
-            # vector index). Once migrated, the legacy property is REMOVED so
-            # the schema converges to the versioned-only shape. (The driver
-            # suppresses the 01N52 "property does not exist" GQL warning on a
-            # fresh database, so the IS NOT NULL filter is safe.)
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"""
-                    MATCH (d:Document {{tenant_id: $tenant_id}})
-                    WHERE d.embedding IS NOT NULL
-                      AND d.{names["embedding_prop"]} IS NULL
-                      AND size(d.embedding) = $dims
-                    SET d.{names["embedding_prop"]} = d.embedding
-                    REMOVE d.embedding
-                    """,
-                ),
-                tenant_id=self.agent_id,
-                dims=embedder_size,
-            )
-            # Same one-time backfill for Entity nodes.
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"""
-                    MATCH (e:Entity {{tenant_id: $tenant_id}})
-                    WHERE e.embedding IS NOT NULL
-                      AND e.{names["entity_embedding_prop"]} IS NULL
-                      AND size(e.embedding) = $dims
-                    SET e.{names["entity_embedding_prop"]} = e.embedding
-                    REMOVE e.embedding
-                    """,
-                ),
-                tenant_id=self.agent_id,
-                dims=embedder_size,
-            )
 
-        # Create / update collections — always store current embedder metadata.
-        async with self._get_session() as session:
-            for collection_name in self._collection_names:
-                await self._ensure_collection_exists_in_session(
-                    session, collection_name, embedder_name, embedder_size
-                )
+            # Create / update collections — always store current embedder metadata.
+            async with self._get_session() as session:
+                for collection_name in self._collection_names:
+                    await self._ensure_collection_exists_in_session(
+                        session, collection_name, embedder_name, embedder_size
+                    )
 
         log.info(
             f"Advanced GraphRAG initialized "
@@ -978,7 +992,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     # re-embed v1->v2), which is arguably better delegated to the core's
     # BillTheLizard.reembed_all. Keep until that is settled; see Hindsight
     # "Remove lazy embedder alignment path? — pending decision".
-    @tenant_write_locked("_align_embedder_lazy")
     async def _align_embedder_lazy(self) -> None:
         """Align the versioned schema with the current embedder, once per handler.
 
@@ -1042,13 +1055,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         f"{index_dims} dims but embedder is {embedder.size}; "
                         "dropping and recreating it (vectors already correct)."
                     )
-                    async with self._get_session() as session:
-                        await session.run(
-                            cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
-                        )
-                        await self._ensure_vector_index_in_session(
-                            session, names["index"], names["embedding_prop"], embedder.size
-                        )
+                    # LOCK SCOPE: only the Neo4j index rewrite is locked.
+                    async with acquire_tenant_write_lock(
+                        self, None, "_align_embedder_lazy"
+                    ):
+                        async with self._get_session() as session:
+                            await session.run(
+                                cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                            )
+                            await self._ensure_vector_index_in_session(
+                                session, names["index"], names["embedding_prop"], embedder.size
+                            )
 
                 if name_mismatch:
                     log.warning(
@@ -1057,6 +1074,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         f"from {embedder.name} @ {embedder.size}); running "
                         "seamless shadow-swap re-embed."
                     )
+                    # LOCK SCOPE: reembed_tenant embeds OUTSIDE the tenant write
+                    # lock and locks only its own Neo4j writes.
                     await self.reembed_tenant(self.agent_id, embedder)
 
             except TenantWriteLockTimeout:
@@ -1606,7 +1625,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return {"status": "done"}
 
-    @tenant_write_locked("_extract_and_link_entities")
     async def _extract_and_link_entities(
         self,
         document_id: str,
@@ -2417,7 +2435,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.error(f"Failed to create similarity relationships: {e}")
             raise
 
-    @tenant_write_locked("add points to tenant")
     async def add_points_to_tenant(
         self, collection_name: str, points: List[PointStruct]
     ) -> UpdateResult:
@@ -3321,7 +3338,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return None
         return {"must": [{"key": k, "match": {"value": v}} for k, v in filter_dict.items()]}
 
-    @tenant_write_locked("create derived graph for source")
     async def create_derived_graph_for_source(
         self,
         source: str,
@@ -3401,111 +3417,117 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
         point_ids = [rp["id"] for rp in regular_points]
 
-        async with self._get_session() as session:
-            # 1 — SourceFile node (idempotent)
-            await session.run(
-                "MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})",
-                source=source,
-                tenant_id=tenant_id,
-            )
-
-            # 2 — PART_OF links
-            await session.run(
-                """
-                UNWIND $point_ids AS pid
-                MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})
-                MERGE (d)-[:PART_OF]->(sf)
-                """,
-                point_ids=point_ids,
-                source=source,
-                tenant_id=tenant_id,
-            )
-
-            # 3 — NEXT edges between consecutive chunks
-            if len(regular_points) > 1:
-                pairs = [
-                    {"curr": regular_points[i]["id"], "next": regular_points[i + 1]["id"]}
-                    for i in range(len(regular_points) - 1)
-                ]
+        # LOCK SCOPE: only the Neo4j derived-graph writes (steps 1-7)
+        # run under the tenant write lock. Step 8 (LLM concept
+        # extraction) runs OUTSIDE it — it is long non-Neo4j work.
+        async with acquire_tenant_write_lock(
+            self, None, "create derived graph for source"
+        ):
+            async with self._get_session() as session:
+                # 1 — SourceFile node (idempotent)
                 await session.run(
-                    """
-                    UNWIND $pairs AS pair
-                    MATCH (a:Document {id: pair.curr, tenant_id: $tenant_id})
-                    MATCH (b:Document {id: pair.next, tenant_id: $tenant_id})
-                    MERGE (a)-[:NEXT]->(b)
-                    """,
-                    pairs=pairs,
-                    tenant_id=tenant_id,
-                )
-
-            # 4 — Structure labels (Section / Paragraph) from chunk_level
-            if any(rp.get("chunk_level") for rp in regular_points):
-                section_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "section"]
-                paragraph_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "paragraph"]
-                if section_ids:
-                    await session.run(
-                        """
-                        UNWIND $ids AS pid
-                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                        SET d:Section
-                        """,
-                        ids=section_ids,
-                        tenant_id=tenant_id,
-                    )
-                if paragraph_ids:
-                    await session.run(
-                        """
-                        UNWIND $ids AS pid
-                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                        SET d:Paragraph
-                        """,
-                        ids=paragraph_ids,
-                        tenant_id=tenant_id,
-                    )
-
-            # 5 — FormulaChunk label
-            formula_ids = [rp["id"] for rp in regular_points if rp.get("has_formula")]
-            if formula_ids:
-                await session.run(
-                    """
-                    UNWIND $ids AS pid
-                    MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                    SET d:FormulaChunk
-                    """,
-                    ids=formula_ids,
-                    tenant_id=tenant_id,
-                )
-
-            # 6 — CHILD_OF from parent_id
-            child_pairs = [
-                {"child": rp["id"], "parent": rp["parent_id"]}
-                for rp in regular_points if rp.get("parent_id")
-            ]
-            if child_pairs:
-                await session.run(
-                    """
-                    UNWIND $pairs AS pair
-                    MATCH (child:Document {id: pair.child, tenant_id: $tenant_id})
-                    MATCH (parent:Document {id: pair.parent, tenant_id: $tenant_id})
-                    MERGE (child)-[:CHILD_OF]->(parent)
-                    """,
-                    pairs=child_pairs,
-                    tenant_id=tenant_id,
-                )
-
-            # 7 — HAS_SUMMARY from SourceFile to CATALOG card
-            if catalogue_id:
-                await session.run(
-                    """
-                    MATCH (card:Document {id: $card_id, tenant_id: $tenant_id})
-                    MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
-                    MERGE (sf)-[:HAS_SUMMARY]->(card)
-                    """,
-                    card_id=catalogue_id,
+                    "MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})",
                     source=source,
                     tenant_id=tenant_id,
                 )
+
+                # 2 — PART_OF links
+                await session.run(
+                    """
+                    UNWIND $point_ids AS pid
+                    MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                    MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                    MERGE (d)-[:PART_OF]->(sf)
+                    """,
+                    point_ids=point_ids,
+                    source=source,
+                    tenant_id=tenant_id,
+                )
+
+                # 3 — NEXT edges between consecutive chunks
+                if len(regular_points) > 1:
+                    pairs = [
+                        {"curr": regular_points[i]["id"], "next": regular_points[i + 1]["id"]}
+                        for i in range(len(regular_points) - 1)
+                    ]
+                    await session.run(
+                        """
+                        UNWIND $pairs AS pair
+                        MATCH (a:Document {id: pair.curr, tenant_id: $tenant_id})
+                        MATCH (b:Document {id: pair.next, tenant_id: $tenant_id})
+                        MERGE (a)-[:NEXT]->(b)
+                        """,
+                        pairs=pairs,
+                        tenant_id=tenant_id,
+                    )
+
+                # 4 — Structure labels (Section / Paragraph) from chunk_level
+                if any(rp.get("chunk_level") for rp in regular_points):
+                    section_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "section"]
+                    paragraph_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "paragraph"]
+                    if section_ids:
+                        await session.run(
+                            """
+                            UNWIND $ids AS pid
+                            MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                            SET d:Section
+                            """,
+                            ids=section_ids,
+                            tenant_id=tenant_id,
+                        )
+                    if paragraph_ids:
+                        await session.run(
+                            """
+                            UNWIND $ids AS pid
+                            MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                            SET d:Paragraph
+                            """,
+                            ids=paragraph_ids,
+                            tenant_id=tenant_id,
+                        )
+
+                # 5 — FormulaChunk label
+                formula_ids = [rp["id"] for rp in regular_points if rp.get("has_formula")]
+                if formula_ids:
+                    await session.run(
+                        """
+                        UNWIND $ids AS pid
+                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                        SET d:FormulaChunk
+                        """,
+                        ids=formula_ids,
+                        tenant_id=tenant_id,
+                    )
+
+                # 6 — CHILD_OF from parent_id
+                child_pairs = [
+                    {"child": rp["id"], "parent": rp["parent_id"]}
+                    for rp in regular_points if rp.get("parent_id")
+                ]
+                if child_pairs:
+                    await session.run(
+                        """
+                        UNWIND $pairs AS pair
+                        MATCH (child:Document {id: pair.child, tenant_id: $tenant_id})
+                        MATCH (parent:Document {id: pair.parent, tenant_id: $tenant_id})
+                        MERGE (child)-[:CHILD_OF]->(parent)
+                        """,
+                        pairs=child_pairs,
+                        tenant_id=tenant_id,
+                    )
+
+                # 7 — HAS_SUMMARY from SourceFile to CATALOG card
+                if catalogue_id:
+                    await session.run(
+                        """
+                        MATCH (card:Document {id: $card_id, tenant_id: $tenant_id})
+                        MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                        MERGE (sf)-[:HAS_SUMMARY]->(card)
+                        """,
+                        card_id=catalogue_id,
+                        source=source,
+                        tenant_id=tenant_id,
+                    )
 
         log.info(
             f"[GraphRAG] Derived graph for '{source}': {len(regular_points)} docs, "
@@ -4368,7 +4390,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     tenant_id=tenant_id,
                 )
 
-    @tenant_write_locked("recompute concept relations")
     async def recompute_concept_relations(
         self,
         stray_cat,
