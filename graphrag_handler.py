@@ -30,6 +30,12 @@ from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
 from .structured_llm import StructuredLLM, StructuredLLMError
+from .tenant_write_lock import (
+    TenantWriteLockTimeout,
+    acquire_tenant_write_lock,
+    detached_write_task,
+    tenant_write_locked,
+)
 from .versioning import ensure_version, retry_on_generation_change, with_transient_retry
 
 # Last-known GraphRAG connection config per agent, captured in ``_connect``
@@ -185,6 +191,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # In-process fallback lock for reembed_tenant when the Cat distributed
         # lock is unavailable (see the module-level try/except import).
         self._reembed_lock = asyncio.Lock()
+
+        # Per-tenant in-process fallback locks for the tenant write lock when
+        # ``cat.db.crud.distributed_lock`` is unavailable (standalone harness).
+        # Production always uses the distributed lock (see tenant_write_lock).
+        self._local_write_locks: Dict[str, asyncio.Lock] = {}
 
         # Lazy embedder-alignment guard: the embedder is injected by the
         # plugin hooks AFTER the core bootstrap, so initialize() cannot rely
@@ -534,6 +545,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 log.error(f"{node_label} index creation warning: {e}")
                 raise e
 
+    @tenant_write_locked("_create_similarity_relationships_for_gen")
     async def _create_similarity_relationships_for_gen(
         self,
         point_id: str,
@@ -583,6 +595,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.error(f"Failed to create similarity relationships: {e}")
             raise
 
+    @tenant_write_locked("gc generation")
     async def _gc_generation(self, tenant_id: str, gen: str) -> None:
         """Drop the old generation's index, SIMILAR_TO edges and embedding property.
 
@@ -630,6 +643,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 tenant_id=tenant_id,
             )
 
+    @tenant_write_locked("reembed tenant")
     async def reembed_tenant(self, tenant_id: str, new_embedder) -> None:
         """Seamless shadow-swap of the tenant's embedding generation (P4, todo 12).
 
@@ -665,6 +679,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             async with self._reembed_lock:
                 await self._reembed_tenant_impl(tenant_id, new_embedder)
 
+    @tenant_write_locked("_reembed_tenant_impl")
     async def _reembed_tenant_impl(self, tenant_id: str, new_embedder) -> None:
         """The shadow-build -> flip -> GC sequence, run under the migration lock."""
         old_gen = await self._read_generation(tenant_id)
@@ -785,6 +800,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"{old_gen} -> {new_gen} ({len(payload)} documents re-embedded)"
         )
 
+    @tenant_write_locked("initialize graph schema")
     async def initialize(self, embedder_name: str, embedder_size: int):
         await self._connect()
 
@@ -954,6 +970,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     # re-embed v1->v2), which is arguably better delegated to the core's
     # BillTheLizard.reembed_all. Keep until that is settled; see Hindsight
     # "Remove lazy embedder alignment path? — pending decision".
+    @tenant_write_locked("_align_embedder_lazy")
     async def _align_embedder_lazy(self) -> None:
         """Align the versioned schema with the current embedder, once per handler.
 
@@ -1034,6 +1051,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     )
                     await self.reembed_tenant(self.agent_id, embedder)
 
+            except TenantWriteLockTimeout:
+                # Lock timeout MUST surface: never swallow it into a silent
+                # "alignment skipped" (the write did not proceed, and the caller
+                # must see the failure so the phase can retry).
+                raise
             except Exception as e:
                 # Do not block the read/ingestion path on alignment failures;
                 # a subsequent call will retry (the flag stays False).
@@ -1097,6 +1119,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             embedder_size=embedder_size,
         )
 
+    @tenant_write_locked("create collection")
     async def create_collection(self, embedder_name: str, embedder_size: int, collection_name: str):
         await self._ensure_connected()
 
@@ -1109,6 +1132,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         log.warning("Hybrid collections not supported")
         pass
 
+    @tenant_write_locked("delete collection")
     async def delete_collection(self, collection_name: str, timeout: int | None = None):
         """
         Deletes a collection and its documents.
@@ -1180,6 +1204,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
     # ========== POINT METHODS ==========
 
+    @tenant_write_locked("add point to tenant")
     async def add_point_to_tenant(
         self,
         collection_name: str,
@@ -1319,7 +1344,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
         # recorded ingestion phase); a direct/classic write defaults to False.
         if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
-            task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
+            # ``detached_write_task`` clears the inherited write-lock context:
+            # this child must take the tenant write lock on its own, never write
+            # unlocked after the parent (add_point_to_tenant) releases it.
+            task = asyncio.create_task(
+                detached_write_task(
+                    self._extract_and_link_entities(point_id, content, metadata)
+                )
+            )
             self._pending_entity_tasks.append(task)
             self._track_source_task((metadata or {}).get("source"), task)
 
@@ -1327,7 +1359,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # Only when the vector is valid: a zero/non-finite vector would produce
         # meaningless (or failing) vector-similarity edges.
         if vector_valid:
-            sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
+            # Same detached-context rule as entity extraction above.
+            sim_task = asyncio.create_task(
+                detached_write_task(
+                    self._create_similarity_relationships(point_id, vector_list, collection_name)
+                )
+            )
             self._pending_entity_tasks.append(sim_task)
             self._track_source_task((metadata or {}).get("source"), sim_task)
 
@@ -1509,6 +1546,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return {"status": "done"}
 
+    @tenant_write_locked("_extract_and_link_entities")
     async def _extract_and_link_entities(
         self,
         document_id: str,
@@ -1755,6 +1793,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.error(f"Failed to extract entities for {document_id}: {e}")
             raise
 
+    @tenant_write_locked("refresh technology entities")
     async def refresh_technology_entities(self, tenant_id: str) -> None:
         """
         Refreshes the Technology-entity subgraph for a single tenant.
@@ -2005,6 +2044,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"({len(entities_batch)} entities, {len(mentions_batch)} mentions)"
         )
 
+    @tenant_write_locked("recompute provenance")
     async def recompute_provenance(self, tenant_id: str | None = None) -> None:
         """One-time backfill of provenance metadata for legacy (pre-migration) data.
 
@@ -2200,6 +2240,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.error(f"[GraphRAG] Provenance marker failed for {tenant_id}: {e}")
 
     @retry_on_generation_change
+    @tenant_write_locked("create similarity relationships")
     async def _create_similarity_relationships(self, point_id: str, vector: List[float], collection_name: str):
         """
         Creates bidirectional SIMILAR_TO relationships between similar documents.
@@ -2267,6 +2308,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.error(f"Failed to create similarity relationships: {e}")
             raise
 
+    @tenant_write_locked("add points to tenant")
     async def add_points_to_tenant(
         self, collection_name: str, points: List[PointStruct]
     ) -> UpdateResult:
@@ -2321,6 +2363,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    @tenant_write_locked("delete tenant points")
     async def delete_tenant_points(self, collection_name: str, metadata: Dict | None = None) -> UpdateResult:
         await self._ensure_connected()
 
@@ -2412,6 +2455,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    @tenant_write_locked("purge source graph artifacts")
     async def purge_source_graph_artifacts(self, source: str) -> int:
         """Delete the graph artifacts ONE source contributed to this tenant.
 
@@ -2501,6 +2545,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
         return doc_count
 
+    @tenant_write_locked("delete tenant points by ids")
     async def delete_tenant_points_by_ids(self, collection_name: str, points_ids: List) -> UpdateResult:
         await self._ensure_connected()
 
@@ -3167,6 +3212,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return None
         return {"must": [{"key": k, "match": {"value": v}} for k, v in filter_dict.items()]}
 
+    @tenant_write_locked("create derived graph for source")
     async def create_derived_graph_for_source(
         self,
         source: str,
@@ -4085,6 +4131,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 return str(record["gen"])
             return None
 
+    @tenant_write_locked("_write_concept_gen")
     async def _write_concept_gen(self, tenant_id: str, gen: str) -> None:
         """Persist the tenant's active concept-generation marker.
 
@@ -4104,6 +4151,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 gen=gen,
             )
 
+    @tenant_write_locked("_flip_concept_gen")
     async def _flip_concept_gen(
         self, tenant_id: str, expected_prev_gen: str | None, new_gen: str
     ) -> bool:
@@ -4191,6 +4239,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     return False
         return True
 
+    @tenant_write_locked("_gc_stale_concept_nodes")
     async def _gc_stale_concept_nodes(self, tenant_id: str) -> None:
         """Deferred GC of concept nodes superseded by a generation flip.
 
@@ -4210,6 +4259,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     tenant_id=tenant_id,
                 )
 
+    @tenant_write_locked("recompute concept relations")
     async def recompute_concept_relations(
         self,
         stray_cat,
@@ -4365,6 +4415,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 return t, enum
         return "CONCEPT", EntityType.CONCEPT
 
+    @tenant_write_locked("_store_concept_relations")
     async def _store_concept_relations(
         self,
         tenant_id: str,
@@ -4703,12 +4754,16 @@ async def wipe_tenant_graph_data(agent_key: str) -> None:
         return
     handler = GraphRAGHandler(**config)
     handler.agent_id = agent_key
-    try:
-        await handler._ensure_connected()
-        async with handler._get_session() as session:
-            await handler._drop_tenant_data_in_session(session)
-    finally:
-        await handler.close()
+    # Tenant-scoped write lock around the whole wipe: serialises against any
+    # concurrent writer of the same tenant (Lock ordering: taken AFTER the
+    # source lock held by the caller, never before).
+    async with acquire_tenant_write_lock(handler, agent_key, "wipe tenant graph data"):
+        try:
+            await handler._ensure_connected()
+            async with handler._get_session() as session:
+                await handler._drop_tenant_data_in_session(session)
+        finally:
+            await handler.close()
 
 
 def parse_definitions(text: str) -> Dict[str, str]:
