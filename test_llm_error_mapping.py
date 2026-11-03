@@ -986,6 +986,87 @@ if __name__ == "__main__":
         handler._store_concept_relations.assert_awaited_once()
         print("PASS (t) card-flagged but clearly textual point is still used")
 
+    async def test_u_readable_prose_with_leaked_full_card_is_kept():
+        """(u/a) A readable prose chunk carrying leaked ``full_card`` +
+        ``is_catalogue_card`` metadata IS kept: flags never veto content."""
+        handler = _make_handler()
+        leaked = _meta_point(
+            "leaked",
+            "Questa e una frase di prosa italiana leggibile, non una card.",
+            full_card="# CATALOGUE CARD\n## Initial page\nvecchia card",
+            is_catalogue_card=True,
+            is_catalogue_card_segment=True,
+        )
+
+        selected = handler._select_extraction_text_points([leaked])
+
+        assert [p.id for p in selected] == ["leaked"], [p.id for p in selected]
+        print("PASS (u) readable prose with leaked full_card is kept")
+
+    async def test_v_card_header_content_is_dropped():
+        """(b) A real card segment whose content starts with the catalogue-card
+        header is dropped, even without any flag."""
+        handler = _make_handler()
+        card = _meta_point(
+            "card", "# CATALOGUE CARD\n## Initial page\nCARD BODY"
+        )
+        prose = _meta_point("prose", "Real prose survives the filter.")
+
+        selected = handler._select_extraction_text_points([card, prose])
+
+        assert [p.id for p in selected] == ["prose"], [p.id for p in selected]
+        print("PASS (v) card-header content is dropped")
+
+    async def test_w_binary_point_is_dropped():
+        """(c) A binary-looking point is dropped regardless of its flags."""
+        handler = _make_handler()
+        binary = _meta_point(
+            "binary",
+            "%PDF-1.5\n\x00\x01 binary",
+            is_catalogue_card=False,
+        )
+        prose = _meta_point("prose", "Real prose survives the filter.")
+
+        selected = handler._select_extraction_text_points([binary, prose])
+
+        assert [p.id for p in selected] == ["prose"], [p.id for p in selected]
+        print("PASS (w) binary point is dropped")
+
+    async def test_x_image_point_is_dropped():
+        """(d) An image point is dropped: its content is only a placeholder."""
+        handler = _make_handler()
+        image = _meta_point("img", "[Image] scan.pdf", image=True)
+        prose = _meta_point("prose", "Real prose survives the filter.")
+
+        selected = handler._select_extraction_text_points([image, prose])
+
+        assert [p.id for p in selected] == ["prose"], [p.id for p in selected]
+        print("PASS (x) image point is dropped")
+
+    async def test_y_empty_after_drops_is_done_with_empty_extraction():
+        """(e) When every point is unusable the extraction is still ``done``
+        with an ``empty-extraction`` warning (not a retryable failure)."""
+        _reset_fake()
+        handler = _make_handler()
+        points = [
+            _meta_point("img", "[Image] scan.pdf", image=True),
+            _meta_point("binary", "%PDF-1.5\n\x00\x01 binary"),
+            _meta_point("card", "# CATALOGUE CARD\nCARD BODY"),
+        ]
+
+        with patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+            outcome = await handler._extract_concept_relations(
+                "src-empty", points, llm=object()
+            )
+
+        assert outcome["status"] == "done", outcome
+        assert outcome["processed"] == 0, outcome
+        assert _FakeStructuredLLM.calls == 0, _FakeStructuredLLM.calls
+        warnings = outcome.get("warnings") or []
+        assert len(warnings) == 1, outcome
+        assert warnings[0]["code"] == "empty-extraction", outcome
+        print("PASS (y) empty-after-drops -> done + empty-extraction")
+
     async def _main():
         await test_a_structured_error_is_never_done()
         await test_b_no_llm_is_configuration_error()
@@ -1007,10 +1088,15 @@ if __name__ == "__main__":
         await test_r_only_binary_points_is_done_with_empty_warning()
         await test_s_extraction_input_is_ordered_by_start_index()
         await test_t_card_flagged_textual_point_is_still_used()
+        await test_u_readable_prose_with_leaked_full_card_is_kept()
+        await test_v_card_header_content_is_dropped()
+        await test_w_binary_point_is_dropped()
+        await test_x_image_point_is_dropped()
+        await test_y_empty_after_drops_is_done_with_empty_extraction()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM error mapping (twenty tests, native path included)")
+    print("OK LLM error mapping (twenty-five tests, native path included)")

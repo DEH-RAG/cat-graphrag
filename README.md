@@ -423,7 +423,7 @@ A few things are worth knowing before production use:
 | `plugin.json` | Plugin metadata for Grinning Cat |
 | `pyproject.toml` | Python dependencies |
 | `tests/` | Standalone, import-safe behavioral harnesses (run as scripts) |
-| `scripts/` | `maintenance_agent.py` and `cleanup_null_vectors.py` utilities |
+| `scripts/` | `maintenance_agent.py`, `cleanup_null_vectors.py` and `fix_leaked_card_metadata.py` utilities |
 
 ### Maintenance CLI coordination
 
@@ -439,6 +439,19 @@ Run the coordination harness as a plain script (it is import-safe, no Redis):
 
 ```bash
 uv run python test_ingestion_safety_fixes.py
+```
+
+### Removing leaked card metadata
+
+Old catalogue-card round-trips left `full_card` / `is_catalogue_card` on real
+prose chunks. Extraction ignores those flags (content decides), but the stale
+metadata still makes source-chunk counts under-report. This utility rewrites the
+affected chunks in place, no re-parse and no re-embed (dry-run by default, exit
+2; `--yes` performs the write):
+
+```bash
+python scripts/fix_leaked_card_metadata.py --dry-run
+python scripts/fix_leaked_card_metadata.py --yes
 ```
 
 ---

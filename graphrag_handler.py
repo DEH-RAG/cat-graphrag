@@ -4063,6 +4063,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return None
 
     _BINARY_REPLACEMENT_RATIO = 0.10
+    #: Header every catalogue card starts with. Card text is never source prose.
+    _CATALOGUE_CARD_HEADER = "# CATALOGUE CARD"
 
     @classmethod
     def _looks_binary_content(cls, content: str) -> bool:
@@ -4084,6 +4086,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         replacements = sample.count("\ufffd")
         return (replacements / len(sample)) >= cls._BINARY_REPLACEMENT_RATIO
 
+    @classmethod
+    def _looks_like_catalogue_card_content(cls, content: str) -> bool:
+        """True when ``content`` starts with the catalogue-card header."""
+        return content.lstrip().startswith(cls._CATALOGUE_CARD_HEADER)
+
     @staticmethod
     def _point_content_and_metadata(point: Any) -> Tuple[str, Dict[str, Any]]:
         payload = getattr(point, "payload", None) or {}
@@ -4097,20 +4104,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     ) -> List[Any]:
         """Return the stored points usable as concept-extraction input.
 
-        The decision is CONTENT-FIRST; the CATALOG card flags are a secondary
-        signal, because production observed a real prose chunk flagged
-        ``is_catalogue_card=True`` (a CATALOG metadata leak). Precedence:
+        Only TEXT from NON-IMAGE chunks is sent to the LLM, and the decision is
+        PURELY content-first: the CATALOG card flags are metadata, never a veto.
+        A point is dropped only when its content is provably NOT usable text:
 
           1. blank content -> dropped (nothing to extract);
-          2. binary-looking content -> dropped EVEN IF unflagged: unreadable
-             bytes can never feed the LLM, the card flag does not rescue them;
-          3. content with at least one alphanumeric character (clearly
-             textual) -> KEPT even when flagged ``is_catalogue_card`` /
-             ``is_catalogue_card_segment``: content is ground truth and the
-             flag leak must not discard real prose;
-          4. content that is neither clearly textual nor binary (no alnum, so
-             punctuation/whitespace-only) -> the card flag decides: a flagged
-             point is dropped, an unflagged one is kept.
+          2. IMAGE point (``image: True`` / ``image_file`` / ``image_mime_type``)
+             -> dropped: its ``page_content`` is only ``"[Image] …"``, an image
+             chunk that must never reach an LLM prompt;
+          3. binary-looking content -> dropped EVEN IF unflagged: unreadable
+             bytes can never feed the LLM;
+          4. content starting with the catalogue-card header -> dropped: it is
+             card text, not source prose;
+          5. punctuation/whitespace-only content (no alphanumeric) -> dropped
+             (nothing meaningful to extract).
+
+        ``full_card`` / ``is_catalogue_card`` / ``is_catalogue_card_segment``
+        NEVER drop a point whose content is readable prose: production observed
+        real prose chunks carrying leaked card metadata, and content wins.
 
         Survivors are ordered by ``metadata.start_index`` when present, else
         ``metadata.chunk_index``, ascending; points with neither keep their
@@ -4121,14 +4132,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             content, metadata = cls._point_content_and_metadata(point)
             if not content.strip():
                 continue
+            if (
+                metadata.get("image") is True
+                or metadata.get("image_file")
+                or metadata.get("image_mime_type")
+            ):
+                continue
             if cls._looks_binary_content(content):
                 continue
+            if cls._looks_like_catalogue_card_content(content):
+                continue
             if not any(ch.isalnum() for ch in content):
-                if (
-                    metadata.get("is_catalogue_card")
-                    or metadata.get("is_catalogue_card_segment")
-                ):
-                    continue
+                continue
             position = metadata.get("start_index")
             if position is None:
                 position = metadata.get("chunk_index")
@@ -4179,10 +4194,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             }
 
         # Join full section texts (no per-chunk truncation), up to a total limit.
-        # Only REAL TEXT points are input: CATALOG card segments (raw PDF bytes)
-        # and any other binary-looking content are dropped, and the survivors
-        # are ordered by start_index/chunk_index. The card flags are secondary;
-        # a flagged point whose content is clearly textual is still used.
+        # Only TEXT from NON-IMAGE chunks is input: image points ("[Image] …"),
+        # catalogue-card text (a card header), raw PDF bytes and any other
+        # binary-looking content are dropped, and the survivors are ordered by
+        # start_index/chunk_index. Card FLAGS never drop readable prose: a chunk
+        # that merely inherited card metadata is still real text (content wins).
         texts: List[str] = []
         total_len = 0
         max_chars = 12000
@@ -4204,7 +4220,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if stored_points:
                 log.warning(
                     f"[GraphRAG] No usable text in {len(stored_points)} point(s) "
-                    f"for '{source}' (all card/binary)"
+                    f"for '{source}' (all image/card/binary)"
                 )
                 return {
                     "status": "done",
