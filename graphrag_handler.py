@@ -4062,6 +4062,82 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.warning(f"[GraphRAG] Could not resolve agent LLM for '{agent_id}': {e}")
             return None
 
+    _BINARY_REPLACEMENT_RATIO = 0.10
+
+    @classmethod
+    def _looks_binary_content(cls, content: str) -> bool:
+        """True when ``content`` is raw bytes decoded as text, not prose.
+
+        PDF/CATALOG card segments decode (with ``errors="replace"``) to NUL
+        bytes, a leading ``%PDF`` marker or a flood of U+FFFD. Feeding them to
+        the extractor makes the LLM return a valid empty product.
+        """
+        if not content:
+            return False
+        if "\x00" in content:
+            return True
+        if content.lstrip().startswith("%PDF"):
+            return True
+        sample = content[:4096]
+        if not sample:
+            return False
+        replacements = sample.count("\ufffd")
+        return (replacements / len(sample)) >= cls._BINARY_REPLACEMENT_RATIO
+
+    @staticmethod
+    def _point_content_and_metadata(point: Any) -> Tuple[str, Dict[str, Any]]:
+        payload = getattr(point, "payload", None) or {}
+        content = payload.get("page_content", "") or ""
+        metadata = payload.get("metadata", {}) or {}
+        return content, metadata
+
+    @classmethod
+    def _select_extraction_text_points(
+        cls, points: List[Any]
+    ) -> List[Any]:
+        """Return the stored points usable as concept-extraction input.
+
+        The decision is CONTENT-FIRST; the CATALOG card flags are a secondary
+        signal, because production observed a real prose chunk flagged
+        ``is_catalogue_card=True`` (a CATALOG metadata leak). Precedence:
+
+          1. blank content -> dropped (nothing to extract);
+          2. binary-looking content -> dropped EVEN IF unflagged: unreadable
+             bytes can never feed the LLM, the card flag does not rescue them;
+          3. content with at least one alphanumeric character (clearly
+             textual) -> KEPT even when flagged ``is_catalogue_card`` /
+             ``is_catalogue_card_segment``: content is ground truth and the
+             flag leak must not discard real prose;
+          4. content that is neither clearly textual nor binary (no alnum, so
+             punctuation/whitespace-only) -> the card flag decides: a flagged
+             point is dropped, an unflagged one is kept.
+
+        Survivors are ordered by ``metadata.start_index`` when present, else
+        ``metadata.chunk_index``, ascending; points with neither keep their
+        arrival order after the positioned ones.
+        """
+        selected: List[Tuple[bool, Any, int, Any]] = []
+        for arrival, point in enumerate(points):
+            content, metadata = cls._point_content_and_metadata(point)
+            if not content.strip():
+                continue
+            if cls._looks_binary_content(content):
+                continue
+            if not any(ch.isalnum() for ch in content):
+                if (
+                    metadata.get("is_catalogue_card")
+                    or metadata.get("is_catalogue_card_segment")
+                ):
+                    continue
+            position = metadata.get("start_index")
+            if position is None:
+                position = metadata.get("chunk_index")
+            selected.append(
+                (position is None, position if position is not None else 0, arrival, point)
+            )
+        selected.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [item[3] for item in selected]
+
     async def _extract_concept_relations(
         self,
         source: str,
@@ -4102,11 +4178,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 "reason": "no LLM configured for graph concept extraction",
             }
 
-        # Join full section texts (no per-chunk truncation), up to a total limit
+        # Join full section texts (no per-chunk truncation), up to a total limit.
+        # Only REAL TEXT points are input: CATALOG card segments (raw PDF bytes)
+        # and any other binary-looking content are dropped, and the survivors
+        # are ordered by start_index/chunk_index. The card flags are secondary;
+        # a flagged point whose content is clearly textual is still used.
         texts: List[str] = []
         total_len = 0
         max_chars = 12000
-        for p in stored_points:
+        for p in self._select_extraction_text_points(stored_points):
             content = (p.payload or {}).get("page_content", "")
             if not content or not content.strip():
                 continue
@@ -4117,6 +4197,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         combined = "\n\n".join(texts)
         if not combined.strip():
+            # No LLM is invoked on content that has no readable text. When the
+            # store did return points but ALL of them were card/binary, that is
+            # a completed extraction with the ``empty-extraction`` warning
+            # (genuinely unreadable input), not a retryable failure.
+            if stored_points:
+                log.warning(
+                    f"[GraphRAG] No usable text in {len(stored_points)} point(s) "
+                    f"for '{source}' (all card/binary)"
+                )
+                return {
+                    "status": "done",
+                    "warnings": [
+                        {
+                            "code": "empty-extraction",
+                            "message": (
+                                f"no usable text in {len(stored_points)} "
+                                f"point(s) for '{source}'"
+                            ),
+                        }
+                    ],
+                    "processed": 0,
+                }
             # No input text is not an LLM failure: there is simply nothing to
             # extract. A phase over empty input truthfully produced no product.
             return {"status": "done", "processed": 0}

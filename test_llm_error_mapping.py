@@ -250,12 +250,20 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
 
     class _Point:
-        def __init__(self, pid, text):
+        def __init__(self, pid, text, metadata=None):
             self.id = pid
-            self.payload = {"page_content": text}
+            self.payload = {
+                "page_content": text,
+                "metadata": metadata or {},
+            }
 
     def _points(text="Some document text with concepts."):
         return [_Point("doc1", text)]
+
+    def _meta_point(pid, text, **metadata):
+        return _Point(pid, text, metadata)
+
+    _BINARY_SEGMENT = "%PDF-1.5\n\x00\x01\x02 binary catalogue-card bytes \ufffd\ufffd"
 
     class _Result:
         """Stand-in for ``StructuredLLMResult`` (only ``.model``/``.text``)."""
@@ -267,9 +275,11 @@ if __name__ == "__main__":
     class _FakeStructuredLLM:
         behavior = None
         calls = 0
+        prompts = []
 
         async def run(self, prompt, llm, output_model):
             type(self).calls += 1
+            type(self).prompts.append(prompt)
             return type(self).behavior()
 
     def _make_handler():
@@ -286,6 +296,7 @@ if __name__ == "__main__":
 
     def _reset_fake():
         _FakeStructuredLLM.calls = 0
+        _FakeStructuredLLM.prompts = []
         _FakeStructuredLLM.behavior = None
 
     class _NativeSeamLLM:
@@ -802,6 +813,179 @@ if __name__ == "__main__":
         assert outcome == {"status": "not_ready", "retry_after": 5}, outcome
         print("PASS (p) spaCy no points -> not_ready (unchanged)")
 
+    async def test_q_card_binary_segments_alone_are_skipped_input():
+        """(a) A source whose store order puts binary CATALOG card segments
+        first and one prose chunk last must extract from the PROSE only: the
+        binary bytes never reach the LLM and the result is a real product."""
+        _reset_fake()
+        product = {
+            "concepts": [{"type": "CONCEPT", "text": "Algebra"}],
+            "relations": [
+                {
+                    "type": "IS_A",
+                    "origin": "Algebra",
+                    "destination": "Mathematics",
+                    "text": "Algebra is a branch of mathematics",
+                }
+            ],
+        }
+        _FakeStructuredLLM.behavior = lambda: _Result(product, json.dumps(product))
+        handler = _make_handler()
+        card = _meta_point(
+            "card", _BINARY_SEGMENT,
+            is_catalogue_card=True,
+            is_catalogue_card_segment=True,
+            chunk_index=0,
+        )
+        prose = _meta_point(
+            "prose",
+            "Algebra is a branch of mathematics that studies symbols.",
+            is_catalogue_card=False,
+            chunk_index=1,
+        )
+
+        with patch.object(
+            type(handler), "drain_source_tasks", new=AsyncMock()
+        ), patch.object(
+            type(handler),
+            "get_source_points_by_collection",
+            new=AsyncMock(return_value={"declarative": [card, prose]}),
+        ), patch.object(
+            type(handler),
+            "_resolve_agent_llm",
+            new=AsyncMock(return_value=object()),
+        ), patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+            outcome = await handler.run_llm_extraction_phase("src-q")
+
+        assert outcome["status"] == "done", outcome
+        assert outcome["processed"] == 1, outcome
+        prompt = _FakeStructuredLLM.prompts[0]
+        assert "Algebra is a branch of mathematics that studies symbols." in prompt
+        assert "%PDF" not in prompt, prompt
+        assert "catalogue-card bytes" not in prompt, prompt
+        handler._store_concept_relations.assert_awaited_once()
+        stored = handler._store_concept_relations.await_args.args[1]
+        assert len(stored["concepts"]) == 1, stored
+        print("PASS (q) binary card segments never reach the extractor")
+
+    async def test_r_only_binary_points_is_done_with_empty_warning():
+        """(b) A source made ONLY of binary/card points stays a completed
+        extraction with an ``empty-extraction`` warning: the LLM is never
+        called on unreadable bytes, and it is not a retryable failure."""
+        _reset_fake()
+        handler = _make_handler()
+        points = [
+            _meta_point(
+                "card1", _BINARY_SEGMENT,
+                is_catalogue_card=True,
+                is_catalogue_card_segment=True,
+                chunk_index=0,
+            ),
+            _meta_point(
+                "card2", "%PDF-1.5\n\x00\x00 more binary",
+                is_catalogue_card=True,
+                chunk_index=1,
+            ),
+        ]
+
+        with patch.object(
+            type(handler), "drain_source_tasks", new=AsyncMock()
+        ), patch.object(
+            type(handler),
+            "get_source_points_by_collection",
+            new=AsyncMock(return_value={"declarative": points}),
+        ), patch.object(
+            type(handler),
+            "_resolve_agent_llm",
+            new=AsyncMock(return_value=object()),
+        ), patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+            outcome = await handler.run_llm_extraction_phase("src-r")
+
+        assert outcome["status"] == "done", outcome
+        assert outcome["processed"] == 0, outcome
+        assert _FakeStructuredLLM.calls == 0, _FakeStructuredLLM.calls
+        warnings = outcome.get("warnings") or []
+        assert len(warnings) == 1, outcome
+        assert warnings[0]["code"] == "empty-extraction", outcome
+        assert "src-r" in warnings[0]["message"], warnings[0]
+        handler._store_concept_relations.assert_not_awaited()
+        print("PASS (r) only binary points -> done + empty-extraction warning")
+
+    async def test_s_extraction_input_is_ordered_by_start_index():
+        """(c) Survivors are concatenated in ``start_index`` ascending order;
+        ``start_index`` wins over ``chunk_index`` when both are present."""
+        _reset_fake()
+        product = {
+            "concepts": [{"type": "CONCEPT", "text": "Algebra"}],
+            "relations": [
+                {
+                    "type": "IS_A",
+                    "origin": "Algebra",
+                    "destination": "Mathematics",
+                    "text": "Algebra is a branch of mathematics",
+                }
+            ],
+        }
+        _FakeStructuredLLM.behavior = lambda: _Result(product, json.dumps(product))
+        handler = _make_handler()
+        points = [
+            _meta_point("p30", "THIRTY comes last.", start_index=30, chunk_index=0),
+            _meta_point("p5", "FIVE comes first.", start_index=5, chunk_index=999),
+            _meta_point("p20", "TWENTY comes second.", start_index=20, chunk_index=1),
+            _meta_point("p10", "TEN comes third.", start_index=10, chunk_index=2),
+        ]
+
+        with patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+            outcome = await handler._extract_concept_relations(
+                "src-s", points, llm=object()
+            )
+
+        assert outcome["status"] == "done", outcome
+        prompt = _FakeStructuredLLM.prompts[0]
+        assert (
+            prompt.index("FIVE comes first.")
+            < prompt.index("TEN comes third.")
+            < prompt.index("TWENTY comes second.")
+            < prompt.index("THIRTY comes last.")
+        ), prompt
+        print("PASS (s) extraction input ordered by start_index")
+
+    async def test_t_card_flagged_textual_point_is_still_used():
+        """(d) The CATALOG metadata leak marks a real prose chunk as a card:
+        content wins, so a clearly textual card-flagged point is still input."""
+        _reset_fake()
+        product = {
+            "concepts": [{"type": "CONCEPT", "text": "Algebra"}],
+            "relations": [
+                {
+                    "type": "IS_A",
+                    "origin": "Algebra",
+                    "destination": "Mathematics",
+                    "text": "Algebra is a branch of mathematics",
+                }
+            ],
+        }
+        _FakeStructuredLLM.behavior = lambda: _Result(product, json.dumps(product))
+        handler = _make_handler()
+        leaked = _meta_point(
+            "leaked",
+            "Real prose about algebra that drives the concept graph.",
+            is_catalogue_card=True,
+            is_catalogue_card_segment=True,
+            start_index=0,
+        )
+
+        with patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+            outcome = await handler._extract_concept_relations(
+                "src-t", [leaked], llm=object()
+            )
+
+        assert outcome["status"] == "done", outcome
+        prompt = _FakeStructuredLLM.prompts[0]
+        assert "Real prose about algebra" in prompt, prompt
+        handler._store_concept_relations.assert_awaited_once()
+        print("PASS (t) card-flagged but clearly textual point is still used")
+
     async def _main():
         await test_a_structured_error_is_never_done()
         await test_b_no_llm_is_configuration_error()
@@ -819,10 +1003,14 @@ if __name__ == "__main__":
         await test_n_timeout_is_not_ready_then_error()
         await test_o_spacy_zero_entities_is_done_with_warning()
         await test_p_spacy_no_points_stays_not_ready()
+        await test_q_card_binary_segments_alone_are_skipped_input()
+        await test_r_only_binary_points_is_done_with_empty_warning()
+        await test_s_extraction_input_is_ordered_by_start_index()
+        await test_t_card_flagged_textual_point_is_still_used()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM error mapping (sixteen tests, native path included)")
+    print("OK LLM error mapping (twenty tests, native path included)")
