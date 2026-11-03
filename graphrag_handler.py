@@ -27,6 +27,7 @@ try:
 except ImportError:
     distributed_lock = None
 
+from .batched_delete import delete_in_batches
 from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
@@ -2658,10 +2659,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-        query = f"""
+        # Resolve the matching Document ids with a read, then delete them in
+        # bounded, strictly sequential transactions. A single DETACH DELETE of
+        # a whole large source exceeded Neo4j's transaction memory limit (529
+        # points-with-edges ≈ 714 MiB against the 716.8 MiB cap), so the delete
+        # is split by DELETE_BATCH_MAX_ITEMS (see batched_delete.py).
+        resolve_query = f"""
         MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})<-[:BELONGS_TO]-(d:Document)
         {where_clause}
-        DETACH DELETE d
+        RETURN d.id AS id
         """
 
         # ── File-deletion cascade (provenance-based graph cleanup) ──────────
@@ -2675,21 +2681,59 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         source = (metadata or {}).get("source")
 
         async with self._get_session() as session:
-            await (await session.run(cast(LiteralString, query), **params)).consume()
+            result = await session.run(cast(LiteralString, resolve_query), **params)
+            document_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_documents(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})<-[:BELONGS_TO]-(d:Document)
+                        WHERE d.id IN $ids
+                        DETACH DELETE d
+                        """),
+                        collection_name=collection_name,
+                        tenant_id=self.agent_id,
+                        ids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(document_ids, _delete_documents)
 
             if source:
-                await session.run(
+                result = await session.run(
                     """
                     MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
                     WHERE r.source_files IS NOT NULL AND $source IN r.source_files
-                    SET r.source_files = [x IN r.source_files WHERE x <> $source]
-                    WITH r
-                    WHERE size(r.source_files) = 0
-                    DELETE r
+                    RETURN elementId(r) AS rid
                     """,
                     source=source,
                     tenant_id=self.agent_id,
                 )
+                related_ids = [
+                    record["rid"] async for record in result if record["rid"] is not None
+                ]
+
+                async def _strip_related(batch: List[str]) -> None:
+                    await (
+                        await session.run(
+                            """
+                            MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+                            WHERE elementId(r) IN $rids
+                            SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                            WITH r
+                            WHERE size(r.source_files) = 0
+                            DELETE r
+                            """,
+                            rids=batch,
+                            source=source,
+                            tenant_id=self.agent_id,
+                        )
+                    ).consume()
+
+                await delete_in_batches(related_ids, _strip_related)
 
             # Entity pruning:
             # - Per-file deletion (source set): keep the provenance-tracked
@@ -2704,30 +2748,73 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             #   created by older plugin versions without tracked_by_provenance
             #   used to survive forever as ghosts).
             if source:
-                prune_query = """
+                prune_resolve = """
                 MATCH (e:Entity {tenant_id: $tenant_id})
                 WHERE e.tracked_by_provenance = true
+                  AND NOT (e)<-[:PROVENANCE]-()
+                RETURN e.id AS id
+                """
+                prune_delete = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE e.id IN $ids
+                  AND e.tracked_by_provenance = true
                   AND NOT (e)<-[:PROVENANCE]-()
                 DETACH DELETE e
                 """
             else:
-                prune_query = """
+                prune_resolve = """
                 MATCH (e:Entity {tenant_id: $tenant_id})
                 WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                RETURN e.id AS id
+                """
+                prune_delete = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE e.id IN $ids
+                  AND NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
                 DETACH DELETE e
                 """
 
-            await session.run(prune_query, tenant_id=self.agent_id)
+            result = await session.run(prune_resolve, tenant_id=self.agent_id)
+            entity_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _prune_entities(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        prune_delete, ids=batch, tenant_id=self.agent_id
+                    )
+                ).consume()
+
+            await delete_in_batches(entity_ids, _prune_entities)
 
         async with self._get_session() as session:
-            await session.run(
+            result = await session.run(
                 """
                 MATCH (sf:SourceFile {tenant_id: $tenant_id})
                 WHERE NOT (sf)<-[:PART_OF]-()
-                DETACH DELETE sf
+                RETURN sf.name AS name
                 """,
                 tenant_id=self.agent_id,
             )
+            sourcefile_names = [
+                record["name"] async for record in result if record["name"] is not None
+            ]
+
+            async def _delete_sourcefiles(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                        WHERE sf.name IN $names
+                        DETACH DELETE sf
+                        """,
+                        names=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(sourcefile_names, _delete_sourcefiles)
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
@@ -2762,54 +2849,135 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         tenant_id = self.agent_id
         meta_fragment = f'"source": {json.dumps(source)}'
         async with self._get_session() as session:
+            # Resolve the source's Document ids FIRST (read only), then drive
+            # every delete below from bounded sequential batches. A single
+            # transaction over a large source exceeds Neo4j's tx memory limit;
+            # see batched_delete.DELETE_BATCH_MAX_ITEMS.
             result = await session.run(
                 """
                 MATCH (d:Document {tenant_id: $tenant_id})
                 WHERE d.metadata CONTAINS $meta
-                RETURN count(d) AS count
+                RETURN d.id AS id
                 """,
                 tenant_id=tenant_id,
                 meta=meta_fragment,
             )
-            record = await result.single()
-            doc_count = (record["count"] if record else 0) or 0
+            document_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+            doc_count = len(document_ids)
 
-            await session.run(
+            # Candidates MUST be resolved before their edges are removed: only
+            # entities this source pointed at may ever be pruned here.
+            result = await session.run(
                 """
                 MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
-                WHERE d.metadata CONTAINS $meta
+                WHERE d.id IN $doc_ids
                   AND type(r) IN ['PROVENANCE', 'MENTIONS']
-                WITH collect(DISTINCT e) AS candidates, collect(r) AS rels
-                FOREACH (rel IN rels | DELETE rel)
-                WITH candidates
-                UNWIND candidates AS e
-                WITH DISTINCT e
-                WHERE NOT (e)<-[:PROVENANCE]-() AND NOT (e)<-[:MENTIONS]-()
-                DETACH DELETE e
+                RETURN DISTINCT e.id AS id
                 """,
                 tenant_id=tenant_id,
-                meta=meta_fragment,
+                doc_ids=document_ids,
             )
-            await session.run(
+            candidate_entity_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_source_edges(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
+                        WHERE d.id IN $doc_ids
+                          AND type(r) IN ['PROVENANCE', 'MENTIONS']
+                        DELETE r
+                        """,
+                        tenant_id=tenant_id,
+                        doc_ids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(document_ids, _delete_source_edges)
+
+            async def _prune_entities(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (e:Entity {tenant_id: $tenant_id})
+                        WHERE e.id IN $ids
+                          AND NOT (e)<-[:PROVENANCE]-()
+                          AND NOT (e)<-[:MENTIONS]-()
+                        DETACH DELETE e
+                        """,
+                        tenant_id=tenant_id,
+                        ids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(candidate_entity_ids, _prune_entities)
+
+            # SIMILAR_TO_* edges: resolve relationship ids, then chunk.
+            result = await session.run(
                 """
                 MATCH (d:Document {tenant_id: $tenant_id})-[r]-(:Document {tenant_id: $tenant_id})
-                WHERE d.metadata CONTAINS $meta AND type(r) STARTS WITH 'SIMILAR_TO'
-                DELETE r
+                WHERE d.id IN $doc_ids AND type(r) STARTS WITH 'SIMILAR_TO'
+                RETURN DISTINCT elementId(r) AS rid
                 """,
                 tenant_id=tenant_id,
-                meta=meta_fragment,
+                doc_ids=document_ids,
             )
-            await session.run(
+            similar_ids = [
+                record["rid"] async for record in result if record["rid"] is not None
+            ]
+
+            async def _delete_similar(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (a:Document {tenant_id: $tenant_id})-[r]-(b:Document {tenant_id: $tenant_id})
+                        WHERE elementId(r) IN $rids
+                          AND type(r) STARTS WITH 'SIMILAR_TO'
+                        DELETE r
+                        """,
+                        tenant_id=tenant_id,
+                        rids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(similar_ids, _delete_similar)
+
+            # RELATED_TO provenance strip + empty-edge delete, chunked.
+            result = await session.run(
                 """
                 MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
                 WHERE r.source_files IS NOT NULL AND $source IN r.source_files
-                SET r.source_files = [x IN r.source_files WHERE x <> $source]
-                WITH r WHERE size(r.source_files) = 0
-                DELETE r
+                RETURN elementId(r) AS rid
                 """,
                 tenant_id=tenant_id,
                 source=source,
             )
+            related_ids = [
+                record["rid"] async for record in result if record["rid"] is not None
+            ]
+
+            async def _strip_related(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+                        WHERE elementId(r) IN $rids
+                        SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                        WITH r WHERE size(r.source_files) = 0
+                        DELETE r
+                        """,
+                        tenant_id=tenant_id,
+                        rids=batch,
+                        source=source,
+                    )
+                ).consume()
+
+            await delete_in_batches(related_ids, _strip_related)
+
             await session.run(
                 """
                 MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
@@ -2830,30 +2998,96 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         operation_id = random.randint(1, 100000)
 
-        query = """
+        # Resolve the matching Document ids with a read, then delete them in
+        # bounded sequential transactions (see batched_delete.py). The same
+        # batching applies to the orphan entity / SourceFile sweeps below.
+        resolve_query = """
         MATCH (c:Collection {name: $collection_name})<-[:BELONGS_TO]-(d:Document)
         WHERE d.id IN $ids AND d.tenant_id = $tenant_id
-        DETACH DELETE d
-        """
-        orphan_query = """
-        MATCH (e:Entity {tenant_id: $tenant_id})
-        WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
-        DETACH DELETE e
-        """
-        orphan_sf_query = """
-        MATCH (sf:SourceFile {tenant_id: $tenant_id})
-        WHERE NOT (sf)<-[:PART_OF]-()
-        DETACH DELETE sf
+        RETURN d.id AS id
         """
         async with self._get_session() as session:
-            await session.run(
-                cast(LiteralString, query),
+            result = await session.run(
+                cast(LiteralString, resolve_query),
                 collection_name=collection_name,
                 ids=points_ids,
-                tenant_id=self.agent_id
+                tenant_id=self.agent_id,
             )
-            await session.run(cast(LiteralString, orphan_query), tenant_id=self.agent_id)
-            await session.run(cast(LiteralString, orphan_sf_query), tenant_id=self.agent_id)
+            document_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_documents(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (c:Collection {name: $collection_name})<-[:BELONGS_TO]-(d:Document)
+                        WHERE d.id IN $ids AND d.tenant_id = $tenant_id
+                        DETACH DELETE d
+                        """),
+                        collection_name=collection_name,
+                        ids=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(document_ids, _delete_documents)
+
+            result = await session.run(
+                """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                RETURN e.id AS id
+                """,
+                tenant_id=self.agent_id,
+            )
+            orphan_entity_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_orphan_entities(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (e:Entity {tenant_id: $tenant_id})
+                        WHERE e.id IN $ids
+                          AND NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                        DETACH DELETE e
+                        """),
+                        ids=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(orphan_entity_ids, _delete_orphan_entities)
+
+            result = await session.run(
+                """
+                MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                WHERE NOT (sf)<-[:PART_OF]-()
+                RETURN sf.name AS name
+                """,
+                tenant_id=self.agent_id,
+            )
+            orphan_sourcefile_names = [
+                record["name"] async for record in result if record["name"] is not None
+            ]
+
+            async def _delete_orphan_sourcefiles(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                        WHERE sf.name IN $names
+                        DETACH DELETE sf
+                        """),
+                        names=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(orphan_sourcefile_names, _delete_orphan_sourcefiles)
+
         return UpdateResult(status="completed", operation_id=operation_id)
 
     @ensure_version
