@@ -533,13 +533,17 @@ def test_spacy_phase_done_when_points_present():
     ]
     with patch.object(type(handler), "get_source_points_by_collection",
                       new=AsyncMock(return_value={"declarative": points})), \
-         patch.object(type(handler), "drain_source_tasks", new=AsyncMock()) as drain, \
+         patch.object(type(handler), "drain_source_tasks", new=AsyncMock(return_value=False)) as drain, \
          patch.object(type(handler), "_create_similarity_relationships", new=AsyncMock()) as sim, \
-         patch.object(type(handler), "_extract_and_link_entities", new=AsyncMock()) as ner:
+         patch.object(type(handler), "_extract_document_graph", new=AsyncMock(
+             return_value={"entities": [{"name": "GraphVault"}], "mentions": [], "relations": []}
+         )) as ner, \
+         patch.object(type(handler), "_write_source_graph", new=AsyncMock()) as write:
         result = asyncio.run(main.ingestion_phase_run(
             "graph_spacy_extraction", "file.pdf", _completed([]), cat
         ))
-    assert result == {"status": "done"}, f"got {result}"
+    assert result["status"] == "done", f"got {result}"
+    assert result["processed"] == 1, f"got {result}"
     drain.assert_awaited_once_with("file.pdf")
     sim.assert_awaited_once_with("doc1", [0.1, 0.2, 0.3], "declarative")
     # the NER step runs AWAITED for the source's points (id, content, metadata)
@@ -564,13 +568,15 @@ def test_spacy_phase_skips_ner_when_entity_extraction_off():
     ]
     with patch.object(type(handler), "get_source_points_by_collection",
                       new=AsyncMock(return_value={"declarative": points})), \
-         patch.object(type(handler), "drain_source_tasks", new=AsyncMock()), \
+         patch.object(type(handler), "drain_source_tasks", new=AsyncMock(return_value=False)), \
          patch.object(type(handler), "_create_similarity_relationships", new=AsyncMock()), \
-         patch.object(type(handler), "_extract_and_link_entities", new=AsyncMock()) as ner:
+         patch.object(type(handler), "_extract_document_graph", new=AsyncMock()) as ner:
         result = asyncio.run(main.ingestion_phase_run(
             "graph_spacy_extraction", "file.pdf", _completed([]), cat
         ))
-    assert result == {"status": "done"}, f"got {result}"
+    assert result["status"] == "done", f"got {result}"
+    # extraction disabled: no product count is produced (current behaviour)
+    assert "processed" not in result, f"got {result}"
     ner.assert_not_awaited()
 
 

@@ -66,6 +66,7 @@ if __name__ == "__main__":
             reason: str | None = None
             processed: int | None = None
             expected: int | None = None
+            warnings: list[dict] | None = None
 
         class IngestionPhase(ABC):
             id = ""
@@ -348,6 +349,41 @@ if __name__ == "__main__":
                 os.environ[env] = saved
         print("PASS (g) concept phase declares the 300s LLM not-ready budget")
 
+    async def test_h_warning_phase_is_complete_not_retried():
+        """A ``done`` result carrying warnings is COMPLETE.
+
+        Warnings are telemetry attached to ``done``; they never change the
+        status. EffING retries only ``not_ready`` (and blocks dependents on
+        ``error``/``skipped``), so a warning phase is never re-run and never
+        blocks a dependent.
+        """
+        handler = FakeGraphHandler()
+        warning = {
+            "code": "empty-extraction",
+            "message": "no entities found in 42 chars of 1 chunks for 'file.pdf'",
+        }
+        handler.run_spacy_extraction_phase = AsyncMock(
+            return_value={
+                "status": "done",
+                "warnings": [warning],
+                "processed": 0,
+            }
+        )
+        cat = FakeCat(handler)
+        phase = phases.GraphSpacyPhase(cat)
+
+        result = await phase.process("file.pdf", cat)
+
+        assert result.status == "done", result
+        assert result.processed == 0, result
+        assert result.warnings == [warning], result
+        # The machine's retry rule: only not_ready is retried; error blocks
+        # dependents; done (with or without warnings) is terminal-complete.
+        assert result.status not in ("not_ready", "error"), (
+            "a phase with warnings must never be retried or treated as failed"
+        )
+        print("PASS (h) a phase with warnings is complete and not retried")
+
     async def _main():
         await test_a_vector_only_agent_is_skipped()
         await test_b_delete_source_scoped_and_idempotent()
@@ -356,10 +392,11 @@ if __name__ == "__main__":
         await test_e_phase_module_owns_no_protocol_logic()
         await test_f_phase_for_accepts_spec_or_id()
         await test_g_concept_phase_declares_llm_budget()
+        await test_h_warning_phase_is_complete_not_retried()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK phase ABC migration (seven tests)")
+    print("OK phase ABC migration (eight tests)")

@@ -7,13 +7,12 @@ Covers the graph concept phase contract (``_extract_concept_relations`` /
   (a) ``StructuredLLMError`` with unparsable raw -> ``not_ready`` on the first
       attempt, ``error`` afterwards (never ``done``);
   (b) no usable LLM -> ``error`` with the configuration reason;
-  (c) empty-but-valid output on non-empty text -> ``not_ready`` then ``error``
-      carrying the raw model text;
+  (c) a VALID LLM call returning empty concepts AND relations on non-empty
+      text -> ``done`` + an ``empty-extraction`` warning (never ``error``);
   (d) a clean extraction still yields ``done`` with the product;
   (e) a partial lenient parse (items dropped) -> ``error`` with ``dropped=<n>``;
   (f) NATIVE structured output, schema-valid but effectively empty product
-      (whitespace-only text/endpoints) -> ``not_ready`` then ``error``, never
-      ``done`` (only the native seam is faked, the wrapper validates);
+      (whitespace-only text/endpoints) -> ``done`` + warning, never ``error``;
   (g) NATIVE empty strings: the output model's ``min_length=1`` rejects them
       (never ``done``);
   (h) a non-list ``concepts``/``relations`` container counts as dropped items,
@@ -27,7 +26,11 @@ Covers the graph concept phase contract (``_extract_concept_relations`` /
   (l) an empty relation ``text`` is allowed by the output model but dropped
       and counted, never a whole-payload schema failure and never ``done``;
   (m) a NATIVE payload with SOME items dropped -> ``error`` with
-      ``dropped>=1``, never ``done``.
+      ``dropped>=1``, never ``done``;
+  (n) a timeout -> ``not_ready`` then ``error``, never a warning;
+  (o) the spaCy phase ran and produced zero entities -> ``done`` with an
+      ``empty-extraction`` warning and ``processed=0``;
+  (p) the spaCy phase with no stored points -> ``not_ready`` (unchanged).
 
 The Cat plugin loader imports every ``.py`` under a plugin folder at
 activation, so this whole file is inert on import: every import, class and
@@ -347,7 +350,10 @@ if __name__ == "__main__":
         handler._store_concept_relations.assert_not_awaited()
         print("PASS (b) no LLM -> error with the configuration reason")
 
-    async def test_c_empty_valid_is_not_ready_then_error():
+    async def test_c_valid_empty_is_done_with_warning():
+        """A VALID LLM call returning empty concepts AND relations on non-empty
+        text is ``done`` with an ``empty-extraction`` warning (never ``error``):
+        the call ran, the content simply has no concepts."""
         _reset_fake()
         raw = '{"concepts": [], "relations": []}'
         _FakeStructuredLLM.behavior = lambda: _Result(
@@ -359,16 +365,22 @@ if __name__ == "__main__":
             first = await handler._extract_concept_relations(
                 "src-c", _points(), llm=object()
             )
+            # A second run stays ``done``: no not_ready -> error transition.
             second = await handler._extract_concept_relations(
                 "src-c", _points(), llm=object()
             )
 
-        assert first["status"] == "not_ready", first
-        assert raw in (first.get("reason") or ""), first
-        assert second["status"] == "error", second
-        assert raw in (second.get("reason") or ""), second
+        for outcome in (first, second):
+            assert outcome["status"] == "done", outcome
+            assert outcome["status"] != "error", outcome
+            assert outcome["processed"] == 0, outcome
+            warnings = outcome.get("warnings") or []
+            assert len(warnings) == 1, outcome
+            assert warnings[0]["code"] == "empty-extraction", outcome
+            assert "chars" in warnings[0]["message"], outcome
+            assert "src-c" in warnings[0]["message"], outcome
         handler._store_concept_relations.assert_not_awaited()
-        print("PASS (c) empty-but-valid -> not_ready then error with raw text")
+        print("PASS (c) valid empty extraction -> done + empty-extraction warning")
 
     async def test_d_clean_extraction_is_done_with_product():
         _reset_fake()
@@ -437,9 +449,9 @@ if __name__ == "__main__":
     # product as ``done`` either.
     # ------------------------------------------------------------------
 
-    async def test_f_native_empty_product_is_never_done():
-        """Schema-valid but effectively empty native product -> not_ready then
-        error. NOT patching StructuredLLM: its native branch + validation run."""
+    async def test_f_native_empty_product_is_done_with_warning():
+        """Schema-valid but effectively empty native product -> done + warning.
+        NOT patching StructuredLLM: its native branch + validation run."""
         _reset_fake()
         payload = {
             "concepts": [{"type": "DEFINITION", "text": "   "}],
@@ -449,20 +461,17 @@ if __name__ == "__main__":
         }
         handler = _make_handler()
 
-        first = await handler._extract_concept_relations(
-            "src-f", _points(), llm=_NativeSeamLLM(payload)
-        )
-        second = await handler._extract_concept_relations(
+        outcome = await handler._extract_concept_relations(
             "src-f", _points(), llm=_NativeSeamLLM(payload)
         )
 
-        assert first["status"] == "not_ready", first
-        assert first["status"] != "done", first
-        assert "empty LLM extraction" in (first.get("reason") or ""), first
-        assert second["status"] == "error", second
-        assert json.dumps(payload) in (second.get("reason") or ""), second
+        assert outcome["status"] == "done", outcome
+        assert outcome["processed"] == 0, outcome
+        warnings = outcome.get("warnings") or []
+        assert len(warnings) == 1, outcome
+        assert warnings[0]["code"] == "empty-extraction", outcome
         handler._store_concept_relations.assert_not_awaited()
-        print("PASS (f) native empty product -> not_ready then error, never done")
+        print("PASS (f) native empty product -> done + empty-extraction warning")
 
     async def test_g_native_empty_strings_are_rejected():
         """The output model declares ``min_length=1``: empty strings must not
@@ -713,13 +722,93 @@ if __name__ == "__main__":
         handler._store_concept_relations.assert_not_awaited()
         print("PASS (m) native partial drop -> error with dropped=1, never done")
 
+    async def test_n_timeout_is_not_ready_then_error():
+        """A timeout is a "could not run" failure: ``not_ready`` on the first
+        attempt, ``error`` afterwards — never the empty-extraction warning."""
+        _reset_fake()
+        _FakeStructuredLLM.behavior = lambda: (_ for _ in ()).throw(
+            TimeoutError("deadline exceeded")
+        )
+        handler = _make_handler()
+
+        with patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
+            first = await handler._extract_concept_relations(
+                "src-n", _points(), llm=object()
+            )
+            second = await handler._extract_concept_relations(
+                "src-n", _points(), llm=object()
+            )
+
+        assert first["status"] == "not_ready", first
+        assert first.get("warnings") is None, first
+        assert second["status"] == "error", second
+        assert "timed out" in (second.get("reason") or ""), second
+        assert second.get("warnings") is None, second
+        handler._store_concept_relations.assert_not_awaited()
+        print("PASS (n) timeout -> not_ready then error, never a warning")
+
+    async def test_o_spacy_zero_entities_is_done_with_warning():
+        """The spaCy phase RAN and produced zero entities -> ``done`` with an
+        ``empty-extraction`` warning and ``processed=0`` (never ``error``)."""
+        handler = _make_handler()
+        point = _Point("doc1", "Formula-only content with no named entities.")
+
+        with patch.object(
+            type(handler),
+            "drain_source_tasks",
+            new=AsyncMock(return_value=False),
+        ), patch.object(
+            type(handler),
+            "get_source_points_by_collection",
+            new=AsyncMock(return_value={"declarative": [point]}),
+        ), patch.object(
+            type(handler),
+            "_create_similarity_relationships",
+            new=AsyncMock(),
+        ), patch.object(
+            type(handler),
+            "_extract_document_graph",
+            new=AsyncMock(return_value=None),
+        ):
+            outcome = await handler.run_spacy_extraction_phase("src-spacy")
+
+        assert outcome["status"] == "done", outcome
+        assert outcome["status"] != "error", outcome
+        assert outcome["processed"] == 0, outcome
+        warnings = outcome.get("warnings") or []
+        assert len(warnings) == 1, outcome
+        assert warnings[0]["code"] == "empty-extraction", outcome
+        message = warnings[0]["message"]
+        assert message.startswith("no entities found in "), message
+        assert "chars of 1 chunks" in message, message
+        assert "'src-spacy'" in message, message
+        print("PASS (o) spaCy zero entities -> done + empty-extraction warning")
+
+    async def test_p_spacy_no_points_stays_not_ready():
+        """The "could not run" case is unchanged: no stored points -> retry."""
+        handler = _make_handler()
+
+        with patch.object(
+            type(handler),
+            "drain_source_tasks",
+            new=AsyncMock(return_value=False),
+        ), patch.object(
+            type(handler),
+            "get_source_points_by_collection",
+            new=AsyncMock(return_value={}),
+        ):
+            outcome = await handler.run_spacy_extraction_phase("src-empty")
+
+        assert outcome == {"status": "not_ready", "retry_after": 5}, outcome
+        print("PASS (p) spaCy no points -> not_ready (unchanged)")
+
     async def _main():
         await test_a_structured_error_is_never_done()
         await test_b_no_llm_is_configuration_error()
-        await test_c_empty_valid_is_not_ready_then_error()
+        await test_c_valid_empty_is_done_with_warning()
         await test_d_clean_extraction_is_done_with_product()
         await test_e_partial_extraction_reports_dropped_count()
-        await test_f_native_empty_product_is_never_done()
+        await test_f_native_empty_product_is_done_with_warning()
         await test_g_native_empty_strings_are_rejected()
         await test_h_non_list_items_count_as_dropped()
         await test_i_disabled_feature_is_skipped_not_done()
@@ -727,10 +816,13 @@ if __name__ == "__main__":
         await test_k_non_iterable_container_is_dropped_not_raised()
         await test_l_empty_relation_text_is_dropped_not_schema_failure()
         await test_m_native_partial_drop_is_error_not_done()
+        await test_n_timeout_is_not_ready_then_error()
+        await test_o_spacy_zero_entities_is_done_with_warning()
+        await test_p_spacy_no_points_stays_not_ready()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM error mapping (thirteen tests, native path included)")
+    print("OK LLM error mapping (sixteen tests, native path included)")

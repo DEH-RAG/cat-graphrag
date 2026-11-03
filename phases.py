@@ -55,6 +55,7 @@ except Exception:  # noqa: BLE001 - EffING may be absent; keep the module import
         reason: str | None = None
         processed: int | None = None
         expected: int | None = None
+        warnings: list[dict] | None = None
 
     class IngestionPhase(ABC):
         """Minimal stand-in mirroring the EffING ABC."""
@@ -103,6 +104,7 @@ def _to_result(phase_id: str, raw: Any) -> PhaseResult:
                 reason=raw.get("reason"),
                 processed=_as_count(raw.get("processed")),
                 expected=_as_count(raw.get("expected")),
+                warnings=raw.get("warnings") or None,
             )
         return PhaseResult(
             status="error",

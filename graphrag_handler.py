@@ -296,6 +296,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # extraction succeeds (or terminally fails) so a later re-ingestion
         # starts a fresh budget.
         self._concept_attempts: Dict[str, int] = {}
+        # Per-source (entities, relations) counts of the last drained
+        # background batch. ``drain_source_tasks`` returns a bool (existing
+        # contract), so the phase reads the real product counts from here for
+        # its ``processed`` telemetry.
+        self._last_drain_counts: Dict[str, tuple[int, int]] = {}
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
         self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
@@ -1612,6 +1617,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 mentions.extend(r.get("mentions") or [])
                 relations.extend(r.get("relations") or [])
 
+        self._last_drain_counts[source] = (len(entities), len(relations))
+
         if not entities and not relations:
             return False
 
@@ -1663,9 +1670,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         Returns ``{"status": "done"}`` on success and
         ``{"status": "not_ready", "retry_after": <s>}`` when the source's
-        points are not yet in the store. Exceptions propagate (the core maps
-        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
-        so re-running after a retry never duplicates data.
+        points are not yet in the store. A phase that RAN and produced ZERO
+        entities is ``done`` with an ``empty-extraction`` warning (the content
+        simply has no entities); its ``processed`` count is 0. Exceptions
+        propagate (the core maps raise -> status=error, fail-hard). All writes
+        are idempotent MERGEs, so re-running after a retry never duplicates
+        data.
         """
         flushed = await self.drain_source_tasks(source)
 
@@ -1684,11 +1694,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # NER + link. When the background batch already produced the write,
         # skip the redundant re-extraction. Otherwise extract every chunk
         # CONCURRENTLY and write the source graph in ONE transaction.
-        if (
-            not flushed
-            and self._enable_entity_extraction
-            and self._entity_extractor
-        ):
+        processed: Optional[int] = None
+        if flushed:
+            entity_count, relation_count = self._last_drain_counts.get(source, (0, 0))
+            processed = entity_count + relation_count
+        elif self._enable_entity_extraction and self._entity_extractor:
+            content_points = [
+                p
+                for p in all_points
+                if (getattr(p, "payload", None) or {}).get("page_content", "")
+            ]
             extractions = await asyncio.gather(
                 *(
                     self._extract_document_graph(
@@ -1696,8 +1711,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         (getattr(p, "payload", None) or {}).get("page_content", ""),
                         (getattr(p, "payload", None) or {}).get("metadata", {}),
                     )
-                    for p in all_points
-                    if (getattr(p, "payload", None) or {}).get("page_content", "")
+                    for p in content_points
                 )
             )
             entities: List[Dict] = []
@@ -1709,6 +1723,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 entities.extend(extracted["entities"])
                 mentions.extend(extracted["mentions"])
                 relations.extend(extracted["relations"])
+            processed = len(entities) + len(relations)
             if entities or relations:
                 await self._write_source_graph(
                     entities,
@@ -1716,8 +1731,36 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     relations,
                     operation=f"write source graph for '{source}'",
                 )
+            else:
+                # The phase RAN correctly (spaCy executed) and found nothing:
+                # a content property, not a failure. ``done`` + warning keeps
+                # the phase complete (no retry, dependents not blocked).
+                char_count = sum(
+                    len((getattr(p, "payload", None) or {}).get("page_content", ""))
+                    for p in content_points
+                )
+                log.warning(
+                    f"[GraphRAG] spaCy extraction found no entities in "
+                    f"{char_count} chars of {len(content_points)} chunks for "
+                    f"'{source}'"
+                )
+                return {
+                    "status": "done",
+                    "warnings": [
+                        {
+                            "code": "empty-extraction",
+                            "message": (
+                                f"no entities found in {char_count} chars of "
+                                f"{len(content_points)} chunks for '{source}'"
+                            ),
+                        }
+                    ],
+                    "processed": 0,
+                }
 
-        return {"status": "done"}
+        if processed is None:
+            return {"status": "done"}
+        return {"status": "done", "processed": processed}
 
     async def run_llm_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
         """Deterministic, awaited LLM graph phase for one source (T5).
@@ -1765,10 +1808,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         outcome = await self._extract_concept_relations(
             source, all_points, stray_cat=cat
         )
-        if isinstance(outcome, dict) and outcome.get("status") in (
-            "not_ready",
-            "error",
-        ):
+        if isinstance(outcome, dict):
+            # Pass the body's result through unchanged: ``done`` (with its
+            # real ``processed`` count and any ``empty-extraction`` warning),
+            # ``not_ready``, ``error`` or ``skipped``.
             return outcome
 
         return {"status": "done"}
@@ -4032,9 +4075,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Returns a ``PhaseResult``-compatible dict: ``{"status": "done"}`` with
         the extracted product on success, ``{"status": "not_ready"}`` for a
         transient LLM failure (retried inside the phase's budget) and
-        ``{"status": "error", "reason": ...}`` for a permanent one. It NEVER
-        returns an empty success: a phase that produced nothing because the LLM
-        failed must not be recorded as ``done``.
+        ``{"status": "error", "reason": ...}`` for a permanent one. A VALID
+        LLM call that returns an empty product on non-empty text is ``done``
+        with an ``empty-extraction`` warning (the phase ran, the content has
+        no concepts/relations) and ``processed=0``; a phase that produced
+        nothing because the LLM could NOT run stays ``not_ready`` / ``error``.
         """
         tenant_id = self.agent_id
 
@@ -4096,6 +4141,32 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             "relations": outcome.get("relations", []),
         }
 
+        # A VALID LLM call that returned empty concepts AND relations on
+        # non-empty text is a ``done`` phase with an ``empty-extraction``
+        # warning: the call ran, the content simply has no concepts. This is
+        # distinct from every "could not run" path (timeout, schema error,
+        # no LLM), which stays ``not_ready`` / ``error`` in
+        # ``_llm_extract_relations``.
+        if not relations["concepts"] and not relations["relations"]:
+            self._clear_concept_attempt(source)
+            log.warning(
+                f"[GraphRAG] LLM extraction found no concepts or relations in "
+                f"{len(combined)} chars for '{source}'"
+            )
+            return {
+                "status": "done",
+                "warnings": [
+                    {
+                        "code": "empty-extraction",
+                        "message": (
+                            f"no concepts or relations found in "
+                            f"{len(combined)} chars for '{source}'"
+                        ),
+                    }
+                ],
+                "processed": 0,
+            }
+
         # Every concept created from this source is provenance-linked to the
         # documents (the file's chunks) that produced it, so the deletion
         # cascade can prune it when ALL of them are gone.
@@ -4153,10 +4224,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
           timeout. The await itself is bounded by
           ``CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS`` (default 180 s), so a
           stalled streaming socket can never keep the phase ``processing``;
-        - empty product on non-empty text (unparsable raw, an empty-but-valid
-          native payload, or every item unstorable) -> ``not_ready`` on the
-          FIRST attempt (transient, retried inside the phase's budget), then
-          ``error`` carrying a raw prefix;
+        - a VALID structured result that is empty on non-empty text -> the
+          caller turns it into ``done`` + an ``empty-extraction`` warning (the
+          content has no concepts/relations; the call succeeded);
+        - unparsable output on non-empty text (a ``StructuredLLMError`` whose
+          raw text yields no items) -> ``not_ready`` on the FIRST attempt
+          (transient, retried inside the phase's budget), then ``error``
+          carrying a raw prefix;
         - partial extraction (items dropped: a non-whitelisted type, blank
           endpoints, a blank concept text, a blank relation text, or a
           malformed non-list ``concepts``/``relations`` container) ->
@@ -4227,28 +4301,22 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # The output model only enforces non-empty STRINGS, so a
             # whitespace-only concept text / relation endpoint is schema-valid
             # yet unstorable (``_store_concept_relations`` skips it). Drop what
-            # the store would skip and demand a real product before ``done``.
+            # the store would skip; what remains is the real product.
             concepts, relations = self._drop_unstorable_items(concepts, relations)
             if not concepts and not relations:
+                # The LLM call itself SUCCEEDED and returned a valid empty
+                # product: the content has no concepts/relations. That is
+                # ``done`` (with the caller's ``empty-extraction`` warning),
+                # never a retryable failure.
                 log.warning(
                     f"[GraphRAG] LLM extraction produced empty concepts/relations "
-                    f"(attempt {attempt}); raw={raw[:300]!r}"
+                    f"(valid empty result); raw={raw[:300]!r}"
                 )
-                if attempt <= 1:
-                    return {
-                        "status": "not_ready",
-                        "reason": (
-                            "empty LLM extraction on non-empty text "
-                            f"(attempt {attempt}); raw={raw[:300]!r}"
-                        ),
-                        "retry_after": 5,
-                    }
                 return {
-                    "status": "error",
-                    "reason": (
-                        "empty LLM extraction on non-empty text "
-                        f"after {attempt} attempt(s); raw={raw[:300]!r}"
-                    ),
+                    "status": "done",
+                    "concepts": [],
+                    "relations": [],
+                    "processed": 0,
                 }
             # Same dropped-item gate as the lenient path: stale items the
             # schema let through but the store skipped are a partial
