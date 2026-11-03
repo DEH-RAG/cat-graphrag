@@ -425,7 +425,50 @@ A few things are worth knowing before production use:
 | `tests/` | Standalone, import-safe behavioral harnesses (run as scripts) |
 | `scripts/` | `maintenance_agent.py`, `cleanup_null_vectors.py` and `fix_leaked_card_metadata.py` utilities |
 
-### Maintenance CLI coordination
+### Maintenance CLI
+
+`maintenance_agent.py` runs inside the Cat container and drives the ingestion
+engine and the GraphRAG graph rebuild. Scope is `--agent <id>` (repeatable; an
+explicit id is the only way to target a protected/`__*__` agent) or `--all`
+(protected agents always skipped). Ops are combinable: `--reingest`,
+`--reembed`, `--resume-failed`, `--graph`.
+
+```bash
+# Re-embed only (chunk reuse) for one agent
+docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --reembed --yes
+
+# Re-ingest from scratch (points-first wipe, then re-parse + re-embed)
+docker exec cheshire_cat_core python /app/maintenance_agent.py --all --reingest --yes
+
+# Resume ONLY the failed phases (keeps complete phases, no purge/re-parse/re-embed)
+docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --resume-failed --yes
+
+# Rebuild the GraphRAG graph (wipe-then-rebuild)
+docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --graph --yes
+
+# Show the resolved plan without touching anything (exits 2)
+docker exec cheshire_cat_core python /app/maintenance_agent.py --all --resume-failed --dry-run
+```
+
+Safety contract: the default mode is **dry-run** — it prints the resolved plan
+(agent, source, failed phases, kept-phase count for `--resume-failed`) and
+exits **2** with zero writes; every mutating op requires `--yes`; agents are
+processed sequentially with per-agent and per-source `try/except` isolation;
+`--json` emits machine-readable plan/summary lines.
+
+Exit codes: **0** = all resumed/ops cleanly, **1** = partial failure (some
+source/agent/op failed, or a `--verify` check failed), **2** = aborted
+(dry-run or missing `--yes`, or EffING is not importable).
+
+`--resume-failed` deletes only the diary entries whose state is `error`
+(including collateral `dependency <x> is error` rows), keeps every `complete`
+entry with its `tag`/`started_at`, writes `status=processing`/`error=None`,
+and re-dispatches only the cleared phases via
+`reembed_sources(..., stale_after=0.0)`. A source with no failed phase is
+reported `nothing-to-resume` and left untouched; a disabled
+`graph_llm_extraction` phase ends `skipped`, never `error`.
+
+### Maintenance script coordination
 
 Before each per-agent run `maintenance_agent.py` writes
 `agents:<agent_id>:ingestion:maintenance` (`{"owner": "maintenance",

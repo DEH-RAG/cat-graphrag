@@ -22,6 +22,9 @@ Usage (inside the Cat container):
     # Show the plan without touching anything (exits 2)
     docker exec cheshire_cat_core python /app/maintenance_agent.py --all --graph --dry-run
 
+    # Resume ONLY the failed phases (no wipe, no re-parse, no re-embed)
+    docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --resume-failed --yes
+
     # Run the acceptance checks after the ops (read-only)
     docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --reembed --yes --verify
 
@@ -32,14 +35,17 @@ Exit codes:
         or an op needs the efficient ingestion plugin EffING and it is not
         importable as ``cat.core_plugins.cat_efficient_ingestion``)
 
-``--reembed``, ``--reingest`` and ``--verify`` require the extracted EffING
-plugin (``reembed``/``registry`` modules). Its imports are lazy and guarded:
-when it is absent the CLI still starts (``--help`` works) and those ops abort
-with a clear message and exit code 2 instead of raising a traceback.
+``--reembed``, ``--reingest``, ``--resume-failed`` and ``--verify`` require the
+extracted EffING plugin (``reembed``/``registry`` modules). Its imports are
+lazy and guarded: when it is absent the CLI still starts (``--help`` works)
+and those ops abort with a clear message and exit code 2 instead of raising a
+traceback.
 
 Every op requires --yes: --reembed deletes the status docs per source,
---reingest additionally deletes the source's points and re-ingests, and
---graph wipes the tenant's graph edges + orphan entities (A0 Cypher).
+--reingest additionally deletes the source's points and re-ingests,
+--resume-failed rewrites the failed diary/status and re-dispatches only the
+failing phases (never purging, re-parsing or re-embedding a completed phase),
+and --graph wipes the tenant's graph edges + orphan entities (A0 Cypher).
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. It must have ZERO top-level side
@@ -149,6 +155,12 @@ _DESTRUCTIVE_STEPS: dict[str, list[str]] = {
     "reembed": [
         "delete_status per source (forces the embedding phase)",
     ],
+    "resume-failed": [
+        "reset the ERROR diary entries per failed source (keeps complete ones)",
+        "set status=processing, error=None per failed source",
+        "reembed_sources re-dispatch of ONLY the failing phases "
+        "(no purge, no re-parse, no re-embed of healthy phases)",
+    ],
 }
 
 # Batch size for the --graph fixed-part walk: after each batch the Epoch
@@ -194,6 +206,8 @@ class _PlanEntry(TypedDict):
     # Present when the agent is excluded from the run (e.g. the GraphRAG
     # plugin is not active for it while `--graph` was requested).
     skip_reason: NotRequired[str]
+    # Resolved error-status sources for `--resume-failed` (dry-run plan).
+    resume_sources: NotRequired[list[dict[str, Any]]]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -211,12 +225,14 @@ def _parse_args() -> argparse.Namespace:
     scope.add_argument(
         "--agent",
         metavar="ID",
-        help="Target a single agent by id.",
+        action="append",
+        help="Target one or more agents by id (repeatable). Explicitly naming "
+             "a protected/system agent allows it.",
     )
     scope.add_argument(
         "--all",
         action="store_true",
-        help="Target all agents (the system agent is always skipped).",
+        help="Target all agents (system and __*__ protected agents skipped).",
     )
 
     parser.add_argument(
@@ -238,6 +254,14 @@ def _parse_args() -> argparse.Namespace:
              "similarity/derived part + optional LLM concept relations). "
              "DESTRUCTIVE (requires --yes).",
     )
+    parser.add_argument(
+        "--resume-failed",
+        action="store_true",
+        help="Resume ONLY the phases whose diary entry is in the error state "
+             "(keeps complete phases with their tag/started_at, writes "
+             "status=processing, error=None, and re-dispatches only those "
+             "phases). No purge, no re-parse, no re-embed. Requires --yes.",
+    )
 
     parser.add_argument(
         "--collection",
@@ -254,7 +278,7 @@ def _parse_args() -> argparse.Namespace:
         "--yes",
         action="store_true",
         help="Confirm destructive steps (required for every op: status/point "
-             "deletes, the graph wipe, re-ingest).",
+             "deletes, the graph wipe, re-ingest, failed-phase resume).",
     )
     parser.add_argument(
         "--verify",
@@ -262,13 +286,31 @@ def _parse_args() -> argparse.Namespace:
         help="Run acceptance assertions after the ops (read-only; never "
              "against the system agent).",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the resolved plan and the final summary as JSON.",
+    )
 
     args = parser.parse_args()
 
-    # At least one op required; combinable.
-    args.ops = [op for op in ("reingest", "reembed", "graph") if getattr(args, op)]
+    # Combinable ops. --resume-failed is declarative-only: it operates on the
+    # agent's stored sources, which live in the declarative collection.
+    ops = ("reingest", "reembed", "resume-failed", "graph")
+    ops_attr = {
+        "reingest": args.reingest,
+        "reembed": args.reembed,
+        "resume-failed": args.resume_failed,
+        "graph": args.graph,
+    }
+    args.ops = [op for op in ops if ops_attr[op]]
     if not args.ops:
-        parser.error("at least one operation is required: --reingest, --reembed, --graph")
+        parser.error(
+            "at least one operation is required: --reingest, --reembed, "
+            "--resume-failed, --graph"
+        )
+    if "resume-failed" in args.ops and args.collection != "declarative":
+        parser.error("--resume-failed only supports --collection declarative")
 
     return args
 
@@ -298,13 +340,16 @@ def _runtime_guard() -> bool:
     return True
 
 
-async def _list_agents() -> list[str]:
+async def _list_agents(include_protected: bool = False) -> list[str]:
     """Enumerate agent ids from Redis (read-only).
 
     ``get_agents_main_keys()`` scans ``agents:*`` and returns the unique
-    second key segment. The ``system`` agent (the admin's default,
-    ``cat.db.database.DEFAULT_SYSTEM_KEY``) is always skipped; the legacy
-    ``default`` agent is kept with a one-time warning.
+    second key segment. With ``include_protected=False`` (``--all``), the
+    ``system`` agent (the admin's default, ``cat.db.database.DEFAULT_SYSTEM_KEY``)
+    and the ``__*__`` system agents are always skipped. An explicit
+    ``--agent`` validates against the protected-inclusive list, so naming one
+    explicitly is the only way to target it. The legacy ``default`` agent is
+    kept with a one-time warning.
     """
     global _default_agent_warned
 
@@ -314,8 +359,11 @@ async def _list_agents() -> list[str]:
 
     agents: list[str] = []
     for agent_id in ids:
-        if agent_id == "system":
-            continue
+        if not include_protected:
+            if agent_id == "system":
+                continue
+            if agent_id.startswith("__") and agent_id.endswith("__"):
+                continue
         if agent_id == "default" and not _default_agent_warned:
             print(
                 "[maintenance] warn: agent 'default' is the legacy default "
@@ -386,26 +434,90 @@ async def _agent_uses_graphrag_handler(agent_id: str) -> bool:
     return (entry or {}).get("name") == "Neo4jGraphRAGConfig"
 
 
+async def _resolve_resume_failed_plan(agent_id: str) -> list[dict[str, Any]]:
+    """Read-only resolution of the sources `--resume-failed` will act on.
+
+    Enumerates the agent-scope status docs (``list_statuses``), keeps only the
+    rows whose status is ``error`` and re-reads each one with
+    ``registry.get_status`` (the same API the op uses). For every row it
+    reports the diary phases whose explicit state is ``error`` (including the
+    collateral ``dependency <x> is error`` entries) and the count of phases it
+    will keep untouched (``complete`` / ``skipped`` / ``processing``).
+
+    Never bootstraps the agent and never writes: safe for the dry-run plan.
+    """
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            PHASE_STATE_ERROR,
+            get_status,
+            list_statuses,
+            phase_state,
+        )
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+
+    resolved: list[dict[str, Any]] = []
+    for listed in await list_statuses(agent_id):
+        source = listed.get("source")
+        if not source or listed.get("status") != "error":
+            continue
+        scope = str(listed.get("scope") or "agent")
+        doc = await get_status(agent_id, scope, source)
+        if not isinstance(doc, dict) or doc.get("status") != "error":
+            continue
+        diary = doc.get("completed_phases")
+        diary = diary if isinstance(diary, dict) else {}
+        failed = [
+            phase
+            for phase, entry in diary.items()
+            if phase_state(entry) == PHASE_STATE_ERROR
+        ]
+        kept = [
+            phase
+            for phase, entry in diary.items()
+            if phase_state(entry) != PHASE_STATE_ERROR
+        ]
+        resolved.append(
+            {
+                "source": source,
+                "scope": scope,
+                "type": doc.get("type") or "file",
+                "failed_phases": failed,
+                "kept_phases": kept,
+            }
+        )
+    return resolved
+
+
 async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
     """Build the per-agent ops plan.
 
-    ``--agent <id>`` validates the id against the live agent list (aborts
-    with exit 2 when unknown);     ``--all`` expands to every agent minus
-    ``system``. When ``--graph`` is the ONLY requested op, an agent is
+    ``--agent <id>`` (repeatable) validates every id against the live agent
+    list (aborts with exit 2 when unknown) and is the ONLY way to target a
+    protected/system agent; ``--all`` expands to every agent minus ``system``
+    and ``__*__``. When ``--graph`` is the ONLY requested op, an agent is
     skipped with ``skip_reason="plugin-not-active"`` (plugin off) or
     ``skip_reason="handler-not-graphrag"`` (plugin on, vector backend not
     GraphRAG). With a mixed plan the engine ops still run, so the graph op is
     skipped per-op in ``_run_agent`` instead.
-    """
-    agents = await _list_agents()
 
-    if args.agent:
-        if args.agent not in agents:
-            print(f"ABORTED: unknown agent {args.agent}")
+    ``--resume-failed`` also resolves the error-status sources for every
+    targeted agent (read-only: status docs only, no bootstrap) so the dry-run
+    can print agent, source, failed phases and the kept-phase count.
+    """
+    raw_agents = args.agent or []
+    if isinstance(raw_agents, str):
+        raw_agents = [raw_agents]
+    explicit = list(dict.fromkeys(raw_agents))
+    if explicit:
+        all_agents = await _list_agents(include_protected=True)
+        unknown = [agent_id for agent_id in explicit if agent_id not in all_agents]
+        if unknown:
+            print(f"ABORTED: unknown agent {', '.join(unknown)}")
             sys.exit(2)
-        agent_ids = [args.agent]
+        agent_ids = explicit
     else:
-        agent_ids = agents
+        agent_ids = await _list_agents()
 
     active: set[str] = set()
     if "graph" in args.ops:
@@ -438,19 +550,30 @@ async def _build_ops_plan(args: argparse.Namespace) -> list[_PlanEntry]:
             # GraphRAG plugin loaded but the agent's vector backend is not the
             # GraphRAG handler (e.g. Qdrant): the graph op cannot run.
             entry["skip_reason"] = "handler-not-graphrag"
+        if "resume-failed" in args.ops:
+            entry["resume_sources"] = await _resolve_resume_failed_plan(agent_id)
         plan.append(entry)
     return plan
 
 
-def _print_plan(plan: list[_PlanEntry]) -> None:
+def _print_plan(plan: list[_PlanEntry], as_json: bool = False) -> None:
     """Print the dry-run plan: per agent+op the concrete steps.
 
     Pure plan (Metis #26): NO bootstrap, NO writes, NO ``CheshireCat.create``.
     The A0 wipe statements are printed verbatim (with a ``<gen>`` placeholder
     for the run-time generation); the per-source wipe/status-delete steps are
     printed as templates — the actual source names are only known after
-    bootstrap, which dry-run must NOT do.
+    bootstrap, which dry-run must NOT do. ``--resume-failed`` is the exception:
+    its sources are resolved from the status docs (read-only) and printed
+    explicitly with the failed and kept phases.
+
+    With ``as_json`` the whole plan is emitted as one JSON document instead of
+    the human-readable lines.
     """
+    if as_json:
+        print(json.dumps({"dry_run": True, "plan": plan}, ensure_ascii=False, default=str))
+        return
+
     print("DRY-RUN PLAN (no writes performed)")
     for entry in plan:
         agent_id = entry["agent_id"]
@@ -488,6 +611,30 @@ def _print_plan(plan: list[_PlanEntry]) -> None:
                     "      2. reembed_sources(ccat, collection, sources)  "
                     "# embedding phase, chunk reuse (PHASE_EMBEDDING)"
                 )
+            elif op == "resume-failed":
+                print("    steps:")
+                print(
+                    "      1. delete_status is NOT called; clear only the "
+                    "ERROR entries in the status diary"
+                )
+                print(
+                    "      2. reembed_sources(ccat, declarative, [source], "
+                    "stale_after=0.0)  # failing phases only"
+                )
+                for item in entry.get("resume_sources", []):
+                    failed = item.get("failed_phases") or []
+                    kept = item.get("kept_phases") or []
+                    if not failed:
+                        print(
+                            f"    source={item['source']} nothing-to-resume "
+                            f"(kept_phases={len(kept)})"
+                        )
+                    else:
+                        print(
+                            f"    source={item['source']} "
+                            f"failed_phases={','.join(failed)} "
+                            f"kept_phases={len(kept)}"
+                        )
             elif op == "graph":
                 print("    steps:")
                 print(
@@ -754,6 +901,213 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
 
     await reembed_sources(ccat, VectorMemoryType(collection), sources)
     return await _report_ingestion_outcome(agent_id, "reembed", sources)
+
+
+async def _op_resume_failed(
+    ccat, handler, collection: str, json_output: bool = False
+) -> bool:
+    """Resume ONLY the diary phases that are in the ``error`` state.
+
+    For every agent-scope source whose status is ``error``:
+
+    1. read the status doc with ``registry.get_status``;
+    2. remove ONLY the diary entries whose ``phase_state`` is ``error``
+       through ``registry.reset_phase_entries`` — the collateral
+       ``dependency <x> is error`` entries are error entries too, while every
+       ``complete`` entry keeps its ``tag`` / ``started_at`` untouched;
+    3. write ``status=processing`` and ``error=None`` (``set_status``);
+    4. hand only that source to ``reembed_sources(..., stale_after=0.0)``: the
+       probe sees the remaining complete phases as fresh, so only the cleared
+       phases re-run. There is NO purge, NO point wipe, NO re-parse and NO
+       re-embed of a completed phase;
+    5. hold the per-agent maintenance marker for the whole pass (refreshed per
+       source) so the EffING sweep cannot steal the rows.
+
+    A source with no failed phase is reported ``nothing-to-resume`` and left
+    untouched. ``graph_llm_extraction`` is never forced: when concept relations
+    are disabled its body records ``skipped`` (never ``error``). Per-source
+    failures are isolated: one bad source never aborts the others, and the
+    final ``result=ok|fail`` is the same shape as ``--reingest``.
+
+    Returns True only when every attempted source ended ``completed`` (or had
+    nothing to resume).
+    """
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            PHASE_STATE_ERROR,
+            IngestionStatus,
+            get_status,
+            phase_state,
+            reset_phase_entries,
+            set_status,
+        )
+        from cat.core_plugins.cat_efficient_ingestion.resume import _source_from_entry
+    except ImportError as exc:
+        _abort_missing_effing(exc)
+
+    from cat.services.memory.models import VectorMemoryType
+
+    agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
+    plan = await _resolve_resume_failed_plan(agent_id)
+
+    retried: dict[str, list[str]] = {}
+    skipped: list[str] = []
+    failures: dict[str, Any] = {}
+
+    for item in plan:
+        source_name = item["source"]
+        scope = item["scope"]
+        type_ = item["type"]
+
+        # A long pass must stay protected even if it outlives the initial TTL.
+        await _set_maintenance_marker(agent_id)
+
+        if not item["failed_phases"]:
+            skipped.append(source_name)
+            if not json_output:
+                print(
+                    f"[maintenance] agent={agent_id} op=resume-failed "
+                    f"source={source_name} result=skip detail=nothing-to-resume"
+                )
+            continue
+
+        try:
+            # Build the source object BEFORE any write: a missing file must
+            # never leave the row ``processing`` with its error diary dropped.
+            source_obj = _source_from_entry(
+                ccat, agent_id, scope, source_name, type_
+            )
+            if source_obj is None:
+                failures[source_name] = {"source": "source-unavailable"}
+                if not json_output:
+                    print(
+                        f"[maintenance] agent={agent_id} op=resume-failed "
+                        f"source={source_name} result=fail detail=source-unavailable"
+                    )
+                continue
+
+            # Re-read just before writing: the row may have changed between
+            # the plan resolution and this pass.
+            doc = await get_status(agent_id, scope, source_name)
+            diary = (doc or {}).get("completed_phases")
+            diary = diary if isinstance(diary, dict) else {}
+            failed_phases = [
+                phase
+                for phase, entry in diary.items()
+                if phase_state(entry) == PHASE_STATE_ERROR
+            ]
+            if not failed_phases:
+                skipped.append(source_name)
+                if not json_output:
+                    print(
+                        f"[maintenance] agent={agent_id} op=resume-failed "
+                        f"source={source_name} result=skip detail=nothing-to-resume"
+                    )
+                continue
+
+            # STATE ONLY: drop the failed diary entries (complete entries and
+            # their tag/started_at are preserved), then mark the source
+            # processing with no error. No points are touched.
+            await reset_phase_entries(agent_id, scope, source_name, failed_phases)
+            await set_status(
+                agent_id,
+                scope,
+                source_name,
+                type_=type_,
+                status=IngestionStatus.PROCESSING,
+                chat_id=None if scope == "agent" else scope,
+                error=None,
+            )
+
+            # Re-dispatch: the probe sees the kept phases as fresh, so only
+            # the cleared (failed) phases run. stale_after=0.0 lets the claim
+            # take the row we just wrote.
+            await reembed_sources(
+                ccat,
+                VectorMemoryType(collection),
+                [source_obj],
+                stale_after=0.0,
+            )
+
+            after = await get_status(agent_id, scope, source_name) or {}
+            after_diary = after.get("completed_phases")
+            after_diary = after_diary if isinstance(after_diary, dict) else {}
+            still_failed = {
+                phase: entry.get("reason")
+                for phase, entry in after_diary.items()
+                if phase_state(entry) == PHASE_STATE_ERROR
+            }
+            status = after.get("status")
+            if status == "error" or still_failed:
+                failures[source_name] = {
+                    "phases": still_failed
+                    or {after.get("phase") or "unknown": after.get("error")}
+                }
+                if not json_output:
+                    print(
+                        f"[maintenance] agent={agent_id} op=resume-failed "
+                        f"source={source_name} result=fail detail=phase-failed "
+                        f"phases={json.dumps(still_failed, ensure_ascii=False, default=str)}"
+                    )
+                continue
+            if status != "completed":
+                failures[source_name] = {"phases": {"still-processing": status}}
+                if not json_output:
+                    print(
+                        f"[maintenance] agent={agent_id} op=resume-failed "
+                        f"source={source_name} result=fail "
+                        f"detail=still-processing status={status!r}"
+                    )
+                continue
+
+            retried[source_name] = failed_phases
+            if not json_output:
+                print(
+                    f"[maintenance] agent={agent_id} op=resume-failed "
+                    f"source={source_name} result=ok detail=resumed "
+                    f"phases={','.join(failed_phases)}"
+                )
+        except Exception as exc:  # noqa: BLE001 - per-source isolation
+            failures[source_name] = {"error": f"{type(exc).__name__}: {exc}"}
+            if not json_output:
+                print(
+                    f"[maintenance] agent={agent_id} op=resume-failed "
+                    f"source={source_name} result=fail "
+                    f"detail={type(exc).__name__}: {exc}"
+                )
+
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "agent": agent_id,
+                    "op": "resume-failed",
+                    "result": "fail" if failures else "ok",
+                    "retried": retried,
+                    "skipped": skipped,
+                    "failures": failures,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+    elif failures:
+        print(
+            f"[maintenance] agent={agent_id} op=resume-failed result=fail "
+            f"detail=phase-failed failures="
+            f"{json.dumps(failures, ensure_ascii=False, default=str)} "
+            f"retried={json.dumps(retried, ensure_ascii=False, default=str)}"
+        )
+    else:
+        print(
+            f"[maintenance] agent={agent_id} op=resume-failed result=ok "
+            f"detail=resumed retried="
+            f"{json.dumps(retried, ensure_ascii=False, default=str)} "
+            f"skipped={json.dumps(skipped, ensure_ascii=False, default=str)}"
+        )
+
+    return not failures
 
 
 async def _preflight_reembed_path(ccat) -> str | None:
@@ -1249,24 +1603,28 @@ async def _op_graph_part_b(ccat, handler) -> bool:
     return False
 
 
-async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarative") -> bool:
+async def _run_agent(
+    agent_id: str,
+    ops: list[str],
+    collection: str = "declarative",
+    json_output: bool = False,
+) -> bool:
     """Run the requested ops for one agent.
 
     Bootstraps the agent (``CheshireCat.create`` + handler checks +
-    ``initialize``) and dispatches each op. ``--reembed`` and ``--reingest``
-    resolve the active ingestion engine first (refusing the base engine, Metis
-    #23) and then run the embedding phase via ``_op_reembed`` / the points-
-    first wipe + clean re-parse via ``_op_reingest``; ``--graph`` runs Part A
-    (fixed graph wipe-then-rebuild, ``_op_graph_part_a``) then Part B (LLM
-    concept relations with the latest-wins flip, ``_op_graph_part_b``).
+    ``initialize``) and dispatches each op. ``--reembed``, ``--reingest`` and
+    ``--resume-failed`` resolve the active ingestion engine first (refusing
+    the base engine, Metis #23) and then run the embedding phase via
+    ``_op_reembed`` / the points-first wipe + clean re-parse via
+    ``_op_reingest`` / the failed-phases-only resume via ``_op_resume_failed``;
+    ``--graph`` runs Part A (fixed graph wipe-then-rebuild,
+    ``_op_graph_part_a``) then Part B (LLM concept relations with the
+    latest-wins flip, ``_op_graph_part_b``).
 
     The skip reason from ``_bootstrap_agent`` only gates the GRAPH ops:
     ``handler-not-graphrag`` (no GraphRAG handler) skips ``--graph`` but NOT
-    ``--reembed`` / ``--reingest``, whose phases are engine-level and no-op
-    their graph steps via ``ingestion_phase_run`` (returns ``done`` when the
-    active handler is not GraphRAG). ``graphrag-not-enabled`` (the ``--graph``
-    op requires the ``Neo4jGraphRAGConfig`` setting with
-    ``enable_concept_relations``) likewise skips only ``--graph``.
+    ``--reembed`` / ``--reingest`` / ``--resume-failed``, whose phases are
+    engine-level and record graph phases as ``skipped`` when inactive.
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
@@ -1287,7 +1645,7 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 f"reason=graphrag-not-enabled"
             )
             continue
-        if op in ("reembed", "reingest"):
+        if op in ("reembed", "reingest", "resume-failed"):
             engine = await _resolve_ingestion_engine(ccat, op=op)
             if engine is None:
                 ok = False
@@ -1301,6 +1659,19 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
                 continue
             if not reembed_ok:
                 # _op_reembed already logged the per-source outcome summary.
+                ok = False
+            continue
+        if op == "resume-failed":
+            try:
+                resume_ok = await _op_resume_failed(
+                    ccat, handler, collection, json_output=json_output
+                )
+            except Exception as exc:  # noqa: BLE001 - per-op isolation
+                print(f"[maintenance] agent={agent_id} op={op} result=fail detail={exc}")
+                ok = False
+                continue
+            if not resume_ok:
+                # _op_resume_failed already logged the per-source summary.
                 ok = False
             continue
         if op == "reingest":
@@ -1444,17 +1815,18 @@ async def main() -> None:
     plan = await _build_ops_plan(args)
 
     if args.dry_run:
-        _print_plan(plan)
+        _print_plan(plan, as_json=args.json)
         sys.exit(2)
 
     # Skipped agents (e.g. plugin-not-active) are reported, not run.
     runnable = []
     for entry in plan:
         if entry.get("skip_reason"):
-            print(
-                f"[maintenance] agent={entry['agent_id']} result=skip "
-                f"reason={entry.get('skip_reason')}"
-            )
+            if not args.json:
+                print(
+                    f"[maintenance] agent={entry['agent_id']} result=skip "
+                    f"reason={entry.get('skip_reason')}"
+                )
         else:
             runnable.append(entry)
 
@@ -1466,33 +1838,42 @@ async def main() -> None:
             if op in _DESTRUCTIVE_STEPS
         ]
         if destructive:
-            print("ABORTED: destructive operations require --yes:")
-            for agent_id, op in destructive:
-                print(f"  agent={agent_id} op={op} steps:")
-                for step in _DESTRUCTIVE_STEPS[op]:
-                    print(f"    - {step}")
-            print("Re-run with --yes to confirm (or --dry-run to preview).")
+            # The resolved plan is the dry-run view (default mode): print it
+            # before aborting, so the operator sees exactly what --yes would do.
+            _print_plan(plan, as_json=args.json)
+            if not args.json:
+                print("ABORTED: destructive operations require --yes:")
+                for agent_id, op in destructive:
+                    print(f"  agent={agent_id} op={op} steps:")
+                    for step in _DESTRUCTIVE_STEPS[op]:
+                        print(f"    - {step}")
+                print("Re-run with --yes to confirm (or --dry-run to preview).")
             sys.exit(2)
 
     results = []
     for entry in runnable:
         # Sequential per-agent execution (Metis #18): agents are processed one
         # at a time, so no two ops ever run concurrently on the same agent.
-        print(f"[maintenance] agent={entry['agent_id']} progress=start")
+        if not args.json:
+            print(f"[maintenance] agent={entry['agent_id']} progress=start")
         # Coordinate with the EffING periodic sweep: while this marker exists
         # the sweep skips the agent, so it can never steal/retry the rows this
         # CLI is processing. Deleted at the end, on success AND on failure.
         await _set_maintenance_marker(entry["agent_id"])
         try:
             ok = await _run_agent(
-                entry["agent_id"], entry["ops"], entry["collection"]
+                entry["agent_id"],
+                entry["ops"],
+                entry["collection"],
+                json_output=args.json,
             )
         except Exception as exc:  # noqa: BLE001 - per-agent isolation
             print(f"[maintenance] agent={entry['agent_id']} result=fail detail={exc}")
             ok = False
         finally:
             await _clear_maintenance_marker(entry["agent_id"])
-        print(f"[maintenance] agent={entry['agent_id']} progress=done")
+        if not args.json:
+            print(f"[maintenance] agent={entry['agent_id']} progress=done")
         results.append(ok)
 
     # --verify: acceptance checks per agent (read-only; the system agent is
@@ -1530,6 +1911,21 @@ async def main() -> None:
                     f"checks={len(checks)}/{len(checks)}"
                 )
         print(f"[maintenance] result=verify-{'ok' if verify_ok else 'fail'}")
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "result": "ok" if all(results) and verify_ok else "fail",
+                    "agents": [
+                        {"agent": entry["agent_id"], "ok": ok}
+                        for entry, ok in zip(runnable, results)
+                    ],
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
 
     if all(results) and verify_ok:
         sys.exit(0)
