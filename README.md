@@ -422,7 +422,7 @@ A few things are worth knowing before production use:
 | `structured_llm.py` | Structured JSON output helpers for the agent LLM |
 | `plugin.json` | Plugin metadata for Grinning Cat |
 | `pyproject.toml` | Python dependencies |
-| `tests/` | Standalone, import-safe behavioral harnesses (run as scripts) |
+| `tests/` | The plugin's own behavioral suite: standalone, import-safe harnesses (run as scripts) |
 | `scripts/` | `cleanup_null_vectors.py` utility |
 
 ### Maintenance CLI
