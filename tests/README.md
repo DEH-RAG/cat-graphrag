@@ -1,7 +1,8 @@
 # Standalone harnesses
 
-The authoritative behavioral suite is the HOST repository at
-`grinning-cat-core/tests/mygraph/` (pytest).
+This directory is the plugin's own behavioral suite. The host repository keeps
+only the integration contract with MyCAT (`grinning-cat-core/tests/mygraph/`:
+`test_dual_mode.py`, `test_phase_registration.py`, `test_transfer_hook.py`).
 
 The files in this directory are import-safe standalone **scripts**: each `.py`
 under the plugin is imported by the Cat loader at activation, so every script
@@ -21,9 +22,12 @@ does not need and prints `PASS <test>` lines. Requirements per script:
 - `test_hook_reload_order.py`, `test_kg_master_switch.py`,
   `test_ner_segmentation.py`, `test_terminology_refresh.py`,
   `test_versioned_schema.py`, `test_reindex_swap.py`,
-  `test_derived_graph_unconditional.py`, `test_phase_fingerprint.py` —
-  self-contained (stubbed Neo4j/spaCy/Cat/tenant lock; the last two load the
-  real handler through a synthetic package), run from the host venv;
+  `test_derived_graph_unconditional.py`, `test_phase_fingerprint.py`,
+  `test_classic_path.py`, `test_embedder_injection.py`,
+  `test_maintenance_imports.py`, `test_phase_run.py`,
+  `test_single_extraction.py` —
+  self-contained (stubbed Neo4j/spaCy/Cat/tenant lock; the last seven load the
+  real plugin through a synthetic package), run from the host venv;
 - `test_cypher_comments.py` — static guard against `#` comments inside Cypher
   strings, plus a live execution of the concept-relation template when a Neo4j
   password is provided (`NEO4J_PASSWORD`/`--password`); without one it reports
@@ -48,4 +52,7 @@ is covered by:
 - `../test_ingestion_phase_machine.py` — the maintained standalone harness at
   the plugin root (registration, markers, tri-state `ingestion_phase_run`,
   completion gate, mode truth table, transfer cleanup);
-- `grinning-cat-core/tests/mygraph/` — the authoritative host suite.
+- the plugin suites in this directory (`test_phase_run.py`,
+  `test_classic_path.py`, `test_embedder_injection.py`,
+  `test_single_extraction.py`, `test_maintenance_imports.py`);
+- `grinning-cat-core/tests/mygraph/` — the MyCAT integration contract only.
