@@ -20,8 +20,10 @@ does not need and prints `PASS <test>` lines. Requirements per script:
 
 - `test_hook_reload_order.py`, `test_kg_master_switch.py`,
   `test_ner_segmentation.py`, `test_terminology_refresh.py`,
-  `test_versioned_schema.py`, `test_reindex_swap.py` — self-contained (stubbed
-  Neo4j/spaCy/Cat), run from the host venv;
+  `test_versioned_schema.py`, `test_reindex_swap.py`,
+  `test_derived_graph_unconditional.py`, `test_phase_fingerprint.py` —
+  self-contained (stubbed Neo4j/spaCy/Cat/tenant lock; the last two load the
+  real handler through a synthetic package), run from the host venv;
 - `test_cypher_comments.py` — static guard against `#` comments inside Cypher
   strings, plus a live execution of the concept-relation template when a Neo4j
   password is provided (`NEO4J_PASSWORD`/`--password`); without one it reports
