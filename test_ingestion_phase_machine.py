@@ -45,8 +45,9 @@ Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
 external packages (cat, langchain_core, spacy, langdetect, pydantic, neo4j)
 are stubbed in sys.modules *before* the plugin modules are imported (same
 pattern as test_kg_master_switch.py). The EffING phase-machine contract
-(``cat.core_plugins.cat_efficient_ingestion.phases.PhaseSpec``) is stubbed with a
-recording fake.
+(``cat.core_plugins.cat_efficient_ingestion.phases.PhaseSpec``) is provided by
+the shared ``effing_testkit`` (``install_stub_package``), the single published
+copy of those doubles.
 """
 
 import asyncio
@@ -56,6 +57,12 @@ import types
 from unittest.mock import AsyncMock, Mock, patch
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# The EffING contract package (and its phases submodule). Only used to
+# save/restore those entries while a test simulates "EffING absent"; the stub
+# itself is owned by effing_testkit.install_stub_package().
+_EFFING = "cat.core_plugins.cat_efficient_ingestion"
+_EFFING_PHASES = _EFFING + ".phases"
 
 # SYSTEM-level ingestion selection returned by the stubbed resolver. Tests
 # flip this between "EfficientIngestionConfiguration" (phase path) and
@@ -237,33 +244,6 @@ def _install_pydantic_stub():
     sys.modules["pydantic"] = pydantic_mod
 
 
-def _install_effing_stub():
-    """Stub the EffING phase-machine contract the hooks import lazily.
-
-    ``PhaseSpec`` is a recording fake (id / settings_category / depends_on);
-    ``cat.core_plugins.cat_efficient_ingestion`` importable is one half of the
-    ``_phase_path_active`` gate (the other is the system ingestion selection).
-    """
-    plugins = types.ModuleType("cat.plugins")
-    plugins.__path__ = []
-    sys.modules["cat.plugins"] = plugins
-
-    effing = types.ModuleType("cat.core_plugins.cat_efficient_ingestion")
-    effing.__path__ = []
-    sys.modules["cat.core_plugins.cat_efficient_ingestion"] = effing
-
-    phases = types.ModuleType("cat.core_plugins.cat_efficient_ingestion.phases")
-
-    class PhaseSpec:
-        def __init__(self, id, settings_category=None, depends_on=()):
-            self.id = id
-            self.settings_category = settings_category
-            self.depends_on = tuple(depends_on)
-
-    phases.PhaseSpec = PhaseSpec
-    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = phases
-
-
 def _install_stubs():
     _install_cat_stub()
     _install_neo4j_stub()
@@ -271,7 +251,37 @@ def _install_stubs():
     _install_langdetect_stub()
     _install_spacy_stubs()
     _install_pydantic_stub()
-    _install_effing_stub()
+
+
+def _load_effing_testkit():
+    """Import the shared ``effing_testkit`` from its sibling plugin checkout."""
+    candidates = (
+        os.path.join(os.path.dirname(REPO_ROOT), "cat-efficient-ingestion"),
+        os.path.join(os.path.dirname(REPO_ROOT), "cat-efficient-ingestion.my"),
+    )
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "effing_testkit.py")):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            break
+    import effing_testkit  # noqa: E402
+
+    return effing_testkit
+
+
+class _MaskRealEffing:
+    """Hide the host's real EffING while the testkit installs.
+
+    This harness runs against a stubbed ``cat`` (no langchain/cat.env), so the
+    real EffING ``phases`` cannot import here. Masking it makes
+    ``install_stub_package()`` take its bare-checkout path and synthesize the
+    contract double, exactly as the previous hand-rolled stub did.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == _EFFING or fullname.startswith(_EFFING + "."):
+            raise ImportError(f"{fullname} masked for the standalone test")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -362,9 +372,9 @@ def test_specs_returns_accumulator_when_effing_absent():
         assert specs is accumulator, "must return the accumulator unchanged when EffING is absent"
     finally:
         if saved is not None:
-            sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
+            sys.modules[_EFFING] = saved
         if saved_phases is not None:
-            sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = saved_phases
+            sys.modules[_EFFING_PHASES] = saved_phases
 
 
 def test_specs_returns_accumulator_when_phases_import_raises():
@@ -380,9 +390,7 @@ def test_specs_returns_accumulator_when_phases_import_raises():
             raise ImportError(f"cannot import {name} from phases")
 
     saved = sys.modules.get("cat.core_plugins.cat_efficient_ingestion.phases")
-    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = _RaisingPhases(
-        "cat.core_plugins.cat_efficient_ingestion.phases"
-    )
+    sys.modules[_EFFING_PHASES] = _RaisingPhases(_EFFING_PHASES)
     try:
         accumulator = [object()]
         specs = main.ingestion_phase_specs(accumulator, cat)
@@ -391,7 +399,7 @@ def test_specs_returns_accumulator_when_phases_import_raises():
         )
     finally:
         if saved is not None:
-            sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = saved
+            sys.modules[_EFFING_PHASES] = saved
         else:
             sys.modules.pop("cat.core_plugins.cat_efficient_ingestion.phases", None)
 
@@ -743,7 +751,7 @@ def test_rabbithole_hook_keeps_classic_path_when_effing_absent():
             create.assert_awaited_once_with("file.pdf", [], cat)
     finally:
         if saved is not None:
-            sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
+            sys.modules[_EFFING] = saved
 
 
 def test_rabbithole_hook_keeps_classic_path_with_core_engine():
@@ -774,7 +782,7 @@ def test_phase_path_active_truth_table():
         assert asyncio.run(main._phase_path_active(cat)) is False
     finally:
         if saved is not None:
-            sys.modules["cat.core_plugins.cat_efficient_ingestion"] = saved
+            sys.modules[_EFFING] = saved
 
     _RESOLVED_INGESTION["name"] = "BaseIngestionConfiguration"
     assert asyncio.run(main._phase_path_active(cat)) is False
@@ -1051,6 +1059,22 @@ def test_spacy_batch_query_keeps_concept_gen_removal():
 def main():
     _install_stubs()
 
+    testkit = _load_effing_testkit()
+    mask = _MaskRealEffing()
+    sys.meta_path.insert(0, mask)
+    try:
+        testkit.install_stub_package()
+    finally:
+        if mask in sys.meta_path:
+            sys.meta_path.remove(mask)
+
+    try:
+        _run()
+    finally:
+        testkit.uninstall_stub_package()
+
+
+def _run():
     # In-memory package pointing at the repo root: imports the plugin modules
     # directly (relative imports resolved via __path__) without executing the
     # plugin __init__.py side effects.
@@ -1058,8 +1082,8 @@ def main():
     _pkg.__path__ = [REPO_ROOT]
     sys.modules["catgraphrag_phase"] = _pkg
 
-    from catgraphrag_phase import graphrag_handler  # noqa: E402
-    from catgraphrag_phase import main as main_mod  # noqa: E402
+    from catgraphrag_phase import graphrag_handler  # noqa: E402, F401
+    from catgraphrag_phase import main as main_mod  # noqa: E402, F401
 
     tests = [
         test_specs_registers_two_graph_phases,
