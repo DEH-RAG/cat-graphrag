@@ -478,10 +478,15 @@ EffING periodic sweep skips that agent, so the app never steals/retries rows
 the CLI is rebuilding. A crashed CLI's marker expires by TTL; a failed delete
 never blocks the sweep forever.
 
-Run the coordination harness as a plain script (it is import-safe, no Redis):
+The coordination harness moved to its owner, EffING: its assertions are about
+EffING's resume/revalidation sweep, so it lives there even though it still
+drives the real MyGRAPH `maintenance_agent`. Run it from the core checkout with
+the EffING plugin (set `MYGRAPH_PLUGIN_DIR` if the MyGRAPH checkout is not a
+sibling of the EffING one):
 
 ```bash
-uv run python test_ingestion_safety_fixes.py
+cd grinning-cat-core
+.venv/bin/python /path/to/plugins/cat-efficient-ingestion/test_maintenance_coordination.py
 ```
 
 ### Removing leaked card metadata
