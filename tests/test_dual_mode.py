@@ -986,8 +986,8 @@ if __name__ == "__main__":
     def _load_effing_testkit():
         """Import the shared ``effing_testkit`` from its sibling plugin checkout."""
         candidates = (
-            os.path.join(os.path.dirname(str(PLUGIN_SRC)), "cat-efficient-ingestion"),
-            os.path.join(os.path.dirname(str(PLUGIN_SRC)), "cat-efficient-ingestion.my"),
+            os.path.join(os.path.dirname(str(PLUGIN_SRC)), "cat-efficient-ingestion", "tests"),
+            os.path.join(os.path.dirname(str(PLUGIN_SRC)), "cat-efficient-ingestion.my", "tests"),
         )
         for path in candidates:
             if os.path.isfile(os.path.join(path, "effing_testkit.py")):

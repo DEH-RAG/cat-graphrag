@@ -37,7 +37,7 @@ if __name__ == "__main__":
     from unittest.mock import patch
 
     def _load_maintenance_agent():
-        path = Path(__file__).with_name("maintenance_agent.py")
+        path = Path(__file__).resolve().parent.parent / "maintenance_agent.py"
         spec = importlib.util.spec_from_file_location(
             "maintenance_agent_exit_summary", path
         )

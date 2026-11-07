@@ -34,7 +34,7 @@ if __name__ == "__main__":
     import types
     from unittest.mock import patch
 
-    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     PKG = "catgraphrag_deadlinetest"
     ENV = "CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS"
 

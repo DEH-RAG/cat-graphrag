@@ -56,7 +56,7 @@ import sys
 import types
 from unittest.mock import AsyncMock, Mock, patch
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The EffING contract package (and its phases submodule). Only used to
 # save/restore those entries while a test simulates "EffING absent"; the stub
@@ -256,8 +256,8 @@ def _install_stubs():
 def _load_effing_testkit():
     """Import the shared ``effing_testkit`` from its sibling plugin checkout."""
     candidates = (
-        os.path.join(os.path.dirname(REPO_ROOT), "cat-efficient-ingestion"),
-        os.path.join(os.path.dirname(REPO_ROOT), "cat-efficient-ingestion.my"),
+        os.path.join(os.path.dirname(REPO_ROOT), "cat-efficient-ingestion", "tests"),
+        os.path.join(os.path.dirname(REPO_ROOT), "cat-efficient-ingestion.my", "tests"),
     )
     for path in candidates:
         if os.path.isfile(os.path.join(path, "effing_testkit.py")):

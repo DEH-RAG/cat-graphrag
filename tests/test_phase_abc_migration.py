@@ -177,7 +177,7 @@ if __name__ == "__main__":
     _IngestionPhase, _PhaseResult, _own_tag = _install_effing_stub()
 
     _pkg = types.ModuleType("catgraphrag_phase")
-    _pkg.__path__ = [__import__("os").path.dirname(__import__("os").path.abspath(__file__))]
+    _pkg.__path__ = [__import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__)))]
     sys.modules["catgraphrag_phase"] = _pkg
 
     from catgraphrag_phase import phases
