@@ -31,7 +31,7 @@ the phases drive (``run_spacy_extraction_phase``, ``run_llm_extraction_phase``,
 - ``wipe_tenant_graph_data`` skips without a recorded config and wipes the
   tenant (tenant-scoped) when one exists.
 
-Runnable:  python test_ingestion_phase_machine.py
+Runnable:  python test_phase_engine.py
 Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
 external packages (cat, langchain_core, spacy, langdetect, pydantic, neo4j)
 are stubbed in sys.modules *before* the plugin modules are imported (same
@@ -628,23 +628,31 @@ def test_gate_does_not_import_core_registry():
         "core_plugins." + "ingestion_status",
         "ingestion_status." + "fingerprints",
         "ingestion_" + "phase_pending",
-        "_phase_path_active",
     )
     for ref in forbidden:
         assert ref not in src, f"forbidden reference found: {ref}"
 
 
-def test_rabbithole_hook_noop_when_phase_path_active():
-    """There is ONE graph writer: the registered phases. No classic callback."""
+def test_registered_phases_are_the_only_graph_writer():
+    """There is ONE graph writer: the classes returned by the core hook."""
     from catgraphrag_phase import main
 
-    assert not hasattr(main, "after_rabbithole_stored_documents"), (
-        "the classic fire-and-forget callback must be gone"
+    assert hasattr(main, "rabbithole_ingestion_phases"), (
+        "the core phase-registration hook must be present"
+    )
+    registered = {
+        name
+        for name, value in vars(main).items()
+        if isinstance(value, types.FunctionType) and not name.startswith("_")
+    }
+    assert "rabbithole_ingestion_phases" in registered, registered
+    assert not any(name.startswith("ingestion_phase_") for name in registered), (
+        f"legacy phase hooks still registered: {registered}"
     )
 
 
-def test_rabbithole_hook_keeps_classic_path_when_effing_absent():
-    """Registration is import-safe and needs no ingestion-engine plugin."""
+def test_registration_is_import_safe():
+    """Registration returns both core phase classes without an engine plugin."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
@@ -654,9 +662,13 @@ def test_rabbithole_hook_keeps_classic_path_when_effing_absent():
         "graph_spacy_extraction",
         "graph_llm_extraction",
     ], classes
+    from catgraphrag_phase import phases as plugin_phases
+
+    for cls in classes:
+        assert issubclass(cls, plugin_phases.IngestionPhase), cls
 
 
-def test_rabbithole_hook_keeps_classic_path_with_core_engine():
+def test_no_engine_selection_switch_remains():
     """No engine-selection switch remains: the phases always own the graph."""
     import inspect
     from catgraphrag_phase import main
@@ -664,15 +676,22 @@ def test_rabbithole_hook_keeps_classic_path_with_core_engine():
     src = inspect.getsource(main)
     for ref in ("EfficientIngestionConfiguration", "_resolved_system_ingestion_config_name"):
         assert ref not in src, f"retired engine switch still present: {ref}"
+    assert hasattr(main, "rabbithole_ingestion_phases")
 
 
-def test_phase_path_active_truth_table():
+def test_single_phase_path_has_no_selector():
     """No mode truth table: the core phase machine is the only path."""
     from catgraphrag_phase import main
 
-    assert not hasattr(main, "_phase_path_active")
-    assert not hasattr(main, "ingestion_phase_run")
-    assert not hasattr(main, "ingestion_phase_specs")
+    assert hasattr(main, "rabbithole_ingestion_phases")
+    registered = {
+        name
+        for name, value in vars(main).items()
+        if isinstance(value, types.FunctionType) and not name.startswith("_")
+    }
+    assert not any(name.startswith("ingestion_phase_") for name in registered)
+    assert "_phase_path_active" not in registered
+    assert "_resolved_system_ingestion_config_name" not in registered
 
 
 
@@ -989,10 +1008,10 @@ def _run():
         test_gate_noop_when_not_graphrag_handler,
         test_gate_raises_when_has_pending_source_tasks_true,
         test_gate_does_not_import_core_registry,
-        test_rabbithole_hook_noop_when_phase_path_active,
-        test_rabbithole_hook_keeps_classic_path_when_effing_absent,
-        test_rabbithole_hook_keeps_classic_path_with_core_engine,
-        test_phase_path_active_truth_table,
+        test_registered_phases_are_the_only_graph_writer,
+        test_registration_is_import_safe,
+        test_no_engine_selection_switch_remains,
+        test_single_phase_path_has_no_selector,
         test_transfer_cleanup_noop_on_failure,
         test_transfer_cleanup_noop_when_new_handler_is_graphrag,
         test_transfer_cleanup_wipes_on_success_when_new_handler_not_graphrag,

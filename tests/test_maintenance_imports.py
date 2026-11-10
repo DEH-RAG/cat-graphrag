@@ -120,12 +120,30 @@ if __name__ == "__main__":
             assert "cat.core_plugins.ingestion_status" not in source
             assert EFFING in source
 
-    def _test_real_effing_symbols_resolve_from_new_paths():
-        reembed = importlib.import_module(f"{EFFING}.reembed")
-        registry = importlib.import_module(f"{EFFING}.registry")
-        assert callable(reembed.reembed_sources)
-        assert callable(registry.delete_status)
-        assert callable(registry.list_statuses)
+    def _test_graph_phases_use_the_core_contract():
+        """The graph phases are core IngestionPhases, registered by the hook."""
+        from cat.rabbit_hole.phases import IngestionPhase
+
+        plugin_dir = _maintenance_path().parent
+        spec = importlib.util.spec_from_file_location(
+            "mygraph_phases_core", plugin_dir / "phases.py"
+        )
+        assert spec is not None and spec.loader is not None
+        phases = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(phases)
+
+        for cls, phase_id in (
+            (phases.GraphSpacyPhase, "graph_spacy_extraction"),
+            (phases.GraphConceptPhase, "graph_llm_extraction"),
+        ):
+            assert issubclass(cls, IngestionPhase), cls
+            instance = cls()
+            assert instance.id == phase_id
+            assert instance.depends_on == ("parsing_chunking", "embedding")
+
+        main_src = (plugin_dir / "main.py").read_text()
+        assert "rabbithole_ingestion_phases" in main_src
+        assert "ingestion_phase_specs" not in main_src
 
     def _test_missing_effing_aborts_without_traceback(op_name):
         module = _load_maintenance()  # import first: module itself stays import-safe
@@ -199,8 +217,8 @@ if __name__ == "__main__":
     _tests = [
         ("test_module_imports_and_uses_new_effing_paths",
          _test_module_imports_and_uses_new_effing_paths),
-        ("test_real_effing_symbols_resolve_from_new_paths",
-         _test_real_effing_symbols_resolve_from_new_paths),
+        ("test_graph_phases_use_the_core_contract",
+         _test_graph_phases_use_the_core_contract),
         ("test_help_works_with_effing_blocked", _test_help_works_with_effing_blocked),
     ]
     _tests.extend(

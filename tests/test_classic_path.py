@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """There is ONE graph writer: the core ingestion phases.
 
-The old classic path (``after_rabbithole_stored_documents`` ->
-``create_derived_graph_for_source``) and its engine-selection switch are gone.
+The old classic graph callback and its engine-selection switch are gone.
 Every source is ingested by the core RabbitHole, which runs
 ``graph_spacy_extraction`` and ``graph_llm_extraction`` after parsing/embedding.
 
@@ -118,10 +117,7 @@ if __name__ == "__main__":
         )
 
     async def _test_single_registration_hook():
-        """The plugin contributes its two phases through ONE hook.
-
-        The removed hooks/callbacks must not exist on the module.
-        """
+        """The plugin contributes its two phases through exactly ONE hook."""
         module = _load_plugin_main("_mygraph_classic_single")
         try:
             classes = module.rabbithole_ingestion_phases.function([], None)
@@ -129,18 +125,21 @@ if __name__ == "__main__":
                 "graph_spacy_extraction",
                 "graph_llm_extraction",
             ], classes
-            for retired in (
-                "after_rabbithole_stored_documents",
-                "rabbithole_ingestion_processing",
-                "ingestion_phase_specs",
-                "ingestion_phase_objects",
-                "ingestion_phase_settings_marker",
-                "ingestion_phase_run",
-                "ingestion_phase_purge",
-                "before_ingestion_status_completed",
-                "_phase_path_active",
-            ):
-                assert not hasattr(module, retired), f"retired hook still present: {retired}"
+            registered = {
+                name
+                for name, value in vars(module).items()
+                if hasattr(value, "function") and not name.startswith("__")
+            }
+            assert registered == {
+                "factory_allowed_vector_databases",
+                "after_cheshire_cat_creation",
+                "before_cat_recalls_memories",
+                "before_rabbithole_stores_documents",
+                "rabbithole_ingestion_phases",
+                "after_vector_memory_transfer_on_agent",
+                "after_plugin_settings_update",
+                "after_vector_database_settings_update",
+            }, registered
         finally:
             _cleanup("_mygraph_classic_single")
 
@@ -173,19 +172,18 @@ if __name__ == "__main__":
             _cleanup("_mygraph_classic_writers")
 
     def _test_no_engine_switch_remains():
-        """No EffING import and no classic/efficient mode selection in main.py."""
+        """No engine plugin and no classic/efficient mode selection in main.py."""
         module = _load_plugin_main("_mygraph_classic_no_switch")
         try:
             src = inspect.getsource(module)
-            for ref in (
-                "import cat.core_plugins",
-                "from cat.core_plugins",
-                "cat_efficient_ingestion",
-                "EfficientIngestionConfiguration",
-                "_resolved_system_ingestion_config_name",
-                "ingestion_phase_",
-            ):
-                assert ref not in src, f"retired ingestion path still present: {ref}"
+            assert "cat_efficient_ingestion" not in src
+            assert "EfficientIngestionConfiguration" not in src
+            assert "_resolved_system_ingestion_config_name" not in src
+            assert not any(
+                name.startswith("ingestion_phase_") for name in vars(module)
+            )
+            assert "_phase_path_active" not in vars(module)
+            assert hasattr(module, "rabbithole_ingestion_phases")
         finally:
             _cleanup("_mygraph_classic_no_switch")
 

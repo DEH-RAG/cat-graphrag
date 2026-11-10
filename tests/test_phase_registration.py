@@ -4,7 +4,7 @@
 The two graph phases are ``cat.rabbit_hole.phases.IngestionPhase`` subclasses
 returned as CLASSES by the single ``rabbithole_ingestion_phases`` hook (the
 core instantiates them without arguments for every run). There is no EffING
-module identity to pin any more and no ``ingestion_phase_*`` hook set.
+module identity to pin any more and no legacy phase-spec hook set.
 
 These tests load the real MyGRAPH ``main.py`` (its heavy relative modules are
 stubbed) and pin the exactly-two-phase contract, the accumulator behaviour and

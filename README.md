@@ -69,7 +69,7 @@ At runtime it provides:
 
 - a custom vector database handler: `GraphRAGHandler`
 - a settings model: `Neo4jGraphRAGConfig`, registered through `factory_allowed_vector_databases`
-- ingestion hooks: embedder injection, the classic `after_rabbithole_stored_documents` graph writer, the optional EffING phase registration (`ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`, `before_ingestion_status_completed`)
+- ingestion hooks: embedder injection, and the two graph phases registered through the core `rabbithole_ingestion_phases` hook
 - a query hook that captures the raw user message before memory recall
 - maintenance hooks: boot-time provenance reconciliation, and old-store cleanup on vector-memory switch (`after_vector_memory_transfer_on_agent`)
 
@@ -103,28 +103,20 @@ Results found by both graph and vector phases receive a boost during reranking.
 
 ---
 
-## Ingestion modes: classic vs efficient phase machine
+## Ingestion: the core phase machine
 
-The plugin can build the graph in two mutually exclusive ways, decided per ingestion by `_phase_path_active(cat)`:
+Every source goes through the core RabbitHole phase machine. It runs the built-in `parsing_chunking` and `embedding` phases, then the plugin phases, ordered by `depends_on`. There is no classic/efficient switch and no second graph writer.
 
-| [`cat_efficient_ingestion`](https://github.com/DEH-RAG/cat-efficient-ingestion) installed | SYSTEM-level `ingestion` engine | Path used |
-|---|---|---|
-| no | any | **classic** |
-| yes | core engine | **classic** |
-| yes | `EfficientIngestionConfiguration` | **phase machine** |
+### Phase registration
 
-The `ingestion` engine is one of only two system-level services in Cat (the other is `embedder`), so the decision is read against the system settings, never the agent's. When the phase machine is active, the classic `after_rabbithole_stored_documents` callback becomes a no-op, so graph work never runs twice; when it is inactive, the classic callback is the only writer.
-
-### Phase registration (EffING)
-
-The plugin registers **exactly two** phases through the `ingestion_phase_specs` accumulator, in this order:
+The plugin registers **exactly two** phase classes through the single core hook `rabbithole_ingestion_phases`, in this order:
 
 - **`graph_spacy_extraction`** — spaCy NER + entity linking + similarity edges.
 - **`graph_llm_extraction`** — LLM concept/relation extraction.
 
-Both declare `settings_category=None` (the material marker *is* the settings fingerprint) and `depends_on=("parsing_chunking", "embedding")` (the graph work needs the stored chunks and valid vectors). `ingestion_phase_settings_marker` returns `_spacy_fingerprint` for the spaCy phase and `_concept_fingerprint` for the LLM phase; `ingestion_phase_run` dispatches each phase to its awaited executor (`run_spacy_extraction_phase` / `run_llm_extraction_phase`), returning `{"status": "done"}` only when the phase produced its product, `{"status": "not_ready", "retry_after": 5}` while the source's points are still absent (or the LLM outcome is transient) and `{"status": "skipped", "reason"}` when the phase is inapplicable (the LLM phase with `enable_concept_relations` off). `before_ingestion_status_completed` is the completion gate: it fails the ingestion hard if live background graph tasks remain for the source.
+Both implement `cat.rabbit_hole.phases.IngestionPhase` and declare `depends_on=("parsing_chunking", "embedding")` (the graph work needs the stored chunks and valid vectors). `settings(cat)` returns the material configuration (`_spacy_fingerprint` / `_concept_fingerprint`), which the core folds into the phase tag; `process(source, cat)` delegates to `run_spacy_extraction_phase` / `run_llm_extraction_phase` and returns a `PhaseResult`: `done` (with the product count), `not_ready` with `retry_after` while the source's points are absent or the LLM outcome is transient, `skipped` when the phase is inapplicable (e.g. the LLM phase with `enable_concept_relations` off), `error` with the reason on failure. `delete(source, cat)` removes only that source's graph artefacts.
 
-A graph phase is considered stale when the dependencies' marker identity or the plugin's own fingerprint changes; EffING computes this itself (no timestamps, no full settings dumps, no raw Redis). Re-running is always safe: every write is an idempotent MERGE.
+A graph phase is considered stale when its own settings or the settings of a phase it depends on change; the core computes this (no timestamps, no full settings dumps, no raw Redis). Re-running is always safe: every write is an idempotent MERGE.
 
 ### Concept and relation extraction (agent-level LLM)
 
@@ -179,7 +171,7 @@ Only two services are **system-level** in Cat; everything else is **per-agent**:
 
 ### Optional dependency
 
-`cat_efficient_ingestion` is **optional**. Without it the plugin runs the classic path unchanged; the phase hooks are import-safe and no-op when EffING is absent. Deploying EffING and selecting its engine enables the phase path; no plugin reconfiguration beyond that is needed.
+The graph phases depend only on the core ingestion contract (`cat.rabbit_hole.phases`). The plugin stays import-safe on a host without it: the registration hook returns the accumulator unchanged and the phases are not registered.
 
 ## Requirements
 

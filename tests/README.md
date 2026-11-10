@@ -25,7 +25,7 @@ does not need and prints `PASS <test>` lines. Requirements per script:
   `test_derived_graph_unconditional.py`, `test_phase_fingerprint.py`,
   `test_classic_path.py`, `test_embedder_injection.py`,
   `test_maintenance_imports.py`, `test_phase_run.py`,
-  `test_ingestion_phase_machine.py`, `test_single_extraction.py` —
+  `test_phase_engine.py`, `test_single_extraction.py` —
   self-contained (stubbed Neo4j/spaCy/Cat/tenant lock; the last several load
   the real plugin through a synthetic package), run from the host venv;
 - `test_phase_registration.py` — loads the real plugin `main.py` and pins the
@@ -61,7 +61,7 @@ does not need and prints `PASS <test>` lines. Requirements per script:
 The two graph phases (`graph_spacy_extraction` / `graph_llm_extraction`) are
 `cat.rabbit_hole.phases.IngestionPhase` subclasses registered through the ONE
 core hook `rabbithole_ingestion_phases`. The classic ingestion callback and the
-old EffING `ingestion_phase_*` hooks are gone. Covered by:
+legacy phase hooks are gone. Covered by:
 
 - `test_phase_abc_migration.py` — the class contract against the real core ABC;
 - `test_phase_registration.py` — the single hook + exactly two classes;
@@ -69,6 +69,6 @@ old EffING `ingestion_phase_*` hooks are gone. Covered by:
 - `test_classic_path.py` — one graph writer, no engine-selection switch;
 - `test_embedder_injection.py` — embedder/extractor preparation for a phase;
 - `test_dual_mode.py` — real core phase-machine integration;
-- `test_ingestion_phase_machine.py` — the handler bodies behind the phases;
+- `test_phase_engine.py` — the handler bodies behind the phases;
 - `test_transfer_hook.py` — the vector-memory switch cleanup.
 
