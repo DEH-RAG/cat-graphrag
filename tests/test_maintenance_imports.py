@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""MyGRAPH maintenance CLI against the extracted EffING plugin.
+"""MyGRAPH maintenance CLI on the core ingestion API.
 
-EffING moved to ``cat.core_plugins.cat_efficient_ingestion`` (``reembed`` and
-``registry`` modules). ``maintenance_agent.py`` lives in the GraphRAG plugin
-folder and is imported by the Cat plugin loader, so it must stay import-safe:
-its EffING imports are lazy and guarded.
+``maintenance_agent.py`` lives in the GraphRAG plugin folder and is imported by
+the Cat plugin loader, so it must stay import-safe: only stdlib imports at
+module level, every ``cat`` import inside a function. The engine-level ops use
+the core ``RabbitHole`` (``ccat.rabbit_hole``) and
+``cat.db.cruds.ingestions``; there is no external ingestion plugin.
 
 These tests load the real ``maintenance_agent.py`` from the GraphRAG plugin
 checkout (the plugin root by default, overridable with
 ``MYGRAPH_MAINTENANCE_AGENT``) and assert:
 
-1. with EffING importable the module imports and the symbols it needs resolve
-   through the new module paths (and are the ones actually used by an op);
-2. with EffING blocked the module still imports, the CLI ``--help`` works, and
-   an op needing EffING aborts with a clear message and exit code 2 instead of
-   raising a traceback.
+1. the module imports and ``_op_reembed`` delegates to
+   ``ccat.rabbit_hole.rerun_source(..., invalidate=["embedding"])``;
+2. the source has no ``cat_efficient_ingestion`` reference;
+3. the CLI ``--help`` works (import-safety);
+4. the graph phases are core ``IngestionPhase`` subclasses.
 
 Standalone script (plugin rules): the host imports every ``.py`` under the
 plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
@@ -27,22 +28,15 @@ host checkout:
 
 if __name__ == "__main__":
     import asyncio
-    import contextlib
-    import importlib
-    import importlib.abc
     import importlib.util
-    import io
     import os
     import subprocess
     import sys
     import tempfile
-    import textwrap
     import traceback
     from pathlib import Path
-    from types import ModuleType
+    from types import ModuleType, SimpleNamespace
     from unittest import mock
-
-    EFFING = "cat.core_plugins.cat_efficient_ingestion"
 
     def _maintenance_path() -> Path:
         override = os.environ.get("MYGRAPH_MAINTENANCE_AGENT")
@@ -59,66 +53,62 @@ if __name__ == "__main__":
         spec.loader.exec_module(module)
         return module
 
-    class _BlockEffing(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if fullname == EFFING or fullname.startswith(EFFING + "."):
-                raise ImportError(f"{fullname} blocked for test")
-            return None
+    class FakeRabbitHole:
+        def __init__(self) -> None:
+            self.rerun_calls = []
+            self.reingest_calls = []
+
+        async def rerun_source(self, ccat, name, chat_id=None, blocking=True, invalidate=None):
+            self.rerun_calls.append((name, invalidate))
+            return {"source": name}
+
+        async def reingest_source(self, ccat, name, chat_id=None):
+            self.reingest_calls.append(name)
+            return {"source": name}
 
     class _FakeCCat:
         agent_key = "agent-test"
 
+        def __init__(self) -> None:
+            self.rabbit_hole = FakeRabbitHole()
+
         async def get_stored_sources_with_metadata(self):
             from cat.services.memory.models import VectorMemoryType
 
-            return {VectorMemoryType("declarative"): []}
+            return {
+                VectorMemoryType("declarative"): [
+                    SimpleNamespace(name="doc.pdf", metadata={}, path="doc.pdf")
+                ]
+            }
 
-    def _test_module_imports_and_uses_new_effing_paths():
-        import cat.services.memory.models  # noqa: F401  (used by _op_reembed)
+    def _test_op_reembed_uses_core_rabbit_hole():
+        from cat.db.cruds import ingestions as crud_ingestions
 
-        calls: list[tuple[object, ...]] = []
+        module = _load_maintenance()
+        ccat = _FakeCCat()
 
-        fake_reembed = ModuleType(f"{EFFING}.reembed")
-        fake_registry = ModuleType(f"{EFFING}.registry")
-
-        async def reembed_sources(ccat, memory_type, sources):
-            calls.append((ccat, memory_type, sources))
-
-        async def delete_status(*args, **kwargs):
-            calls.append(("delete_status", args, kwargs))
-
-        async def list_statuses(agent_id):
-            calls.append(("list_statuses", agent_id))
+        async def no_statuses(*args, **kwargs):
             return []
 
-        async def get_status(agent_id, scope, source):
-            calls.append(("get_status", agent_id, scope, source))
-            return {"status": "completed", "completed_phases": {}}
+        async def no_outcome(*args, **kwargs):
+            return True
 
-        def phase_state(entry):
-            return (entry or {}).get("state")
+        async def no_marker(*args, **kwargs):
+            return None
 
-        setattr(fake_reembed, "reembed_sources", reembed_sources)
-        setattr(fake_registry, "delete_status", delete_status)
-        setattr(fake_registry, "list_statuses", list_statuses)
-        setattr(fake_registry, "get_status", get_status)
-        setattr(fake_registry, "phase_state", phase_state)
-        setattr(fake_registry, "PHASE_STATE_ERROR", "error")
-        fake_modules = {
-            f"{EFFING}.reembed": fake_reembed,
-            f"{EFFING}.registry": fake_registry,
-        }
-        with mock.patch.dict(sys.modules, fake_modules):
-            module = _load_maintenance()
+        with mock.patch.object(crud_ingestions, "list_statuses", no_statuses), \
+             mock.patch.object(module, "_report_ingestion_outcome", no_outcome), \
+             mock.patch.object(module, "_set_maintenance_marker", no_marker):
+            assert asyncio.run(module._op_reembed(ccat, None, "declarative")) is True
 
-            assert asyncio.run(module._op_reembed(_FakeCCat(), None, "declarative")) is True
-            assert calls[0] == ("list_statuses", "agent-test")
-            assert calls[-1][2] == []  # reembed_sources(ccat, VectorMemoryType, sources)
-
-            source = _maintenance_path().read_text()
-            assert "cat.core_plugins.efficient_ingestion" not in source
-            assert "cat.core_plugins.ingestion_status" not in source
-            assert EFFING in source
+        # The op delegates to the core engine, forcing the embedding phase.
+        assert ccat.rabbit_hole.rerun_calls == [("doc.pdf", ["embedding"])], (
+            ccat.rabbit_hole.rerun_calls
+        )
+        source = _maintenance_path().read_text()
+        assert "cat_efficient_ingestion" not in source
+        assert "cat.core_plugins.efficient_ingestion" not in source
+        assert "rerun_source" in source and "reingest_source" in source
 
     def _test_graph_phases_use_the_core_contract():
         """The graph phases are core IngestionPhases, registered by the hook."""
@@ -145,62 +135,10 @@ if __name__ == "__main__":
         assert "rabbithole_ingestion_phases" in main_src
         assert "ingestion_phase_specs" not in main_src
 
-    def _test_missing_effing_aborts_without_traceback(op_name):
-        module = _load_maintenance()  # import first: module itself stays import-safe
-
-        saved = {
-            name: sys.modules.pop(name)
-            for name in list(sys.modules)
-            if name == EFFING or name.startswith(EFFING + ".")
-        }
-        blocker = _BlockEffing()
-        sys.meta_path.insert(0, blocker)
-        stderr = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(stderr):
-                try:
-                    if op_name == "_verify_agent":
-                        asyncio.run(module._verify_agent(_FakeCCat(), None, "declarative"))
-                    else:
-                        asyncio.run(getattr(module, op_name)(_FakeCCat(), None, "declarative"))
-                except SystemExit as exc:
-                    assert exc.code == 2
-                else:
-                    raise AssertionError(f"{op_name} did not abort with SystemExit")
-        finally:
-            sys.meta_path.remove(blocker)
-            sys.modules.update(saved)
-
-        err = stderr.getvalue()
-        assert "ABORTED" in err
-        assert EFFING in err
-        assert "Traceback" not in err
-
-    def _test_help_works_with_effing_blocked():
+    def _test_help_works():
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            sitecustomize = tmp_path / "sitecustomize.py"
-            sitecustomize.write_text(
-                textwrap.dedent(
-                    f"""
-                    import sys
-
-                    class _BlockEffing:
-                        def find_spec(self, fullname, path=None, target=None):
-                            if fullname == {EFFING!r} or fullname.startswith({EFFING!r} + "."):
-                                raise ImportError(f"{{fullname}} blocked for test")
-                            return None
-
-                    sys.meta_path.insert(0, _BlockEffing())
-                    """
-                )
-            )
-
             env = dict(os.environ)
-            env["PYTHONPATH"] = os.pathsep.join(
-                [str(tmp_path), env.get("PYTHONPATH", "")]
-            ).rstrip(os.pathsep)
-
             result = subprocess.run(
                 [sys.executable, str(_maintenance_path()), "--help"],
                 capture_output=True,
@@ -209,23 +147,15 @@ if __name__ == "__main__":
                 env=env,
                 timeout=120,
             )
-
             assert result.returncode == 0, result.stderr
             assert "usage:" in result.stdout.lower()
             assert "Traceback" not in result.stderr
 
     _tests = [
-        ("test_module_imports_and_uses_new_effing_paths",
-         _test_module_imports_and_uses_new_effing_paths),
-        ("test_graph_phases_use_the_core_contract",
-         _test_graph_phases_use_the_core_contract),
-        ("test_help_works_with_effing_blocked", _test_help_works_with_effing_blocked),
+        ("test_op_reembed_uses_core_rabbit_hole", _test_op_reembed_uses_core_rabbit_hole),
+        ("test_graph_phases_use_the_core_contract", _test_graph_phases_use_the_core_contract),
+        ("test_help_works", _test_help_works),
     ]
-    _tests.extend(
-        (f"test_missing_effing_aborts_without_traceback[{op}]",
-         lambda op=op: _test_missing_effing_aborts_without_traceback(op))
-        for op in ("_op_reembed", "_op_reingest", "_verify_agent")
-    )
 
     _failed = 0
     for _name, _fn in _tests:

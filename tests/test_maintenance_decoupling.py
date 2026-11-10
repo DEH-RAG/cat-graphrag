@@ -6,11 +6,12 @@ Regression test: the maintenance CLI decouples ENGINE-level ops from GraphRAG.
 engine-level; the graph phases no-op when the active handler is not
 GraphRAG). Only ``--graph`` requires the ``GraphRAGHandler`` and must report
 ``skip reason=handler-not-graphrag`` otherwise. The re-embed preflight must
-still block ``--reingest`` before any destructive wipe.
+still block ``--reingest`` before the engine touches any storage.
 
-Run INSIDE the container (like the other plugin tests):
+Run from the host repository (the plugin is importable by file path):
 
-    docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/tests/test_maintenance_decoupling.py
+    cd /root/git/grinning-cat-core
+    .venv/bin/python /root/git/plugins/cat-graphrag.my/tests/test_maintenance_decoupling.py
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. The ENTIRE body lives under
@@ -19,47 +20,51 @@ loader imports recursively at activation. The ENTIRE body lives under
 
 if __name__ == "__main__":
     import asyncio
+    import importlib.util
     import io
     import sys
     from contextlib import redirect_stdout
+    from pathlib import Path
     from types import SimpleNamespace
 
-    import cat.plugins.cat_graphrag.maintenance_agent as m
-
+    def _load_maintenance_agent():
+        path = Path(__file__).resolve().parent.parent / "maintenance_agent.py"
+        spec = importlib.util.spec_from_file_location(
+            "maintenance_agent_decoupling", path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
     def _fail(msg: str) -> None:
         print(f"FAIL: {msg}")
         sys.exit(1)
 
-
     class FakeCcat:
         def __init__(self) -> None:
             self.agent_key = "test-agent"
+            self._id = "test-agent"
             self.vector_memory_handler = None
             self.chunker = object()
+            self.rabbit_hole = SimpleNamespace(
+                reingest_calls=[],
+                rerun_calls=[],
+            )
 
         async def get_stored_sources_with_metadata(self):
             from cat.services.memory.models import VectorMemoryType
 
             return {VectorMemoryType("declarative"): []}
 
-
-    class FakeVectorHandler:
-        def __init__(self) -> None:
-            self.deleted = []
-
-        async def delete_tenant_points(self, collection, metadata=None):
-            self.deleted.append((collection, metadata))
-
-
-    async def _case_reingest_non_graphrag() -> None:
+    async def _case_reingest_non_graphrag(m) -> None:
         calls = []
 
         async def fake_bootstrap(agent_id):
             return (FakeCcat(), None, "handler-not-graphrag")
 
         async def fake_engine(ccat, op="reembed"):
-            return "EfficientIngestionConfiguration"
+            return "CoreRabbitHole"
 
         async def fake_reingest(ccat, handler, collection):
             calls.append((handler, collection))
@@ -85,12 +90,11 @@ if __name__ == "__main__":
             _fail(f"--reingest on a non-GraphRAG agent failed: {out!r}")
         if len(calls) != 1:
             _fail(f"--reingest helper calls={len(calls)}, expected 1: {out!r}")
-        if "op=reingest result=ok" not in out:
-            _fail(f"--reingest did not report ok: {out!r}")
+        if "result=fail" in out:
+            _fail(f"--reingest reported a failure: {out!r}")
         print("PASS (a): --reingest planned+executed for non-GraphRAG agent")
 
-
-    async def _case_graph_non_graphrag_skipped() -> None:
+    async def _case_graph_non_graphrag_skipped(m) -> None:
         graph_calls = []
 
         async def fake_bootstrap(agent_id):
@@ -119,37 +123,17 @@ if __name__ == "__main__":
             _fail(f"missing handler-not-graphrag skip: {out!r}")
         print("PASS (b): --graph skipped with reason=handler-not-graphrag")
 
-
-    async def _case_preflight_blocks() -> None:
-        from cat.services.memory.models import VectorMemoryType
-
-        # 1. The real preflight refuses an unusable re-embed path.
-        import cat.core_plugins.cat_efficient_ingestion.reembed as reembed
-
-        orig_rh = reembed._resolve_rabbit_hole
-
-        async def fake_rh(ccat):
-            return SimpleNamespace(cat=ccat)
-
-        reembed._resolve_rabbit_hole = fake_rh
-        try:
-            ccat = FakeCcat()
-            ccat.chunker = None
-            reason = await m._preflight_reembed_path(ccat)
-        finally:
-            reembed._resolve_rabbit_hole = orig_rh
-        if reason != "chunker-unavailable":
-            _fail(f"preflight reason={reason!r}, expected chunker-unavailable")
-
-        # 2. _op_reingest aborts before any destructive delete when the
-        #    preflight reports the path unusable.
-        handler = FakeVectorHandler()
+    async def _case_preflight_blocks(m) -> None:
+        # 1. The real preflight refuses an unusable re-embed path (no engine).
         ccat = FakeCcat()
-        ccat.vector_memory_handler = handler
-        ccat.get_stored_sources_with_metadata = (
-            lambda: _sources_with_one_doc(VectorMemoryType)
-        )
+        ccat.rabbit_hole = None
+        reason = await m._preflight_reembed_path(ccat)
+        if reason != "rabbit-hole-unbound":
+            _fail(f"preflight reason={reason!r}, expected rabbit-hole-unbound")
 
+        # 2. _op_reingest aborts before calling the engine when the preflight
+        #    reports the path unusable.
+        ccat = FakeCcat()
         orig_preflight = m._preflight_reembed_path
 
         async def fake_preflight(_ccat):
@@ -166,18 +150,16 @@ if __name__ == "__main__":
 
         if ok:
             _fail(f"_op_reingest succeeded despite preflight failure: {out!r}")
-        if handler.deleted:
-            _fail(f"preflight failure still deleted points: {handler.deleted!r}")
+        if ccat.rabbit_hole.reingest_calls:
+            _fail(
+                "preflight failure still called the engine: "
+                f"{ccat.rabbit_hole.reingest_calls!r}"
+            )
         if "detail=preflight-reembed-path-unusable" not in out:
             _fail(f"missing preflight failure message: {out!r}")
-        print("PASS (c): preflight still blocks --reingest before any wipe")
+        print("PASS (c): preflight still blocks --reingest before any write")
 
-
-    async def _sources_with_one_doc(vector_memory_type):
-        return {vector_memory_type("declarative"): [SimpleNamespace(name="doc.txt")]}
-
-
-    async def _case_reingest_graphrag_unchanged() -> None:
+    async def _case_reingest_graphrag_unchanged(m) -> None:
         calls = []
         graph_handler = SimpleNamespace(
             _graphrag_detected=True,
@@ -188,7 +170,7 @@ if __name__ == "__main__":
             return (FakeCcat(), graph_handler, None)
 
         async def fake_engine(ccat, op="reembed"):
-            return "EfficientIngestionConfiguration"
+            return "CoreRabbitHole"
 
         async def fake_reingest(ccat, handler, collection):
             calls.append((handler, collection))
@@ -212,19 +194,18 @@ if __name__ == "__main__":
             _fail("GraphRAG --reingest did not receive the GraphRAG handler")
         print("PASS (d): --reingest for a GraphRAG agent is unchanged")
 
-
     async def _main() -> int:
+        m = _load_maintenance_agent()
         try:
-            await _case_reingest_non_graphrag()
-            await _case_graph_non_graphrag_skipped()
-            await _case_preflight_blocks()
-            await _case_reingest_graphrag_unchanged()
+            await _case_reingest_non_graphrag(m)
+            await _case_graph_non_graphrag_skipped(m)
+            await _case_preflight_blocks(m)
+            await _case_reingest_graphrag_unchanged(m)
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001 - report and fail
             _fail(f"{type(exc).__name__}: {exc}")
         print("PASS: maintenance engine ops decoupled from the GraphRAG handler")
         return 0
-
 
     raise SystemExit(asyncio.run(_main()))

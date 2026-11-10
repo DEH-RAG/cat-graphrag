@@ -2,9 +2,9 @@
 """
 Maintenance agent CLI for the Neo4j GraphRAG plugin.
 
-Standalone, import-safe maintenance script that drives Grinning Cat's
-two-phase ingestion engine and the GraphRAG graph rebuild from INSIDE the
-Cat container.
+Standalone, import-safe maintenance script that drives the core Cat ingestion
+engine (the RabbitHole phase machine) and the GraphRAG graph rebuild from
+INSIDE the Cat container.
 
 Usage (inside the Cat container):
     # Re-embed only (chunk reuse) for one agent
@@ -31,21 +31,18 @@ Usage (inside the Cat container):
 Exit codes:
     0 = all agents/ops ok (and verify ok when --verify)
     1 = partial failure (some agent/op failed, or a --verify check failed)
-    2 = aborted (dry-run plan printed, --yes missing for a destructive step,
-        or an op needs the efficient ingestion plugin EffING and it is not
-        importable as ``cat.core_plugins.cat_efficient_ingestion``)
+    2 = aborted (dry-run plan printed, or --yes missing for a destructive step)
 
-``--reembed``, ``--reingest``, ``--resume-failed`` and ``--verify`` require the
-extracted EffING plugin (``reembed``/``registry`` modules). Its imports are
-lazy and guarded: when it is absent the CLI still starts (``--help`` works)
-and those ops abort with a clear message and exit code 2 instead of raising a
-traceback.
+The engine-level ops drive the core RabbitHole API directly
+(``ccat.rabbit_hole.rerun_source`` / ``reingest_source``) and read/reset the
+ingestion states through ``cat.db.cruds.ingestions``. No external ingestion
+plugin is required: ``--reembed``, ``--reingest`` and ``--resume-failed`` all
+run on the core engine.
 
-Every op requires --yes: --reembed deletes the status docs per source,
---reingest additionally deletes the source's points and re-ingests,
---resume-failed rewrites the failed diary/status and re-dispatches only the
-failing phases (never purging, re-parsing or re-embedding a completed phase),
-and --graph wipes the tenant's graph edges + orphan entities (A0 Cypher).
+Every op requires --yes: --reembed reruns the embedding (and its dependents)
+per source, --reingest re-runs every phase per source from the kept bytes,
+--resume-failed reruns the stale phases of the sources in ``error``, and
+--graph wipes the tenant's graph edges + orphan entities (A0 Cypher).
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. It must have ZERO top-level side
@@ -58,23 +55,16 @@ import asyncio
 import importlib.util
 import json
 import sys
-import types  # noqa: F401  (used by the --graph LLM part in a later todo)
-from typing import Any, NoReturn, NotRequired, TypedDict
-
-_EFFING_MODULE = "cat.core_plugins.cat_efficient_ingestion"
+import types  # SimpleNamespace: stored-file refs + the --graph LLM duck
+from typing import Any, NotRequired, TypedDict
 
 
-# Per-agent maintenance marker shared with the EffING resume sweep. The sweep
-# skips an agent while this marker is present, so the CLI and the periodic
-# app sweep never process the same agent's sources concurrently. Written
-# through ``cat.db.crud`` (never a raw Redis client). A generous TTL makes a
+# Per-agent maintenance marker shared with the core automatic-resume sweep. The
+# sweep skips an agent while this marker is present, so the CLI and the periodic
+# sweep never process the same agent's sources concurrently. Written through
+# ``cat.db.cruds.ingestions`` (never a raw Redis client). A generous TTL makes a
 # crashed CLI fail safe: the marker expires on its own and the sweep resumes.
 _MAINTENANCE_MARKER_TTL_SECONDS = 2 * 60 * 60
-
-
-def _maintenance_marker_key(agent_id: str) -> str:
-    """Redis key of the CLI maintenance marker for one agent."""
-    return f"agents:{agent_id}:ingestion:maintenance"
 
 
 async def _set_maintenance_marker(agent_id: str) -> None:
@@ -83,15 +73,10 @@ async def _set_maintenance_marker(agent_id: str) -> None:
     Best-effort: a marker write failure is reported but never aborts the
     maintenance op (the TTL then simply is not renewed).
     """
-    from cat.db import crud
-    from cat.db.models import generate_timestamp
+    from cat.db.cruds import ingestions as crud_ingestions
 
     try:
-        await crud.store(
-            _maintenance_marker_key(agent_id),
-            {"owner": "maintenance", "started_at": generate_timestamp()},
-            expire=_MAINTENANCE_MARKER_TTL_SECONDS,
-        )
+        await crud_ingestions.set_maintenance(agent_id, _MAINTENANCE_MARKER_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001 - coordination is best-effort
         print(
             f"[maintenance] agent={agent_id} result=warn "
@@ -103,12 +88,12 @@ async def _clear_maintenance_marker(agent_id: str) -> None:
     """Delete the per-agent maintenance marker (also on failure).
 
     A failed delete is only logged: the marker's TTL guarantees it cannot
-    block the resume sweep forever.
+    block the automatic-resume sweep forever.
     """
-    from cat.db import crud
+    from cat.db.cruds import ingestions as crud_ingestions
 
     try:
-        await crud.delete(_maintenance_marker_key(agent_id))
+        await crud_ingestions.clear_maintenance(agent_id)
     except Exception as exc:  # noqa: BLE001 - TTL is the fail-safe
         print(
             f"[maintenance] agent={agent_id} result=warn "
@@ -116,50 +101,27 @@ async def _clear_maintenance_marker(agent_id: str) -> None:
         )
 
 
-def _abort_missing_effing(exc: ImportError) -> NoReturn:
-    """Report the absent EffING dependency and abort (exit code 2, no traceback).
-
-    EffING was extracted to ``cat.core_plugins.cat_efficient_ingestion``; the
-    ops that drive its phase machine cannot run without it. Callers wrap their
-    lazy ``cat.core_plugins.cat_efficient_ingestion.*`` imports in
-    ``try/except ImportError`` and delegate here, so the module itself stays
-    import-safe and ``--help`` keeps working when the plugin is absent.
-    """
-    print(
-        "[maintenance] ABORTED: required optional dependency "
-        f"'{_EFFING_MODULE}' is not importable ({exc}). "
-        "--reembed, --reingest and --verify need the efficient ingestion "
-        "plugin (EffING); install/enable it and retry.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-
-
-# Destructive steps per op — what `--yes` confirms. `--reembed` deletes the
-# status docs per source (forces the embedding phase, Metis #9); `--reingest`
-# deletes the source's points FIRST (points-first wipe) and re-ingests;
-# `--graph` wipes the tenant's graph edges + orphan entities via the A0
-# Cypher. Every op therefore requires `--yes`; the missing-`--yes` message
-# lists these steps per agent+op.
+# Destructive steps per op — what `--yes` confirms. `--reembed` reruns the
+# embedding phase (and its dependents) per source; `--reingest` re-runs every
+# phase per source from the kept bytes; `--resume-failed` reruns the stale
+# phases of the sources in error; `--graph` wipes the tenant's graph edges +
+# orphan entities via the A0 Cypher. Every op therefore requires `--yes`; the
+# missing-`--yes` message lists these steps per agent+op.
 _DESTRUCTIVE_STEPS: dict[str, list[str]] = {
     "reingest": [
-        "delete_tenant_points per source (points-first wipe)",
-        "clear_completed_phases per source (drop the lying diary)",
-        "delete_status per source",
-        "reembed_sources re-ingest (re-parse + re-embed)",
+        "reingest_source per source (every phase again, from the kept bytes)",
     ],
     "graph": [
         "A0 wipe Cypher (5 tenant-filtered statements: RELATED_TO, MENTIONS, "
         "PROVENANCE, SIMILAR_TO_<gen>, orphan entities)",
     ],
     "reembed": [
-        "delete_status per source (forces the embedding phase)",
+        "rerun_source per source with invalidate=['embedding'] "
+        "(embedding + dependents rerun, chunks reused)",
     ],
     "resume-failed": [
-        "reset the ERROR diary entries per failed source (keeps complete ones)",
-        "set status=processing, error=None per failed source",
-        "reembed_sources re-dispatch of ONLY the failing phases "
-        "(no purge, no re-parse, no re-embed of healthy phases)",
+        "rerun_source per source whose status is error "
+        "(only the stale phases run: no parse/embed of healthy phases)",
     ],
 }
 
@@ -188,12 +150,21 @@ async def _ensure_lizard_booted() -> None:
     process that lizard is never bootstrapped (the server does it in the
     uvicorn lifespan), so the registry is empty and ``base_plugin`` is
     missing. Discover the plugins once, lazily, before creating any Cat.
+
+    ``BillTheLizard.bootstrap`` also creates ``lizard.rabbit_hole``; outside
+    the lifespan we create it here too (without starting the resume sweep), so
+    ``ccat.rabbit_hole`` is available to the engine-level ops.
     """
     global _lizard_booted
     if _lizard_booted:
         return
     from cat.looking_glass.bill_the_lizard import BillTheLizard
-    await BillTheLizard().plugin_manager.discover_plugins()
+    from cat.rabbit_hole import RabbitHole
+
+    lizard = BillTheLizard()
+    await lizard.plugin_manager.discover_plugins()
+    if lizard.rabbit_hole is None:
+        lizard.rabbit_hole = RabbitHole()
     _lizard_booted = True
 
 
@@ -459,50 +430,38 @@ async def _agent_uses_graphrag_handler(agent_id: str) -> bool:
 async def _resolve_resume_failed_plan(agent_id: str) -> list[dict[str, Any]]:
     """Read-only resolution of the sources `--resume-failed` will act on.
 
-    Enumerates the agent-scope status docs (``list_statuses``), keeps only the
-    rows whose status is ``error`` and re-reads each one with
-    ``registry.get_status`` (the same API the op uses). For every row it
-    reports the diary phases whose explicit state is ``error`` (including the
-    collateral ``dependency <x> is error`` entries) and the count of phases it
-    will keep untouched (``complete`` / ``skipped`` / ``processing``).
+    Enumerates the agent-scope states through
+    ``cat.db.cruds.ingestions.list_statuses``, keeps only the rows whose status
+    is ``error`` and re-reads each one with ``get_status`` (the same API the op
+    uses). For every row it reports the diary phases whose explicit state is
+    ``error`` (including the collateral ``Depends on the failed phase <x>``
+    entries) and the count of phases it will keep untouched (``complete`` /
+    ``skipped``).
 
     Never bootstraps the agent and never writes: safe for the dry-run plan.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.registry import (
-            PHASE_STATE_ERROR,
-            get_status,
-            list_statuses,
-            phase_state,
-        )
-    except ImportError as exc:
-        _abort_missing_effing(exc)
+    from cat.db.cruds import ingestions as crud_ingestions
 
     resolved: list[dict[str, Any]] = []
-    for listed in await list_statuses(agent_id):
+    for listed in await crud_ingestions.list_statuses(agent_id, None):
         source = listed.get("source")
         if not source or listed.get("status") != "error":
             continue
-        scope = str(listed.get("scope") or "agent")
-        doc = await get_status(agent_id, scope, source)
+        doc = await crud_ingestions.get_status(agent_id, None, source)
         if not isinstance(doc, dict) or doc.get("status") != "error":
             continue
         diary = doc.get("completed_phases")
         diary = diary if isinstance(diary, dict) else {}
         failed = [
-            phase
-            for phase, entry in diary.items()
-            if phase_state(entry) == PHASE_STATE_ERROR
+            phase for phase, entry in diary.items() if (entry or {}).get("state") == "error"
         ]
         kept = [
-            phase
-            for phase, entry in diary.items()
-            if phase_state(entry) != PHASE_STATE_ERROR
+            phase for phase, entry in diary.items() if (entry or {}).get("state") != "error"
         ]
         resolved.append(
             {
                 "source": source,
-                "scope": scope,
+                "scope": "agent",
                 "type": doc.get("type") or "file",
                 "failed_phases": failed,
                 "kept_phases": kept,
@@ -612,36 +571,28 @@ def _print_plan(plan: list[_PlanEntry], as_json: bool = False) -> None:
             if op == "reingest":
                 print("    steps:")
                 print(
-                    "      1. for each source <name>: delete_tenant_points("
-                    f"'{collection}', metadata={{'source': <name>}})"
+                    "      1. enumerate sources (vector store ∪ stored files, "
+                    "derived images skipped)"
                 )
                 print(
-                    "      2. for each source <name>: delete_status("
-                    "agent, 'agent', <name>)"
-                )
-                print(
-                    "      3. reembed_sources(ccat, collection, sources)  "
-                    "# re-parse + re-embed (PHASE_PARSING_CHUNKING)"
+                    "      2. for each source <name>: "
+                    "ccat.rabbit_hole.reingest_source(ccat, <name>)  "
+                    "# every phase again from the kept bytes"
                 )
             elif op == "reembed":
                 print("    steps:")
                 print(
-                    "      1. for each source <name>: delete_status("
-                    "agent, 'agent', <name>)"
-                )
-                print(
-                    "      2. reembed_sources(ccat, collection, sources)  "
-                    "# embedding phase, chunk reuse (PHASE_EMBEDDING)"
+                    "      1. for each source <name>: "
+                    "ccat.rabbit_hole.rerun_source(ccat, <name>, "
+                    "invalidate=['embedding'])  # embedding + dependents, "
+                    "chunk reuse"
                 )
             elif op == "resume-failed":
                 print("    steps:")
                 print(
-                    "      1. delete_status is NOT called; clear only the "
-                    "ERROR entries in the status diary"
-                )
-                print(
-                    "      2. reembed_sources(ccat, declarative, [source], "
-                    "stale_after=0.0)  # failing phases only"
+                    "      1. for each source <name> whose status is error: "
+                    "ccat.rabbit_hole.rerun_source(ccat, <name>)  "
+                    "# only the stale phases run"
                 )
                 for item in entry.get("resume_sources", []):
                     failed = item.get("failed_phases") or []
@@ -752,94 +703,56 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
 
 
 async def _resolve_ingestion_engine(ccat, op: str = "reembed") -> str | None:
-    """Resolve the active ingestion engine; refuse anything but the efficient one.
+    """Resolve the core ingestion engine for the engine-level ops.
 
-    Mirrors ``main.py``: the current core does not expose
-    ``resolved_config_name``; when a host provides it the saved entry is
-    resolved against the allowed classes via
-    ``cat.services.factory.ingestion``, otherwise the same SYSTEM-level
-    ``ingestion`` category entry (``DEFAULT_SYSTEM_KEY``) is read directly, so
-    both paths return the same value. Only the efficient engine
-    (``EfficientIngestionConfiguration`` / ``EfficientIngestionEngine``) is
-    supported by ``--reembed``/``--reingest``: the base engine's re-embed path
-    (``embed_all_in_cheshire_cats``) is destructive and out of scope, so it is
-    refused with a message naming the active engine (Metis #23).
+    The phase machine now lives in the core ``RabbitHole``: there is no
+    pluggable engine to select. This only proves the engine instance is
+    available (``ccat.rabbit_hole``), so the op fails cleanly with
+    ``detail=engine-unavailable`` instead of raising a traceback.
 
-    Returns the active config name when the efficient engine is active, else
-    None (the caller marks the op failed → exit 1).
+    Returns a marker string when the core engine is available, else None (the
+    caller marks the op failed → exit 1).
     """
-    from cat.log import log
-
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
-
-    try:
-        from cat.services.factory.ingestion import resolved_config_name
-    except ImportError:
-        resolved_config_name = None
-
-    if resolved_config_name is not None:
-        log.debug("[maintenance] ingestion engine resolved via resolved_config_name")
-        name = await resolved_config_name(ccat)
-    else:
-        from cat.db.cruds import settings as crud_settings
-        from cat.db.database import DEFAULT_SYSTEM_KEY
-
-        log.debug("[maintenance] ingestion engine resolved via system settings fallback")
-        saved = await crud_settings.get_settings_by_category(
-            DEFAULT_SYSTEM_KEY, "ingestion"
-        )
-        name = (saved or {}).get("name")
-
-    if name != "EfficientIngestionConfiguration":
+    if getattr(ccat, "rabbit_hole", None) is None:
         print(
             f"[maintenance] agent={agent_id} op={op} result=fail "
-            f"detail=engine-not-efficient active={name}"
+            f"detail=engine-unavailable engine=RabbitHole"
         )
         return None
-    return name
+    return "CoreRabbitHole"
 
 
 async def _read_ingestion_status(agent_id: str, source_name: str):
-    """Read one source's ingestion-status doc (lazy EffING import)."""
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.registry import get_status
-    except ImportError as exc:
-        _abort_missing_effing(exc)
-    return await get_status(agent_id, "agent", source_name)
+    """Read one agent-scope source's ingestion state through the core crud."""
+    from cat.db.cruds import ingestions as crud_ingestions
+
+    return await crud_ingestions.get_status(agent_id, None, source_name)
 
 
 async def _report_ingestion_outcome(
     agent_id: str, op: str, sources: list
 ) -> bool:
-    """Report the REAL per-source phase outcome after handing sources to EffING.
+    """Report the REAL per-source phase outcome after the engine ran.
 
-    ``reembed_sources`` runs its serial dispatch loop synchronously but never
-    raises on a failed phase: a phase error only lives in the source's status
-    doc (``status=error`` plus the ``error`` entry in ``completed_phases``).
-    Printing ``result=ok`` right after the loop therefore claims success for
-    work the engine did not finish. This reads every processed source's status
-    doc back and owns the final summary line:
+    The engine records a failed phase in the source's state (``status=error``
+    plus the ``error`` entry in ``completed_phases``) and never raises for it.
+    Printing ``result=ok`` right after the loop would therefore claim success
+    for work the engine did not finish. This reads every processed source's
+    state back and owns the final summary line:
 
       - all ``completed`` -> ``result=ok detail=reingested|reembedded``;
       - any ``error`` -> ``result=fail detail=phase-failed`` with the verbatim
         reason of each failing phase;
-      - anything not terminal (``processing`` / missing doc) -> ``result=fail
+      - anything not terminal (``processing`` / missing row) -> ``result=fail
         detail=still-processing``.
 
     Returns True only when every processed source is ``completed``.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.registry import (
-            PHASE_STATE_ERROR,
-            phase_state,
-        )
-    except ImportError as exc:
-        _abort_missing_effing(exc)
-
     failures: dict[str, dict[str, Any]] = {}
     still_processing: list[str] = []
     for source in sources:
-        name = source.name
+        name = getattr(source, "name", source)
         doc = await _read_ingestion_status(agent_id, name)
         if not isinstance(doc, dict):
             still_processing.append(name)
@@ -848,8 +761,8 @@ async def _report_ingestion_outcome(
         phase_errors: dict[str, Any] = {}
         if isinstance(diary, dict):
             for phase_id, entry in diary.items():
-                if phase_state(entry) == PHASE_STATE_ERROR:
-                    phase_errors[phase_id] = entry.get("reason")
+                if (entry or {}).get("state") == "error":
+                    phase_errors[phase_id] = (entry or {}).get("reason")
         status = doc.get("status")
         if status == "error" or phase_errors:
             if not phase_errors:
@@ -878,24 +791,16 @@ async def _report_ingestion_outcome(
 
 
 async def _op_reembed(ccat, handler, collection: str) -> bool:
-    """Re-embed only: delete the status docs, then run the embedding phase.
+    """Re-embed only: rerun the embedding phase (chunks reused) per source.
 
-    ``reembed_sources`` decides the phase per source from the status doc: no
-    doc + points exist → ``PHASE_EMBEDDING`` (chunk reuse, Metis #9). Deleting
-    the status doc per source therefore forces the embedding phase when the
-    source's points exist — chunks are reused, nothing is re-parsed. Status
-    docs whose source is absent from the enumeration are warned
-    (``detail=file-missing``, Metis #10). ``handler`` is accepted for signature
-    symmetry with the other ops (todo 5+).
+    ``ccat.rabbit_hole.rerun_source(ccat, name, invalidate=["embedding"])``
+    forces the embedding phase and its dependents to run again, reusing the
+    stored chunks (nothing is re-parsed). States whose source is absent from
+    the enumeration are warned (``detail=file-missing``). ``handler`` is
+    accepted for signature symmetry with the other ops.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
-        from cat.core_plugins.cat_efficient_ingestion.registry import (
-            delete_status,
-            list_statuses,
-        )
-    except ImportError as exc:
-        _abort_missing_effing(exc)
+    from cat.db.cruds import ingestions as crud_ingestions
+    from cat.rabbit_hole.phases import PHASE_EMBEDDING
     from cat.services.memory.models import VectorMemoryType
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -903,8 +808,8 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
 
-    # Metis #10: status docs whose source is absent from the enumeration.
-    statuses = await list_statuses(agent_id)
+    # States whose source is absent from the enumeration.
+    statuses = await crud_ingestions.list_statuses(agent_id, None)
     known = {s.name for s in sources}
     for doc in statuses:
         src = doc.get("source")
@@ -914,62 +819,46 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
                 f"detail=file-missing source={src}"
             )
 
-    # Metis #9: no doc + points exist → PHASE_EMBEDDING (chunk reuse).
     for source in sources:
         # Refresh the maintenance marker per source: a long run must stay
         # protected even if it outlives the initial TTL.
         await _set_maintenance_marker(agent_id)
-        await delete_status(agent_id, "agent", source.name)
+        try:
+            await ccat.rabbit_hole.rerun_source(
+                ccat, source.name, invalidate=[PHASE_EMBEDDING]
+            )
+        except Exception as exc:  # noqa: BLE001 - per-source isolation
+            print(
+                f"[maintenance] agent={agent_id} op=reembed "
+                f"source={source.name} result=fail "
+                f"detail={type(exc).__name__}: {exc}"
+            )
 
-    await reembed_sources(ccat, VectorMemoryType(collection), sources)
     return await _report_ingestion_outcome(agent_id, "reembed", sources)
 
 
 async def _op_resume_failed(
     ccat, handler, collection: str, json_output: bool = False
 ) -> bool:
-    """Resume ONLY the diary phases that are in the ``error`` state.
+    """Resume the stale phases of every agent-scope source in ``error``.
 
-    For every agent-scope source whose status is ``error``:
-
-    1. read the status doc with ``registry.get_status``;
-    2. remove ONLY the diary entries whose ``phase_state`` is ``error``
-       through ``registry.reset_phase_entries`` — the collateral
-       ``dependency <x> is error`` entries are error entries too, while every
-       ``complete`` entry keeps its ``tag`` / ``started_at`` untouched;
-    3. write ``status=processing`` and ``error=None`` (``set_status``);
-    4. hand only that source to ``reembed_sources(..., stale_after=0.0)``: the
-       probe sees the remaining complete phases as fresh, so only the cleared
-       phases re-run. There is NO purge, NO point wipe, NO re-parse and NO
-       re-embed of a completed phase;
-    5. hold the per-agent maintenance marker for the whole pass (refreshed per
-       source) so the EffING sweep cannot steal the rows.
+    For every source whose state status is ``error``,
+    ``ccat.rabbit_hole.rerun_source(ccat, name)`` runs its stale phases: the
+    engine keeps the phases whose diary entry is still fresh (``complete``)
+    and re-runs only the failed / not-installed ones. There is NO point wipe,
+    NO re-parse and NO re-embed of a completed phase. The maintenance marker
+    is held for the whole pass (refreshed per source) so the automatic-resume
+    sweep cannot steal the rows.
 
     A source with no failed phase is reported ``nothing-to-resume`` and left
     untouched. ``graph_llm_extraction`` is never forced: when concept relations
     are disabled its body records ``skipped`` (never ``error``). Per-source
     failures are isolated: one bad source never aborts the others, and the
-    final ``result=ok|fail`` is the same shape as ``--reingest``.
+    final ``result=ok|fail`` has the same shape as ``--reingest``.
 
     Returns True only when every attempted source ended ``completed`` (or had
     nothing to resume).
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
-        from cat.core_plugins.cat_efficient_ingestion.registry import (
-            PHASE_STATE_ERROR,
-            IngestionStatus,
-            get_status,
-            phase_state,
-            reset_phase_entries,
-            set_status,
-        )
-        from cat.core_plugins.cat_efficient_ingestion.resume import _source_from_entry
-    except ImportError as exc:
-        _abort_missing_effing(exc)
-
-    from cat.services.memory.models import VectorMemoryType
-
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
     plan = await _resolve_resume_failed_plan(agent_id)
 
@@ -979,8 +868,6 @@ async def _op_resume_failed(
 
     for item in plan:
         source_name = item["source"]
-        scope = item["scope"]
-        type_ = item["type"]
 
         # A long pass must stay protected even if it outlives the initial TTL.
         await _set_maintenance_marker(agent_id)
@@ -995,70 +882,17 @@ async def _op_resume_failed(
             continue
 
         try:
-            # Build the source object BEFORE any write: a missing file must
-            # never leave the row ``processing`` with its error diary dropped.
-            source_obj = _source_from_entry(
-                ccat, agent_id, scope, source_name, type_
-            )
-            if source_obj is None:
-                failures[source_name] = {"source": "source-unavailable"}
-                if not json_output:
-                    print(
-                        f"[maintenance] agent={agent_id} op=resume-failed "
-                        f"source={source_name} result=fail detail=source-unavailable"
-                    )
-                continue
+            # The engine decides the stale phases from the kept diary: only the
+            # failed phase and its dependents rerun.
+            await ccat.rabbit_hole.rerun_source(ccat, source_name)
 
-            # Re-read just before writing: the row may have changed between
-            # the plan resolution and this pass.
-            doc = await get_status(agent_id, scope, source_name)
-            diary = (doc or {}).get("completed_phases")
-            diary = diary if isinstance(diary, dict) else {}
-            failed_phases = [
-                phase
-                for phase, entry in diary.items()
-                if phase_state(entry) == PHASE_STATE_ERROR
-            ]
-            if not failed_phases:
-                skipped.append(source_name)
-                if not json_output:
-                    print(
-                        f"[maintenance] agent={agent_id} op=resume-failed "
-                        f"source={source_name} result=skip detail=nothing-to-resume"
-                    )
-                continue
-
-            # STATE ONLY: drop the failed diary entries (complete entries and
-            # their tag/started_at are preserved), then mark the source
-            # processing with no error. No points are touched.
-            await reset_phase_entries(agent_id, scope, source_name, failed_phases)
-            await set_status(
-                agent_id,
-                scope,
-                source_name,
-                type_=type_,
-                status=IngestionStatus.PROCESSING,
-                chat_id=None if scope == "agent" else scope,
-                error=None,
-            )
-
-            # Re-dispatch: the probe sees the kept phases as fresh, so only
-            # the cleared (failed) phases run. stale_after=0.0 lets the claim
-            # take the row we just wrote.
-            await reembed_sources(
-                ccat,
-                VectorMemoryType(collection),
-                [source_obj],
-                stale_after=0.0,
-            )
-
-            after = await get_status(agent_id, scope, source_name) or {}
+            after = await _read_ingestion_status(agent_id, source_name) or {}
             after_diary = after.get("completed_phases")
             after_diary = after_diary if isinstance(after_diary, dict) else {}
             still_failed = {
-                phase: entry.get("reason")
+                phase: (entry or {}).get("reason")
                 for phase, entry in after_diary.items()
-                if phase_state(entry) == PHASE_STATE_ERROR
+                if (entry or {}).get("state") == "error"
             }
             status = after.get("status")
             if status == "error" or still_failed:
@@ -1083,12 +917,12 @@ async def _op_resume_failed(
                     )
                 continue
 
-            retried[source_name] = failed_phases
+            retried[source_name] = item["failed_phases"]
             if not json_output:
                 print(
                     f"[maintenance] agent={agent_id} op=resume-failed "
                     f"source={source_name} result=ok detail=resumed "
-                    f"phases={','.join(failed_phases)}"
+                    f"phases={','.join(item['failed_phases'])}"
                 )
         except Exception as exc:  # noqa: BLE001 - per-source isolation
             failures[source_name] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -1130,41 +964,18 @@ async def _op_resume_failed(
         )
 
     return not failures
-
-
 async def _preflight_reembed_path(ccat) -> str | None:
-    """Return why the re-embed path cannot rebuild, or None when it can.
+    """Return why the re-embed path cannot run, or None when it can.
 
-    Runs BEFORE any destructive wipe: ``_op_reingest`` deletes the source
-    points first, so a parse/embed path that cannot run must abort before
-    touching storage (incident: a ``None`` RabbitHole wiped the points and
-    then failed at ``rabbit_hole.cat = ccat``, leaving nothing to rebuild).
+    Runs BEFORE the per-source reingest (whose phase deletes remove the old
+    points), so a missing engine/chunker aborts with everything still in
+    place. The core RabbitHole reads the kept bytes itself, so the only engine
+    precondition is an available ``ccat.rabbit_hole``.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.reembed import (
-            _resolve_rabbit_hole,
-        )
-    except ImportError as exc:
-        _abort_missing_effing(exc)
-
-    try:
-        rabbit_hole = await _resolve_rabbit_hole(ccat)
-    except Exception as exc:  # noqa: BLE001 - reported, never raised
-        return f"rabbit-hole-unavailable: {exc}"
-    if rabbit_hole is None or getattr(rabbit_hole, "cat", None) is None:
+    if getattr(ccat, "rabbit_hole", None) is None:
         return "rabbit-hole-unbound"
     if getattr(ccat, "chunker", None) is None:
         return "chunker-unavailable"
-
-    try:
-        handlers = await ccat.file_handlers()
-        embedder = await ccat.embedder()
-    except Exception as exc:  # noqa: BLE001 - reported, never raised
-        return f"parsing-engine-unavailable: {exc}"
-    if not handlers:
-        return "no-file-handlers"
-    if embedder is None:
-        return "embedder-unavailable"
     return None
 
 
@@ -1174,23 +985,18 @@ def _union_with_stored_files(ccat, agent_id: str | None, sources: list) -> list:
     ``get_stored_sources_with_metadata`` reads the VECTOR STORE, so a source
     whose points were already wiped by a failed re-ingest is invisible and can
     never be recovered. The bytes still live in the file manager, so every
-    stored file missing from the vector enumeration is appended, built through
-    EffING's existing ``_source_from_entry`` loader (the same ``BytesIO`` shape
-    the vector-store enumeration produces). Dedup is by ``name``.
+    stored file missing from the vector enumeration is appended as a source
+    reference (``name``); the core ``reingest_source`` reads the bytes itself.
+    Dedup is by ``name``.
 
     Derived image artifacts (``<stem>_img_<index>_<digest>.<ext>``, produced by
     cat-multimodal-ingestion) are NOT sources: they are artifacts of their
     parent file. They are skipped explicitly and logged; re-ingesting them
     would mint duplicate image sources next to the parent PDF.
 
-    Read-only and fail-open: a missing/unusable file manager or an
-    unreadable file only logs, leaving the vector-store sources untouched.
+    Read-only and fail-open: a missing/unusable file manager only logs,
+    leaving the vector-store sources untouched.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.resume import _source_from_entry
-    except ImportError as exc:
-        _abort_missing_effing(exc)
-
     if not agent_id:
         return sources
     file_manager = getattr(ccat, "file_manager", None)
@@ -1218,73 +1024,39 @@ def _union_with_stored_files(ccat, agent_id: str | None, sources: list) -> list:
                 f"detail=derived-image-skip source={name}"
             )
             continue
-        source = _source_from_entry(ccat, agent_id, "agent", name, "file")
-        if source is None:
-            print(
-                f"[maintenance] agent={agent_id} op=reingest result=warn "
-                f"detail=stored-file-unreadable source={name}"
-            )
-            continue
-        merged.append(source)
+        merged.append(types.SimpleNamespace(name=name))
         seen.add(name)
     return merged
 
 
 async def _op_reingest(ccat, handler, collection: str) -> bool:
-    """Re-ingest from scratch: delete points per source, then re-parse + re-embed.
+    """Re-ingest from scratch: every phase again from the kept bytes.
 
-    ``reembed_sources`` decides the phase per source from the status doc: no
-    doc + no points → ``PHASE_PARSING_CHUNKING`` (clean re-parse, Metis #9).
-    Deleting the status doc ALONE would leave the source's points in place and
-    silently chunk-reuse (``PHASE_EMBEDDING``) — so the points MUST be deleted
-    FIRST, per source, via the active vector handler's
-    ``delete_tenant_points(str(collection), metadata={"source": name})`` (which
-    also triggers the provenance-cascade graph cleanup), THEN clear the
-    completed-phases diary (``clear_completed_phases``), and only THEN the
-    status doc. The diary is bookkeeping, not proof the points exist: clearing
-    it before ``delete_status`` guarantees the phases re-run even if the status
-    row survives a failed delete. ``handler`` may be None (non-GraphRAG agent):
-    the live vector handler is resolved from ``ccat`` in that case. URL sources
-    are passed through as-is: the engine re-downloads them (the
-    ``content=None`` path in ``_source_from_entry``), so their points are NOT
-    deleted by source name — each pass-through is logged
-    (``detail=url-pass-through``).
+    ``ccat.rabbit_hole.reingest_source(ccat, name)`` reruns every phase of each
+    source from the bytes kept for it (the core resets the diary and each phase
+    replaces what it produced before). It raises ``SourceNotKept`` for a file
+    whose bytes were not kept: nothing is touched for that source and the
+    failure is reported per source. URL sources are re-downloaded by the engine
+    (each pass-through is logged ``detail=url-pass-through``).
 
     Enumeration is the UNION of the vector-store sources and the agent's
     stored files (``ccat.file_manager.list_files(agent_id)``): a source whose
     points were already deleted by a failed re-ingest is invisible to the
-    vector store, so a points-only enumeration could never recover it. Stored
-    files without points are added through the existing EffING
-    ``_source_from_entry`` loader (no second content loader); derived image
-    artifacts (``*_img_*.jpg``-style names) are skipped and logged, since they
-    belong to their parent PDF.
+    vector store, so a points-only enumeration could never recover it. Derived
+    image artifacts (``*_img_*.jpg``-style names) are skipped and logged, since
+    they belong to their parent PDF.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
-        from cat.core_plugins.cat_efficient_ingestion.registry import (
-            purge_source_for_reingest,
-        )
-    except ImportError as exc:
-        _abort_missing_effing(exc)
+    from cat.rabbit_hole import SourceNotKept
     from cat.services.memory.models import VectorMemoryType
     from cat.utils import is_url
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
 
-    # The points-first wipe only needs the active VECTOR handler's
-    # delete_tenant_points, which every vector backend exposes. ``handler`` is
-    # the GraphRAG handler only for GraphRAG agents; for any other backend the
-    # caller passes None, so resolve the live vector handler here. The graph
-    # phases themselves are engine-level and no-op when GraphRAG is inactive.
-    vector_handler = handler if handler is not None else ccat.vector_memory_handler
-
     all_sources = await ccat.get_stored_sources_with_metadata()
     sources = all_sources.get(VectorMemoryType(collection), [])
     sources = _union_with_stored_files(ccat, agent_id, sources)
 
-    # PREFLIGHT: never wipe when the re-embed path cannot rebuild. This runs
-    # before the points-first delete loop below, so a broken path aborts the
-    # agent with everything still in place.
+    # PREFLIGHT: never touch storage when the re-embed path cannot run.
     preflight_reason = await _preflight_reembed_path(ccat)
     if preflight_reason is not None:
         print(
@@ -1293,8 +1065,6 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
         )
         return False
 
-    # Metis #9 points-first: delete the source's points, THEN the status doc,
-    # so reembed_sources sees no doc + no points → PHASE_PARSING_CHUNKING.
     for source in sources:
         # Refresh the maintenance marker per source (long runs outlive the TTL).
         await _set_maintenance_marker(agent_id)
@@ -1303,22 +1073,20 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
                 f"[maintenance] agent={agent_id} op=reingest result=warn "
                 f"detail=url-pass-through source={source.name}"
             )
-            continue
-        # DATA FIRST, STATE LAST — through the shared EffING helper so the two
-        # sides can never be reordered: the points are deleted, THEN the diary
-        # is cleared (every phase, not a hardcoded pair), THEN the status row.
-        # If the vector delete raises, neither the diary nor the row is
-        # touched, and the source re-runs from its current checkpoint.
-        await purge_source_for_reingest(
-            agent_id,
-            "agent",
-            source.name,
-            lambda: vector_handler.delete_tenant_points(
-                str(collection), metadata={"source": source.name}
-            ),
-        )
+        try:
+            await ccat.rabbit_hole.reingest_source(ccat, source.name)
+        except SourceNotKept:
+            print(
+                f"[maintenance] agent={agent_id} op=reingest "
+                f"source={source.name} result=fail detail=source-not-kept"
+            )
+        except Exception as exc:  # noqa: BLE001 - per-source isolation
+            print(
+                f"[maintenance] agent={agent_id} op=reingest "
+                f"source={source.name} result=fail "
+                f"detail={type(exc).__name__}: {exc}"
+            )
 
-    await reembed_sources(ccat, VectorMemoryType(collection), sources)
     return await _report_ingestion_outcome(agent_id, "reingest", sources)
 
 
@@ -1451,20 +1219,15 @@ async def _reset_graph_phase_entries(ccat, tenant_id: str) -> int:
     The tenant-wide wipe removes every source's graph edges/entities, so EVERY
     status doc of this agent (all scopes) must stop recording the graph phases
     as ``complete`` — otherwise the next ingestion trusts a diary whose data is
-    gone and skips the rebuild. EffING enumerates the docs; this helper only
-    supplies the phase ids it owns.
+    gone and skips the rebuild. The core crud enumerates the docs; this helper
+    only supplies the phase ids it owns.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.registry import (
-            reset_phase_entries_for_agent,
-        )
-    except ImportError as exc:
-        _abort_missing_effing(exc)
+    from cat.db.cruds import ingestions as crud_ingestions
 
     phase_ids = await _graph_phase_ids(ccat)
     if not phase_ids:
         return 0
-    changed = await reset_phase_entries_for_agent(tenant_id, phase_ids)
+    changed = await crud_ingestions.reset_phase_entries_for_agent(tenant_id, phase_ids)
     print(
         f"[maintenance] agent={tenant_id} op=graph detail=phase-state-reset "
         f"phases={phase_ids} docs={changed}"
@@ -1731,7 +1494,7 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
     Read-only assertions against the agent's status docs and the Neo4j
     graph (via ``handler._get_session()``):
 
-      1. status docs completed with the active embedder/chunker;
+      1. every state completed with no error;
       2. zero ``Document.embedding_<gen> IS NULL``;
       3. ``MENTIONS`` edge count > 0 and ``SIMILAR_TO_<gen>`` edge count > 0;
       4. ``Collection.concept_gen_active == handler._concept_fingerprint()``
@@ -1742,10 +1505,7 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
     Returns a list of ``(check_name, ok)`` tuples; the caller prints the
     ``result=verify-ok|verify-fail`` summary. Never destructive.
     """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.registry import list_statuses
-    except ImportError as exc:
-        _abort_missing_effing(exc)
+    from cat.db.cruds import ingestions as crud_ingestions
     from cat.services.memory.models import VectorMemoryType
 
     tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -1756,18 +1516,14 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
 
     checks: list[tuple[str, bool]] = []
 
-    # 1. status docs completed with the active embedder/chunker.
-    embedder = await ccat.embedder()
-    chunker = ccat.chunker
-    statuses = await list_statuses(tenant_id)
+    # 1. every state completed with no error.
+    statuses = await crud_ingestions.list_statuses(tenant_id, None)
     checks.append(
         (
-            "status-completed-active-embedder-chunker",
+            "status-completed-no-error",
             bool(statuses)
             and all(
-                doc.get("status") == "completed"
-                and doc.get("embedder_name") == embedder.name
-                and doc.get("chunker_name") == chunker.name
+                doc.get("status") == "completed" and not doc.get("error")
                 for doc in statuses
             ),
         )
@@ -1878,9 +1634,9 @@ async def main() -> None:
         # at a time, so no two ops ever run concurrently on the same agent.
         if not args.json:
             print(f"[maintenance] agent={entry['agent_id']} progress=start")
-        # Coordinate with the EffING periodic sweep: while this marker exists
-        # the sweep skips the agent, so it can never steal/retry the rows this
-        # CLI is processing. Deleted at the end, on success AND on failure.
+        # Coordinate with the core automatic-resume sweep: while this marker
+        # exists the sweep skips the agent, so it can never steal/retry the
+        # rows this CLI is processing. Deleted at the end, success or failure.
         await _set_maintenance_marker(entry["agent_id"])
         try:
             ok = await _run_agent(

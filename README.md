@@ -405,7 +405,7 @@ A few things are worth knowing before production use:
 
 | File | Purpose |
 |---|---|
-| `main.py` | Hook registration: query capture, embedder injection, classic graph writer, EffING phase hooks, transfer cleanup, boot reconciliation |
+| `main.py` | Hook registration: query capture, embedder injection, core ingestion phase hooks, transfer cleanup, boot reconciliation |
 | `graphrag_handler.py` | `GraphRAGHandler` core logic + `Neo4jGraphRAGConfig` settings model |
 | `entity_extractor.py` | spaCy-based entity and relation extraction pipeline |
 | `constants.py` | Entity mappings, regex technology patterns, relation verb map, default concept/relation definitions |
@@ -450,36 +450,30 @@ processed sequentially with per-agent and per-source `try/except` isolation;
 
 Exit codes: **0** = all resumed/ops cleanly, **1** = partial failure (some
 source/agent/op failed, or a `--verify` check failed), **2** = aborted
-(dry-run or missing `--yes`, or EffING is not importable).
+(dry-run or missing `--yes`).
 
-`--resume-failed` deletes only the diary entries whose state is `error`
-(including collateral `dependency <x> is error` rows), keeps every `complete`
-entry with its `tag`/`started_at`, writes `status=processing`/`error=None`,
-and re-dispatches only the cleared phases via
-`reembed_sources(..., stale_after=0.0)`. A source with no failed phase is
-reported `nothing-to-resume` and left untouched; a disabled
+The engine-level ops drive the core `RabbitHole`: `--reembed` calls
+`ccat.rabbit_hole.rerun_source(ccat, name, invalidate=["embedding"])`,
+`--reingest` calls `reingest_source(ccat, name)` and `--resume-failed` calls
+`rerun_source` for the sources whose state status is `error`. States are read
+and reset through `cat.db.cruds.ingestions`; no external ingestion plugin is
+required. `--resume-failed` therefore re-runs only the stale phases (the core
+engine keeps the still-fresh `complete` entries). A source with no failed phase
+is reported `nothing-to-resume` and left untouched; a disabled
 `graph_llm_extraction` phase ends `skipped`, never `error`.
 
 ### Maintenance script coordination
 
-Before each per-agent run `maintenance_agent.py` writes
-`agents:<agent_id>:ingestion:maintenance` (`{"owner": "maintenance",
-"started_at": ...}`, TTL 2h, refreshed per source) through `cat.db.crud`, and
-deletes it in a `finally` (success or failure). While the marker exists the
-EffING periodic sweep skips that agent, so the app never steals/retries rows
-the CLI is rebuilding. A crashed CLI's marker expires by TTL; a failed delete
-never blocks the sweep forever.
+Before each per-agent run `maintenance_agent.py` writes the core maintenance
+marker (`cat.db.cruds.ingestions.set_maintenance`, TTL 2h, refreshed per
+source) and clears it in a `finally` (success or failure). While the marker
+exists the core automatic-resume sweep skips that agent, so the app never
+steals/retries rows the CLI is rebuilding. A crashed CLI's marker expires by
+TTL; a failed clear never blocks the sweep forever.
 
-The coordination harness moved to its owner, EffING: its assertions are about
-EffING's resume/revalidation sweep, so it lives there even though it still
-drives the real MyGRAPH `maintenance_agent`. Run it from the core checkout with
-the EffING plugin (set `MYGRAPH_PLUGIN_DIR` if the MyGRAPH checkout is not a
-sibling of the EffING one):
-
-```bash
-cd grinning-cat-core
-.venv/bin/python /path/to/plugins/cat-efficient-ingestion/test_maintenance_coordination.py
-```
+The former coordination harness lives in the archived EffING checkout
+(`plugins/_archive/cat-efficient-ingestion/test_maintenance_coordination.py`);
+it still drives the real MyGRAPH `maintenance_agent`.
 
 ### Removing leaked card metadata
 

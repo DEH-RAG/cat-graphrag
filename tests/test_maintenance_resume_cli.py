@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Standalone, import-safe harness for ``--resume-failed``.
 
-The operation resumes ONLY the diary phases whose explicit state is ``error``:
-it keeps every ``complete`` entry (with its ``tag`` / ``started_at``), writes
-``status=processing`` / ``error=None`` and re-dispatches ONLY the cleared
-phases through ``reembed_sources(..., stale_after=0.0)``. No purge, no point
-wipe, no re-parse and no re-embed of a healthy phase.
+The operation resumes the sources whose state status is ``error`` by calling
+``ccat.rabbit_hole.rerun_source(ccat, name)``: the core engine keeps the
+phases whose diary entry is still fresh (``complete``) and re-runs only the
+failed ones. No purge, no point wipe, no re-parse and no re-embed of a healthy
+phase. No manual diary rewrite happens in the CLI.
 
 Covered:
   (a) dry-run resolves the plan and exits 2 with ZERO writes;
-  (b) --yes deletes only the ``error`` entries and keeps the complete ones
-      with their ``tag`` / ``started_at`` byte-for-byte unchanged;
+  (b) --yes calls rerun_source once per error source and reports ok;
   (c) a source with no failed phase is ``nothing-to-resume`` and untouched;
   (d) per-source failure isolation: one failing source never aborts the
       others and the process exits 1 naming the failing source;
@@ -18,14 +17,10 @@ Covered:
   (f) ``--all`` vs ``--agent`` scoping (protect system/``__*__`` unless
       explicitly named) and repeatable ``--agent``.
 
-Run it as a plain script (inside the Cat container, where EffING is deployed):
+Run it as a plain script from the host repository:
 
-    docker exec dev-grinning-cat-core-1 python \\
-        /app/cat/plugins/cat_graphrag/test_maintenance_resume_cli.py
-
-or from the host repository with the container's python, e.g.:
-
-    docker exec dev-grinning-cat-core-1 python - < test_maintenance_resume_cli.py
+    cd /root/git/grinning-cat-core
+    .venv/bin/python /root/git/plugins/cat-graphrag.my/tests/test_maintenance_resume_cli.py
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. The ENTIRE body lives under
@@ -35,6 +30,7 @@ loader imports recursively at activation. The ENTIRE body lives under
 if __name__ == "__main__":
     import asyncio
     import contextlib
+    import copy
     import importlib.util
     import io
     import sys
@@ -64,15 +60,10 @@ if __name__ == "__main__":
     def _error(reason, tag="err-tag", started_at=900):
         return {"state": "error", "reason": reason, "tag": tag, "started_at": started_at}
 
-    def _source(name):
-        return types.SimpleNamespace(
-            name=name, metadata={}, path=name, content=None
-        )
-
     def _doc(name, status, diary, error=None):
         return {
             "source": name,
-            "scope": "agent",
+            "chat_id": None,
             "type": "file",
             "status": status,
             "error": error,
@@ -80,69 +71,94 @@ if __name__ == "__main__":
         }
 
     class Store:
-        """In-memory status docs + the writes the op performs."""
+        """In-memory ingestion states + the engine calls the op performs."""
 
         def __init__(self, docs):
-            self.docs = {name: dict(doc) for name, doc in docs.items()}
-            self.reset_calls = []
-            self.set_calls = []
-            self.reembed_calls = []
+            self.docs = {name: copy.deepcopy(doc) for name, doc in docs.items()}
+            self.rerun_calls = []
 
-        async def list_statuses(self, agent_id, chat_id=None):
-            return [dict(doc) for doc in self.docs.values()]
-
-        async def get_status(self, agent_id, scope, source):
-            doc = self.docs.get(source)
-            return dict(doc) if doc is not None else None
-
-        async def reset_phase_entries(self, agent_id, scope, source, phases):
-            self.reset_calls.append((source, sorted(phases)))
-            diary = self.docs[source]["completed_phases"]
-            for phase in phases:
-                diary.pop(phase, None)
-            return self.docs[source]
-
-        async def set_status(
-            self, agent_id, scope, source, *, type_, status, chat_id=None,
-            error=None, **kwargs
-        ):
-            self.set_calls.append(
-                (source, getattr(status, "value", status), error)
-            )
-            self.docs[source]["status"] = getattr(status, "value", status)
-            self.docs[source]["error"] = error
-            return self.docs[source]
-
-    def _patch_op(store, behaviors):
-        import cat.core_plugins.cat_efficient_ingestion.reembed as effing_reembed
-        import cat.core_plugins.cat_efficient_ingestion.registry as effing_registry
-        import cat.core_plugins.cat_efficient_ingestion.resume as effing_resume
-
-        async def fake_reembed(ccat, collection, sources, stale_after=None):
-            store.reembed_calls.append(
-                (
-                    sources[0].name,
-                    str(collection),
-                    stale_after,
+        def plan(self, agent_id):
+            resolved = []
+            for name, doc in self.docs.items():
+                if doc.get("status") != "error":
+                    continue
+                diary = doc.get("completed_phases") or {}
+                failed = [
+                    phase
+                    for phase, entry in diary.items()
+                    if (entry or {}).get("state") == "error"
+                ]
+                kept = [
+                    phase
+                    for phase, entry in diary.items()
+                    if (entry or {}).get("state") != "error"
+                ]
+                resolved.append(
+                    {
+                        "source": name,
+                        "scope": "agent",
+                        "type": doc.get("type") or "file",
+                        "failed_phases": failed,
+                        "kept_phases": kept,
+                    }
                 )
-            )
-            behavior = behaviors.get(sources[0].name)
-            if behavior is not None:
-                await behavior(store.docs[sources[0].name])
+            return resolved
 
-        def fake_source_from_entry(ccat, agent_id, scope, source, type_="file"):
-            return _source(source)
+        async def get_status(self, agent_id, source):
+            doc = self.docs.get(source)
+            return copy.deepcopy(doc) if doc is not None else None
 
-        return (
-            patch.object(effing_registry, "list_statuses", store.list_statuses),
-            patch.object(effing_registry, "get_status", store.get_status),
-            patch.object(
-                effing_registry, "reset_phase_entries", store.reset_phase_entries
-            ),
-            patch.object(effing_registry, "set_status", store.set_status),
-            patch.object(effing_reembed, "reembed_sources", fake_reembed),
-            patch.object(effing_resume, "_source_from_entry", fake_source_from_entry),
+    def finish_completed(store, name):
+        """Engine semantics: drop the failed diary, complete the phase."""
+        doc = store.docs[name]
+        diary = doc["completed_phases"]
+        for phase in [p for p, e in diary.items() if (e or {}).get("state") == "error"]:
+            diary.pop(phase, None)
+            diary[phase] = _complete("rerun", 1000)
+        doc["status"] = "completed"
+        doc["error"] = None
+
+    def finish_skipped(store, name):
+        doc = store.docs[name]
+        doc["completed_phases"]["graph_llm_extraction"] = {
+            "state": "skipped",
+            "reason": "concept-relations extraction disabled",
+        }
+        doc["status"] = "completed"
+        doc["error"] = None
+
+    def explode(store, name):
+        raise RuntimeError("reembed backend unavailable")
+
+    class FakeRabbitHole:
+        def __init__(self, store, behaviors):
+            self.store = store
+            self.behaviors = behaviors
+
+        async def rerun_source(self, ccat, name, chat_id=None, blocking=True, invalidate=None):
+            self.store.rerun_calls.append((name, None if invalidate is None else list(invalidate)))
+            behavior = self.behaviors.get(name, finish_completed)
+            behavior(self.store, name)
+            return {"source": name}
+
+    def _ccat(store, behaviors):
+        return types.SimpleNamespace(
+            agent_key="a1",
+            _id="a1",
+            rabbit_hole=FakeRabbitHole(store, behaviors),
         )
+
+    def _patch_state(maintenance_agent, store):
+        async def fake_resolve(agent_id):
+            return store.plan(agent_id)
+
+        async def fake_read(agent_id, source_name):
+            return await store.get_status(agent_id, source_name)
+
+        return [
+            patch.object(maintenance_agent, "_resolve_resume_failed_plan", fake_resolve),
+            patch.object(maintenance_agent, "_read_ingestion_status", fake_read),
+        ]
 
     def _enter(patches):
         for p in patches:
@@ -172,25 +188,13 @@ if __name__ == "__main__":
         async def fake_list_agents(include_protected=False):
             return ["a1"]
 
-        async def fake_resolve(agent_id):
-            return [
-                {
-                    "source": "broken.pdf",
-                    "scope": "agent",
-                    "type": "file",
-                    "failed_phases": ["graph_llm_extraction"],
-                    "kept_phases": ["parsing_chunking", "embedding"],
-                }
-            ]
-
         async def forbidden_bootstrap(agent_id):
             raise AssertionError("dry-run must not bootstrap the agent")
 
-        patches = list(_patch_op(store, {}))
+        patches = _patch_state(maintenance_agent, store)
         patches += [
             patch.object(maintenance_agent, "_runtime_guard", lambda: True),
             patch.object(maintenance_agent, "_list_agents", fake_list_agents),
-            patch.object(maintenance_agent, "_resolve_resume_failed_plan", fake_resolve),
             patch.object(maintenance_agent, "_bootstrap_agent", forbidden_bootstrap),
         ]
         _enter(patches)
@@ -209,21 +213,16 @@ if __name__ == "__main__":
 
         out = stdout.getvalue()
         assert code == 2, f"dry-run must exit 2, got {code}: {out}"
-        assert store.reset_calls == [], store.reset_calls
-        assert store.set_calls == [], store.set_calls
-        assert store.reembed_calls == [], store.reembed_calls
+        assert store.rerun_calls == [], store.rerun_calls
         assert "failed_phases=graph_llm_extraction" in out, out
         assert "kept_phases=2" in out, out
         print("PASS (a) dry-run resolves the plan, exits 2, zero writes")
 
-    async def test_yes_removes_only_error_and_keeps_complete(maintenance_agent):
+    async def test_yes_resumes_only_error_sources(maintenance_agent):
         diary = {
             "parsing_chunking": _complete("p-tag", 111),
             "embedding": _complete("e-tag", 222),
             "graph_llm_extraction": _error("llm exploded", "l-tag", 333),
-            "catalog_cards": _error(
-                "dependency graph_llm_extraction is error", "c-tag", 444
-            ),
         }
         store = Store(
             {
@@ -235,33 +234,22 @@ if __name__ == "__main__":
             for phase in ("parsing_chunking", "embedding")
         }
 
-        async def finish(doc):
-            doc["completed_phases"]["graph_llm_extraction"] = _complete("l2", 555)
-            doc["completed_phases"]["catalog_cards"] = _complete("c2", 666)
-            doc["status"] = "completed"
-            doc["error"] = None
-
-        patches = list(_patch_op(store, {"doc.pdf": finish}))
+        patches = _patch_state(maintenance_agent, store)
         _enter(patches)
         try:
             ok = await maintenance_agent._op_resume_failed(
-                types.SimpleNamespace(agent_key="a1", _id="a1"), None, "declarative"
+                _ccat(store, {"doc.pdf": finish_completed}), None, "declarative"
             )
         finally:
             _exit(patches)
 
         assert ok is True, ok
-        assert store.reset_calls == [
-            ("doc.pdf", ["catalog_cards", "graph_llm_extraction"])
-        ], store.reset_calls
-        assert ("doc.pdf", "processing", None) in store.set_calls, store.set_calls
+        assert store.rerun_calls == [("doc.pdf", None)], store.rerun_calls
         after = store.docs["doc.pdf"]["completed_phases"]
         for phase, expected in kept_before.items():
             assert after[phase] == expected, (phase, after[phase], expected)
-        assert store.reembed_calls == [
-            ("doc.pdf", "declarative", 0.0)
-        ], store.reembed_calls
-        print("PASS (b) --yes deletes only error entries, complete entries unchanged")
+        assert store.docs["doc.pdf"]["status"] == "completed"
+        print("PASS (b) --yes calls rerun_source once per error source")
 
     async def test_nothing_to_resume_is_untouched(maintenance_agent):
         store = Store(
@@ -277,26 +265,20 @@ if __name__ == "__main__":
                 )
             }
         )
-        patches = list(_patch_op(store, {}))
+        patches = _patch_state(maintenance_agent, store)
         _enter(patches)
         stdout = io.StringIO()
         try:
             with contextlib.redirect_stdout(stdout):
                 ok = await maintenance_agent._op_resume_failed(
-                    types.SimpleNamespace(agent_key="a1", _id="a1"),
-                    None,
-                    "declarative",
+                    _ccat(store, {}), None, "declarative"
                 )
         finally:
             _exit(patches)
 
         out = stdout.getvalue()
         assert ok is True, out
-        assert store.reset_calls == [] and store.set_calls == [], (
-            store.reset_calls,
-            store.set_calls,
-        )
-        assert store.reembed_calls == [], store.reembed_calls
+        assert store.rerun_calls == [], store.rerun_calls
         assert "detail=nothing-to-resume" in out, out
         assert store.docs["ok.pdf"]["status"] == "error", store.docs["ok.pdf"]
         print("PASS (c) no failed phase -> nothing-to-resume, untouched")
@@ -323,22 +305,13 @@ if __name__ == "__main__":
             }
         )
 
-        async def finish_good(doc):
-            doc["completed_phases"]["graph_llm_extraction"] = _complete("l2", 2)
-            doc["status"] = "completed"
-
-        async def explode_bad(doc):
-            raise RuntimeError("reembed backend unavailable")
-
-        patches = list(
-            _patch_op(store, {"good.pdf": finish_good, "bad.pdf": explode_bad})
-        )
+        patches = _patch_state(maintenance_agent, store)
         _enter(patches)
         stdout = io.StringIO()
         try:
             with contextlib.redirect_stdout(stdout):
                 ok = await maintenance_agent._op_resume_failed(
-                    types.SimpleNamespace(agent_key="a1", _id="a1"),
+                    _ccat(store, {"good.pdf": finish_completed, "bad.pdf": explode}),
                     None,
                     "declarative",
                 )
@@ -349,65 +322,44 @@ if __name__ == "__main__":
         assert ok is False, out
         assert "source=good.pdf result=ok" in out, out
         assert "source=bad.pdf result=fail" in out, out
-        assert "bad.pdf" in out and "result=fail" in out, out
-        assert store.reembed_calls[0][0] == "good.pdf"
-        assert store.reembed_calls[1][0] == "bad.pdf"
+        assert [call[0] for call in store.rerun_calls] == ["good.pdf", "bad.pdf"], (
+            store.rerun_calls
+        )
         print("PASS (d) one failing source is isolated and named")
 
     async def test_main_exits_one_on_partial_failure(maintenance_agent):
         store = Store(
             {
                 "good.pdf": _doc(
-                    "good.pdf",
-                    "error",
-                    {"graph_llm_extraction": _error("boom")},
+                    "good.pdf", "error", {"graph_llm_extraction": _error("boom")}
                 ),
                 "bad.pdf": _doc(
-                    "bad.pdf",
-                    "error",
-                    {"graph_llm_extraction": _error("boom")},
+                    "bad.pdf", "error", {"graph_llm_extraction": _error("boom")}
                 ),
             }
         )
-
-        async def finish_good(doc):
-            doc["completed_phases"]["graph_llm_extraction"] = _complete("l2", 2)
-            doc["status"] = "completed"
-
-        async def explode_bad(doc):
-            raise RuntimeError("boom")
 
         async def fake_list_agents(include_protected=False):
             return ["a1"]
 
         async def fake_bootstrap(agent_id):
-            return (
-                types.SimpleNamespace(agent_key=agent_id, _id=agent_id, agent_id=agent_id),
-                None,
-                None,
-            )
+            return (_ccat(store, {"good.pdf": finish_completed, "bad.pdf": explode}),
+                    None, None)
 
         async def fake_engine(ccat, op="reembed"):
-            return "EfficientIngestionConfiguration"
+            return "CoreRabbitHole"
 
         async def fake_marker(agent_id):
             return None
 
-        async def fake_clear(agent_id):
-            return None
-
-        patches = list(
-            _patch_op(store, {"good.pdf": finish_good, "bad.pdf": explode_bad})
-        )
+        patches = _patch_state(maintenance_agent, store)
         patches += [
             patch.object(maintenance_agent, "_runtime_guard", lambda: True),
             patch.object(maintenance_agent, "_list_agents", fake_list_agents),
             patch.object(maintenance_agent, "_bootstrap_agent", fake_bootstrap),
-            patch.object(
-                maintenance_agent, "_resolve_ingestion_engine", fake_engine
-            ),
+            patch.object(maintenance_agent, "_resolve_ingestion_engine", fake_engine),
             patch.object(maintenance_agent, "_set_maintenance_marker", fake_marker),
-            patch.object(maintenance_agent, "_clear_maintenance_marker", fake_clear),
+            patch.object(maintenance_agent, "_clear_maintenance_marker", fake_marker),
         ]
         _enter(patches)
         argv = ["maintenance_agent", "--agent", "a1", "--resume-failed", "--yes"]
@@ -442,19 +394,11 @@ if __name__ == "__main__":
             }
         )
 
-        async def finish_skipped(doc):
-            doc["completed_phases"]["graph_llm_extraction"] = {
-                "state": "skipped",
-                "reason": "concept-relations extraction disabled",
-            }
-            doc["status"] = "completed"
-            doc["error"] = None
-
-        patches = list(_patch_op(store, {"doc.pdf": finish_skipped}))
+        patches = _patch_state(maintenance_agent, store)
         _enter(patches)
         try:
             ok = await maintenance_agent._op_resume_failed(
-                types.SimpleNamespace(agent_key="a1", _id="a1"), None, "declarative"
+                _ccat(store, {"doc.pdf": finish_skipped}), None, "declarative"
             )
         finally:
             _exit(patches)
@@ -522,7 +466,7 @@ if __name__ == "__main__":
     async def _main():
         maintenance_agent = _load_maintenance_agent()
         await test_dry_run_exits_two_with_zero_writes(maintenance_agent)
-        await test_yes_removes_only_error_and_keeps_complete(maintenance_agent)
+        await test_yes_resumes_only_error_sources(maintenance_agent)
         await test_nothing_to_resume_is_untouched(maintenance_agent)
         await test_per_source_failure_isolation(maintenance_agent)
         await test_main_exits_one_on_partial_failure(maintenance_agent)
