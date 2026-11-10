@@ -5,7 +5,6 @@ from langchain_core.documents import Document
 from cat import hook, RecallSettings, VectorDatabaseSettings
 from cat.log import log
 from cat.looking_glass.stray_cat import StrayCat
-from cat.services.memory.models import PointStruct
 
 from .graphrag_handler import Neo4jGraphRAGConfig, GraphRAGHandler
 from .entity_extractor import EntityExtractor
@@ -94,21 +93,6 @@ async def _inject_embedder(cat) -> None:
 
 
 @hook(priority=10)
-async def rabbithole_ingestion_processing(source, cat) -> None:
-    """Inject the embedder on the hook BOTH ingestion engines emit.
-
-    The classic RabbitHole fires this right before parsing/embedding; the
-    efficient engine (EffING, ``cat/core_plugins/cat_efficient_ingestion``)
-    fires it too and NEVER fires ``before_rabbithole_stores_documents``. Without
-    this hook the handler would run its extraction phases with no embedder under
-    EffING, silently skipping entity embeddings. Idempotent (see
-    ``_inject_embedder``), so on the classic flow — which emits both hooks — the
-    second injection changes nothing.
-    """
-    await _inject_embedder(cat)
-
-
-@hook(priority=10)
 async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
     await _inject_embedder(cat)
 
@@ -126,53 +110,25 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
     return docs
 
 
-@hook
-async def after_rabbithole_stored_documents(source: str, stored_points: List[PointStruct], cat) -> None:
-    # Lazy import (FX-7): the plugin loader reloads each file in glob order and
-    # main.py comes BEFORE graphrag_handler.py, so a module-level import binds
-    # the PRE-reload class and isinstance() below ALWAYS fails (the factory
-    # instantiates the handler from the CURRENT, post-reload class). Import at
-    # call time, when graphrag_handler is the current module, so the check
-    # matches the class the factory actually created.
-    from .graphrag_handler import GraphRAGHandler as _GH
-    handler = cat.vector_memory_handler
-    if not isinstance(handler, _GH):
-        return
-    # The document-structure graph is ALWAYS built.
-    # The classic callback is the ONLY graph writer when the phase path is
-    # inactive; when it is active the registered phases own the work, so this
-    # fire-and-forget must be a NO-OP (otherwise the graph is built twice).
-    if await _phase_path_active(cat):
-        return
-    # Join the lock-free per-chunk extraction spawned by add_point_to_tenant
-    # and flush it as ONE graph write for this source, then build the derived
-    # document-structure graph. Draining outside the tenant write lock keeps
-    # the source lock -> tenant write lock order intact and avoids waiting for
-    # write tasks while holding the lock they need.
-    await handler.drain_source_tasks(source)
-    await handler.create_derived_graph_for_source(source, stored_points, cat)
-
-
-# ========== INGESTION PHASE MACHINE (EffING registration contract) ==========
+# ========== INGESTION PHASES (core ``rabbithole_ingestion_phases``) ==========
 #
-# The EffING phase machine (deployed as
-# ``cat.core_plugins.cat_efficient_ingestion``)
-# drives the phase-aware ingestion lifecycle. Plugins REGISTER their phases
-# (``ingestion_phase_specs``), provide the material marker for each
-# (``ingestion_phase_settings_marker``), and execute them
-# (``ingestion_phase_run``). EffING computes staleness for ALL merged phases
-# (deps by upstream marker identity + marker comparison) — providers do NOT
-# implement their own pending-probe hook. Clock-free: no timestamps
-# for correctness, no full settings fingerprints, no raw Redis.
+# The core RabbitHole owns the phase machine: it instantiates the registered
+# ``IngestionPhase`` subclasses without arguments for every run, computes each
+# phase's tag from its ``settings(cat)`` folded with the tags of its
+# dependencies, records it in the source diary and runs it after
+# ``parsing_chunking`` and ``embedding``. The two graph phases are the ONLY
+# graph writers for a source — the old classic
+# ``after_rabbithole_stored_documents`` callback is gone — so the graph is
+# never built twice and no runtime switch selects a path.
 
 
 def _graphrag_handler(cat):
-    """Resolve the active GraphRAG handler, or None.
+    """Return the active GraphRAG handler, or ``None``.
 
-    Same guard as every other hook in this module: lazy import (FX-9, the
-    plugin loader reloads main.py BEFORE graphrag_handler.py, so a module-level
-    binding would compare against the PRE-reload class and always fail) +
-    isinstance against the current class.
+    The handler is resolved lazily (FX-9: the plugin loader reloads ``main.py``
+    before ``graphrag_handler.py``, so a module-level binding would compare
+    against the PRE-reload class and always fail) and checked with
+    ``isinstance`` against the current class.
     """
     from .graphrag_handler import GraphRAGHandler as _GH
     handler = getattr(cat, "vector_memory_handler", None)
@@ -181,215 +137,23 @@ def _graphrag_handler(cat):
     return None
 
 
-_EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
-
-
-async def _resolved_system_ingestion_config_name(cat) -> "str | None":
-    """Effective SYSTEM-level ingestion engine name.
-
-    The ``ingestion`` category is one of the two system-level services (the
-    other is ``embedder``), so its selection is read against
-    ``DEFAULT_SYSTEM_KEY`` — never the agent key. The current core does not
-    expose ``resolved_config_name``; when a host provides it (signature
-    ``resolved_config_name(lizard) -> str``) it is used, otherwise the same
-    single system-level ``ingestion`` category entry is read directly. Both
-    paths return the same value.
-    """
-    try:
-        from cat.services.factory.ingestion import resolved_config_name
-    except ImportError:
-        resolved_config_name = None
-
-    if resolved_config_name is not None:
-        return await resolved_config_name(cat)
-
-    from cat.db.cruds import settings as crud_settings
-    from cat.db.database import DEFAULT_SYSTEM_KEY
-
-    saved = await crud_settings.get_settings_by_category(
-        DEFAULT_SYSTEM_KEY, "ingestion"
-    )
-    return (saved or {}).get("name")
-
-
-async def _phase_path_active(cat) -> bool:
-    """Whether the EffING phase path owns graph building for this ingest.
-
-    Single source of truth for the two ingestion modes. The phase path is
-    active **iff**:
-
-    ==========================  ======================  =============
-    EffING installed/loadable   SYSTEM ``ingestion``    phase path
-    ==========================  ======================  =============
-    no                          any                     inactive
-    yes                         core engine             inactive
-    yes                         efficient engine        active
-    ==========================  ======================  =============
-
-    In every other case the classic path runs (``after_rabbithole_stored_documents``
-    -> ``create_derived_graph_for_source``). The phase hooks are still REGISTERED
-    whenever EffING is importable; this helper only decides which mechanism
-    writes the graph, so the two can never run together and neither is dead.
-    """
-    try:
-        import cat.core_plugins.cat_efficient_ingestion  # noqa: F401
-    except Exception:  # noqa: BLE001
-        return False
-
-    try:
-        name = await _resolved_system_ingestion_config_name(cat)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            f"[GraphRAG] Could not resolve the system ingestion engine "
-            f"({exc!r}); using the classic path."
-        )
-        return False
-
-    return name == _EFFICIENT_INGESTION_CONFIG_NAME
-
-
 @hook(priority=10)
-def ingestion_phase_specs(specs, cat) -> list:
-    """Register the two graph phases with the EffING phase machine (T5).
+def rabbithole_ingestion_phases(phases: List, cat) -> List:
+    """Register the two graph phases with the core ingestion machine.
 
-    ACCUMULATOR convention: EffING threads ``specs`` through every registrant
-    and merges the returned list into its PHASES. ``settings_category=None``:
-    the material marker IS the settings fingerprint (``_spacy_fingerprint`` /
-    ``_concept_fingerprint``), so the settings fast-path is skipped. Both
-    phases depend on ``parsing_chunking`` + ``embedding`` (the graph work
-    needs the stored chunks AND valid vectors). Lazy import (FX-9 style) in a
-    try/except keeps this module import-safe when EffING is not deployed.
+    The hook appends phase CLASSES (the core instantiates them without
+    arguments for every run) and returns the extended accumulator. Both phases
+    depend on ``parsing_chunking`` + ``embedding`` (the graph work needs the
+    stored chunks and valid vectors). A missing plugin phase module leaves the
+    accumulator untouched, so activation never crashes.
     """
     try:
-        from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
-    except ImportError:
-        PhaseSpec = None
-    if PhaseSpec is None:
-        return specs
-    specs.append(
-        PhaseSpec(
-            "graph_spacy_extraction",
-            settings_category=None,
-            depends_on=("parsing_chunking", "embedding"),
-        )
-    )
-    specs.append(
-        PhaseSpec(
-            "graph_llm_extraction",
-            settings_category=None,
-            depends_on=("parsing_chunking", "embedding"),
-        )
-    )
-    return specs
-
-
-def _phases_module():
-    """The plugin's phase module, or ``None`` when it cannot be imported."""
-    try:
-        from . import phases
+        from .phases import GraphConceptPhase, GraphSpacyPhase
     except Exception:  # noqa: BLE001 - keep main.py import-safe
-        return None
+        return phases
+    phases.append(GraphSpacyPhase)
+    phases.append(GraphConceptPhase)
     return phases
-
-
-@hook(priority=10)
-def ingestion_phase_objects(cat=None) -> list:
-    """Contribute the two graph phases as ``IngestionPhase`` instances.
-
-    Class path (phase-contract v2): EffING merges these instances BEFORE the
-    legacy ``ingestion_phase_specs`` adapters, so for the two graph ids the
-    class implementation is the one exercised by the registry (``applies_to``,
-    ``delete``, ``tag``). The legacy hooks below stay registered for one release
-    as the compatibility adapter and for hosts that still call them directly.
-    Lazy import keeps ``main.py`` import-safe when the class module is
-    unavailable, and returns an empty list so the legacy specs remain the
-    fallback (never a crash at activation).
-    """
-    phases = _phases_module()
-    if phases is None:
-        return []
-    return [phases.GraphSpacyPhase(cat), phases.GraphConceptPhase(cat)]
-
-
-@hook(priority=10)
-async def ingestion_phase_settings_marker(phase, cat) -> Any:
-    """Material marker for the graph phases (thin delegate to ``tag``).
-
-    The marker IS the class's configuration fingerprint
-    (``_spacy_fingerprint`` / ``_concept_fingerprint``): configuration only,
-    no LLM call. Delegating to ``phases.phase_fingerprint`` keeps ONE
-    implementation shared with ``IngestionPhase.tag``.
-    """
-    phases = _phases_module()
-    if phases is None:
-        return None
-    return await phases.phase_fingerprint(phase, cat)
-
-
-@hook(priority=10)
-async def ingestion_phase_run(phase, source, completed_phases, cat):
-    """Phase executor (thin delegate to ``IngestionPhase.process``).
-
-    Returns the documented tri-state status dict:
-
-    - ``{"status": "done"}`` when there is nothing to do (the graph backend is
-      not active) — a registered-but-inactive graph phase must NOT turn a
-      successful ingestion into an ERROR;
-    - whatever the phase body returns (``done`` / ``not_ready``) when the
-      handler is active;
-    - ``None`` for an UNKNOWN phase (fail-hard: the core maps ``None`` ->
-      status=error, so an unhandled phase never silently succeeds).
-
-    Exceptions propagate (the core maps them to status=error). The phase BODY
-    is ``phases.run_phase``, the same one ``process`` uses; this hook only
-    adapts the raw status dict (which carries ``retry_after``) back to EffING.
-    """
-    phases = _phases_module()
-    if phases is None or phases.phase_for(phase, cat) is None:
-        return None
-    raw = await phases.run_phase(phase, source, cat)
-    return {"status": "done"} if raw is None else raw
-
-
-@hook(priority=10)
-async def ingestion_phase_purge(phase, source, cat) -> Any:
-    """Purge the graph artifacts derived from ``source`` (phase purge hook).
-
-    Thin delegate to ``IngestionPhase.delete``: only the graph-derived
-    entities/relations/provenance of THIS source are removed
-    (``GraphRAGHandler.purge_source_graph_artifacts``); chunk Documents and
-    every other source are untouched. Both graph phases derive from the same
-    graph, so either phase's purge removes the source's graph artifacts (the
-    re-run rebuilds them).
-
-    Returns ``None`` for non-graph phases (hook abstention) and a truthy
-    status dict otherwise. When GraphRAG is not the active handler there is
-    nothing to purge and ``delete`` is an idempotent no-op.
-    """
-    phases = _phases_module()
-    if phases is None or phases.phase_for(phase, cat) is None:
-        return None
-    await phases.delete_phase(phase, source, cat)
-    return {"status": "done"}
-
-
-@hook(priority=10)
-async def before_ingestion_status_completed(source, cat) -> None:
-    """Completion gate (T5): fail-hard when graph work is still pending.
-
-    Raises when live background tasks remain for the source, so the core
-    writes status=error. The diary check is gone: EffING owns the completed-
-    phases diary and computes staleness for the registered phases itself.
-    No-op when graphrag is not the active handler.
-    """
-    handler = _graphrag_handler(cat)
-    if handler is None:
-        return
-
-    if handler.has_pending_source_tasks(source):
-        raise RuntimeError(
-            f"[GraphRAG] Pending background graph tasks for source '{source}'"
-        )
 
 
 @hook(priority=10)

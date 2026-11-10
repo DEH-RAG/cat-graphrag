@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""MyGRAPH embedder injection on the hook BOTH ingestion engines emit.
+"""MyGRAPH injects the agent embedder before graph extraction.
 
-The embedder used to be injected only from ``before_rabbithole_stores_documents``,
-which the efficient engine (EffING) NEVER emits, so under EffING the handler ran
-its extraction phases with ``handler.embedder is None`` and skipped entity
-embeddings. The injection now also lives on ``rabbithole_ingestion_processing``,
-which BOTH engines emit (classic: ``cat/rabbit_hole.py:247``; EffING:
-``cat/core_plugins/cat_efficient_ingestion/reembed.py:1105``).
+The embedder is injected on two independent paths:
 
-These tests load the real MyGRAPH ``main.py``; its heavy relative modules are
-replaced by local fakes, so no Neo4j/spaCy/Redis is needed.
+* ``before_rabbithole_stores_documents`` — fired by the core during the
+  ``embedding`` phase (before the graph phases run);
+* ``IngestionPhase.process`` — the phase makes its handler self-sufficient, so
+  a resumed/retried graph phase that skips embedding still holds the embedder
+  (and an initialized entity extractor).
+
+These tests load the real MyGRAPH ``main.py`` / ``phases.py``; its heavy
+relative modules are replaced by local fakes, so no Neo4j/spaCy/Redis is
+needed.
 
 Standalone script (plugin rules): the host imports every ``.py`` under the
 plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
@@ -22,20 +24,18 @@ host checkout:
 
 if __name__ == "__main__":
     import asyncio
-    import importlib
     import importlib.util
+    import os
     import sys
     import traceback
     import types
     from pathlib import Path
-    from unittest import mock
 
     PLUGIN_DIR = Path("/root/git/plugins/cat-graphrag.my")
     MAIN_PATH = PLUGIN_DIR / "main.py"
-    EFFING = "cat.core_plugins.cat_efficient_ingestion"
 
-    EFFICIENT = "EfficientIngestionConfiguration"
-    CORE = "BaseIngestionConfiguration"
+    os.environ.setdefault("CAT_CRYPTO_KEY", "graphrag-test-crypto-key")
+    os.environ.setdefault("CAT_CRYPTO_SALT", "graphrag-test-crypto-salt")
 
     class FakeEmbedder:
         """Stand-in for the agent-resolved embedder instance (identity matters)."""
@@ -54,7 +54,6 @@ if __name__ == "__main__":
             self._embedder = None
             self._alignment_done = False
             self.align_calls = 0
-            self.classic_calls = 0
             self.spacy_calls = 0
             self.llm_calls = 0
             self.seen_embedder = "UNSET"
@@ -78,23 +77,21 @@ if __name__ == "__main__":
             self._alignment_done = True
             self.align_calls += 1
 
-        async def drain_source_tasks(self, source):
-            # No background extraction in this fake; the classic write follows.
-            return False
-
-        async def create_derived_graph_for_source(self, source, stored_points, cat):
-            self.classic_calls += 1
-            self.seen_embedder = self._embedder
-
         async def run_spacy_extraction_phase(self, source, cat=None):
             self.spacy_calls += 1
             self.seen_embedder = self._embedder
-            return "done"
+            return {"status": "done"}
 
         async def run_llm_extraction_phase(self, source, cat=None):
             self.llm_calls += 1
             self.seen_embedder = self._embedder
-            return "done"
+            return {"status": "done"}
+
+        def _spacy_fingerprint(self):
+            return "spacy"
+
+        async def _concept_fingerprint(self):
+            return "concept"
 
     def _cleanup(package_name):
         for name in list(sys.modules):
@@ -127,15 +124,12 @@ if __name__ == "__main__":
             raise
         return module
 
-    def _install_resolver(name):
-        ingestion = importlib.import_module("cat.services.factory.ingestion")
-
-        async def resolved_config_name(lizard):
-            return name
-
-        return mock.patch.object(
-            ingestion, "resolved_config_name", resolved_config_name, create=True
-        )
+    class Source:
+        def __init__(self, name="file.pdf"):
+            self.name = name
+            self.agent_id = "agent_test"
+            self.chat_id = None
+            self.type = "file"
 
     def _cat(handler, embedder):
         async def resolve_embedder():
@@ -147,91 +141,76 @@ if __name__ == "__main__":
             embedder=resolve_embedder,
         )
 
-    async def _test_efficient_flow_has_embedder_before_extraction():
-        """EffING emits `rabbithole_ingestion_processing` (never the classic hook):
-        the handler already holds the agent embedder when a graph phase runs."""
-        with _install_resolver(EFFICIENT):
-            module = _load_plugin_main("_mygraph_embedder_effing")
-            try:
-                handler = FakeGraphRAGHandler()
-                embedder = FakeEmbedder()
-                cat = _cat(handler, embedder)
+    async def _test_phase_injects_embedder_before_extraction():
+        """A resumed graph phase gets the embedder without the embedding phase."""
+        module = _load_plugin_main("_mygraph_embedder_phase")
+        try:
+            phases = __import__("_mygraph_embedder_phase.phases", fromlist=["phases"])
+            handler = FakeGraphRAGHandler()
+            embedder = FakeEmbedder()
+            cat = _cat(handler, embedder)
 
-                # EffING: processing hook, then the phase dispatcher.
-                await module.rabbithole_ingestion_processing.function("file.pdf", cat)
+            result = await phases.GraphSpacyPhase().process(Source(), cat)
 
-                assert handler.embedder is embedder
-                assert handler.align_calls == 1
+            assert result.status == "done", result
+            assert handler.embedder is embedder
+            assert handler.align_calls == 1
+            assert handler.entity_extractor.ensure_initialized_calls == 1
+            assert handler.seen_embedder is embedder
+        finally:
+            _cleanup("_mygraph_embedder_phase")
 
-                await module.ingestion_phase_run.function(
-                    "graph_spacy_extraction", "file.pdf", [], cat
-                )
-                await module.ingestion_phase_run.function(
-                    "graph_llm_extraction", "file.pdf", [], cat
-                )
+    async def _test_stores_documents_hook_keeps_identical_behaviour():
+        """The core-fired stores hook injects embedder, extractor and chunk_index."""
+        module = _load_plugin_main("_mygraph_embedder_classic")
+        try:
+            handler = FakeGraphRAGHandler()
+            embedder = FakeEmbedder()
+            cat = _cat(handler, embedder)
 
-                assert handler.spacy_calls == 1
-                assert handler.llm_calls == 1
-                assert handler.seen_embedder is embedder
-            finally:
-                _cleanup("_mygraph_embedder_effing")
+            docs = [types.SimpleNamespace(metadata={})]
+            returned = await module.before_rabbithole_stores_documents.function(docs, cat)
 
-    async def _test_classic_flow_keeps_identical_behaviour():
-        """Classic RabbitHole emits processing AND stores_documents then the
-        callback: the handler/extractor still get the agent embedder."""
-        with _install_resolver(CORE):
-            module = _load_plugin_main("_mygraph_embedder_classic")
-            try:
-                handler = FakeGraphRAGHandler()
-                embedder = FakeEmbedder()
-                cat = _cat(handler, embedder)
-
-                await module.rabbithole_ingestion_processing.function("file.pdf", cat)
-                docs = [types.SimpleNamespace(metadata={})]
-                returned = await module.before_rabbithole_stores_documents.function(docs, cat)
-                await module.after_rabbithole_stored_documents.function("file.pdf", [], cat)
-
-                assert returned is docs
-                assert handler.embedder is embedder
-                assert handler.entity_extractor.ensure_initialized_calls == 1
-                assert docs[0].metadata["chunk_index"] == 0
-                assert handler.classic_calls == 1
-                assert handler.seen_embedder is embedder
-            finally:
-                _cleanup("_mygraph_embedder_classic")
+            assert returned is docs
+            assert handler.embedder is embedder
+            assert handler.entity_extractor.ensure_initialized_calls == 1
+            assert docs[0].metadata["chunk_index"] == 0
+        finally:
+            _cleanup("_mygraph_embedder_classic")
 
     async def _test_injection_twice_is_harmless():
-        """Re-injecting (classic emits both hooks; retries) changes no state."""
-        with _install_resolver(EFFICIENT):
-            module = _load_plugin_main("_mygraph_embedder_idempotent")
-            try:
-                handler = FakeGraphRAGHandler()
-                embedder = FakeEmbedder()
-                cat = _cat(handler, embedder)
+        """Re-injecting (retries, the stores hook plus a phase) changes no state."""
+        module = _load_plugin_main("_mygraph_embedder_idempotent")
+        try:
+            phases = __import__(
+                "_mygraph_embedder_idempotent.phases", fromlist=["phases"]
+            )
+            handler = FakeGraphRAGHandler()
+            embedder = FakeEmbedder()
+            cat = _cat(handler, embedder)
 
-                await module.rabbithole_ingestion_processing.function("file.pdf", cat)
-                first = handler.embedder
-                await module.rabbithole_ingestion_processing.function("file.pdf", cat)
-                await module.rabbithole_ingestion_processing.function("file.pdf", cat)
+            await phases.GraphSpacyPhase().process(Source(), cat)
+            first = handler.embedder
+            await phases.GraphConceptPhase().process(Source(), cat)
 
-                assert handler.embedder is first is embedder
-                assert handler.align_calls == 1
+            assert handler.embedder is first is embedder
+            assert handler.align_calls == 1
 
-                docs = [types.SimpleNamespace(metadata={})]
-                await module.before_rabbithole_stores_documents.function(docs, cat)
-                await module.before_rabbithole_stores_documents.function(docs, cat)
+            docs = [types.SimpleNamespace(metadata={})]
+            await module.before_rabbithole_stores_documents.function(docs, cat)
+            await module.before_rabbithole_stores_documents.function(docs, cat)
 
-                assert handler.embedder is embedder
-                assert handler.align_calls == 1
-                assert docs[0].metadata["chunk_index"] == 0
-            finally:
-                _cleanup("_mygraph_embedder_idempotent")
+            assert handler.embedder is embedder
+            assert handler.align_calls == 1
+            assert docs[0].metadata["chunk_index"] == 0
+        finally:
+            _cleanup("_mygraph_embedder_idempotent")
 
     _tests = [
-        ("test_efficient_flow_has_embedder_before_extraction",
-         _test_efficient_flow_has_embedder_before_extraction),
-        ("test_classic_flow_keeps_identical_behaviour",
-         _test_classic_flow_keeps_identical_behaviour),
+        ("test_phase_injects_embedder_before_extraction",
+         _test_phase_injects_embedder_before_extraction),
+        ("test_stores_documents_hook_keeps_identical_behaviour",
+         _test_stores_documents_hook_keeps_identical_behaviour),
         ("test_injection_twice_is_harmless", _test_injection_twice_is_harmless),
     ]
     _failed = 0
@@ -246,3 +225,4 @@ if __name__ == "__main__":
 
     print(f"\ntest_embedder_injection: {len(_tests) - _failed}/{len(_tests)} passed")
     raise SystemExit(1 if _failed else 0)
+

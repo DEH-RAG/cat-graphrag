@@ -25,24 +25,26 @@ does not need and prints `PASS <test>` lines. Requirements per script:
   `test_derived_graph_unconditional.py`, `test_phase_fingerprint.py`,
   `test_classic_path.py`, `test_embedder_injection.py`,
   `test_maintenance_imports.py`, `test_phase_run.py`,
-  `test_single_extraction.py` —
-  self-contained (stubbed Neo4j/spaCy/Cat/tenant lock; the last seven load the
-  real plugin through a synthetic package), run from the host venv;
+  `test_ingestion_phase_machine.py`, `test_single_extraction.py` —
+  self-contained (stubbed Neo4j/spaCy/Cat/tenant lock; the last several load
+  the real plugin through a synthetic package), run from the host venv;
 - `test_phase_registration.py` — loads the real plugin `main.py` and pins the
-  canonical EffING `PhaseSpec` identity; the EffING contract comes from the
-  shared `effing_testkit` (`install_stub_package`). Run from the host venv;
+  single core hook (`rabbithole_ingestion_phases`). Run from the host venv;
+- `test_phase_abc_migration.py` — the core-contract harness (real
+  `cat.rabbit_hole.phases.IngestionPhase`, fake handler): applicability,
+  source-scoped delete, settings/tags, process delegation, no protocol logic,
+  core subclass shape, 300 s concept budget, warning-is-done;
 - `test_transfer_hook.py` — pure unit test of the transfer-hook signature and
   wipe policy (the plugin's heavy modules are stubbed); one case resolves the
   ingestion factory, so run it from the host venv;
-- `test_dual_mode.py` — the full host-app integration contract (classic vs
-  efficient engine on the real `create_app`, in-memory Qdrant, dedicated
-  `CAT_REDIS_DB=1` and a live Neo4j at `bolt://127.0.0.1:7687`). It needs
-  `CAT_REDIS_HOST` (and `CAT_NEO4J_PASSWORD`/`NEO4J_PASSWORD` when the local
-  Neo4j container is not inspectable) and runs from the host venv:
+- `test_dual_mode.py` — drives the REAL core phase machine offline
+  (`engine.collect_phases`, `execution_order`, `compute_tags`,
+  `engine._run_phase`) with the real plugin phase classes and a fake handler:
+  no Redis/Neo4j required. Run from the host venv:
 
   ```bash
   cd /root/git/grinning-cat-core
-  CAT_REDIS_HOST=<redis host> .venv/bin/python /root/git/plugins/cat-graphrag.my/tests/test_dual_mode.py
+  .venv/bin/python /root/git/plugins/cat-graphrag.my/tests/test_dual_mode.py
   ```
 - `test_cypher_comments.py` — static guard against `#` comments inside Cypher
   strings, plus a live execution of the concept-relation template when a Neo4j
@@ -54,22 +56,19 @@ does not need and prints `PASS <test>` lines. Requirements per script:
   `cat.plugins.cat_graphrag`, i.e. run it inside the Cat container with the
   plugin installed, not from a bare host checkout.
 
-## Retired: `tests/test_ingestion_phase_machine.py`
+## Phase model
 
-Removed. It documented the obsolete single-phase `graph_building` model
-(`ingestion_phase_pending` + a diary/generation check in
-`before_ingestion_status_completed`) and imported the pre-extraction module
-path (the legacy `cat.plugins.*` namespace).
+The two graph phases (`graph_spacy_extraction` / `graph_llm_extraction`) are
+`cat.rabbit_hole.phases.IngestionPhase` subclasses registered through the ONE
+core hook `rabbithole_ingestion_phases`. The classic ingestion callback and the
+old EffING `ingestion_phase_*` hooks are gone. Covered by:
 
-The current two-phase model (`graph_spacy_extraction` /
-`graph_llm_extraction`, registered through EffING's `ingestion_phase_specs`)
-is covered by:
+- `test_phase_abc_migration.py` — the class contract against the real core ABC;
+- `test_phase_registration.py` — the single hook + exactly two classes;
+- `test_phase_run.py` — the status mapping (skipped/done/not_ready/error);
+- `test_classic_path.py` — one graph writer, no engine-selection switch;
+- `test_embedder_injection.py` — embedder/extractor preparation for a phase;
+- `test_dual_mode.py` — real core phase-machine integration;
+- `test_ingestion_phase_machine.py` — the handler bodies behind the phases;
+- `test_transfer_hook.py` — the vector-memory switch cleanup.
 
-- `../test_ingestion_phase_machine.py` — the maintained standalone harness at
-  the plugin root (registration, markers, tri-state `ingestion_phase_run`,
-  completion gate, mode truth table, transfer cleanup);
-- the plugin suites in this directory (`test_phase_run.py`,
-  `test_classic_path.py`, `test_embedder_injection.py`,
-  `test_single_extraction.py`, `test_maintenance_imports.py`);
-- `test_dual_mode.py`, `test_phase_registration.py`, `test_transfer_hook.py`
-  — the former MyCAT integration contract, now owned here.

@@ -34,11 +34,15 @@ if __name__ == "__main__":
     import importlib
     import importlib.util
     import inspect
+    import os
     import sys
     import traceback
     import types
     from pathlib import Path
     from unittest import mock
+
+    os.environ.setdefault("CAT_CRYPTO_KEY", "graphrag-test-crypto-key")
+    os.environ.setdefault("CAT_CRYPTO_SALT", "graphrag-test-crypto-salt")
 
     PLUGIN_DIR = Path("/root/git/plugins/cat-graphrag.my")
     MAIN_PATH = PLUGIN_DIR / "main.py"
@@ -160,19 +164,15 @@ if __name__ == "__main__":
         finally:
             _cleanup("_mygraph_transfer_new_graphrag")
 
-    async def _test_classic_callback_noop_when_phase_path_active():
-        """With EffING active (same gate as the transfer hook's sibling), the
-        classic ``after_rabbithole_stored_documents`` does zero graph work."""
+    async def _test_classic_callback_is_gone():
+        """The single graph writer contract: no classic ingestion callback."""
         calls, wipe = _wipe_spy()
         module = _load_plugin_main("_mygraph_transfer_classic_gate", wipe)
         try:
-            with _install_resolver(EFFICIENT):
-                handler = FakeGraphRAGHandler()
-                cat = _cat(handler)
-
-                await module.after_rabbithole_stored_documents.function("file.pdf", [], cat)
-
-                assert handler.classic_calls == 0
+            assert not hasattr(module, "after_rabbithole_stored_documents"), (
+                "the classic fire-and-forget callback must be gone"
+            )
+            assert hasattr(module, "rabbithole_ingestion_phases")
         finally:
             _cleanup("_mygraph_transfer_classic_gate")
 
@@ -183,8 +183,8 @@ if __name__ == "__main__":
         ("test_no_wipe_on_failed_transfer", _test_no_wipe_on_failed_transfer),
         ("test_no_wipe_when_new_handler_is_graphrag",
          _test_no_wipe_when_new_handler_is_graphrag),
-        ("test_classic_callback_noop_when_phase_path_active",
-         _test_classic_callback_noop_when_phase_path_active),
+        ("test_classic_callback_is_gone",
+         _test_classic_callback_is_gone),
     ]
     _failed = 0
     for _name, _fn in _tests:

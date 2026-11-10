@@ -254,17 +254,17 @@ if __name__ == "__main__":
         image. ``resume_owner`` is ignored (a stale lease survives into a classic
         re-ingest and used to skip the graph silently).
         """
-        from cat.core_plugins.cat_efficient_ingestion import registry
+        from cat.db.cruds import ingestions as crud_ingestions
 
         handler = _make_handler()
         del handler._is_empty_vector_staging_pass  # reveal the real class method
 
-        async def _parsing_chunking_claimed(agent_id, scope, source):
+        async def _parsing_chunking_claimed(agent_id, chat_id, source):
             assert agent_id == "tenant_test"
-            assert scope == "agent"
+            assert chat_id is None
             return {"phase": "parsing_chunking", "resume_owner": "reembed-1"}
 
-        with mock.patch.object(registry, "get_status", _parsing_chunking_claimed):
+        with mock.patch.object(crud_ingestions, "get_status", _parsing_chunking_claimed):
             # staging pass: empty mapping + parsing_chunking
             assert await handler._is_empty_vector_staging_pass(
                 "file.pdf", {"source": "file.pdf"}, {}
@@ -278,25 +278,25 @@ if __name__ == "__main__":
                 "file.pdf", {"source": "file.pdf"}, [0.1, 0.2, 0.3]
             ) is False
 
-        async def _embedding(agent_id, scope, source):
+        async def _embedding(agent_id, chat_id, source):
             return {"phase": "embedding", "resume_owner": "reembed-1"}
 
-        with mock.patch.object(registry, "get_status", _embedding):
+        with mock.patch.object(crud_ingestions, "get_status", _embedding):
             # payload-only image in the embedding pass: still builds the graph
             assert await handler._is_empty_vector_staging_pass(
                 "file.pdf", {"source": "file.pdf"}, {}
             ) is False
 
-        async def _no_doc(agent_id, scope, source):
+        async def _no_doc(agent_id, chat_id, source):
             return None
 
-        with mock.patch.object(registry, "get_status", _no_doc):
+        with mock.patch.object(crud_ingestions, "get_status", _no_doc):
             assert await handler._is_empty_vector_staging_pass(
                 "file.pdf", {"source": "file.pdf"}, {}
             ) is False
 
         # no source at all -> never staging
-        with mock.patch.object(registry, "get_status", _parsing_chunking_claimed):
+        with mock.patch.object(crud_ingestions, "get_status", _parsing_chunking_claimed):
             assert await handler._is_empty_vector_staging_pass(None, {}, {}) is False
 
     _tests = [

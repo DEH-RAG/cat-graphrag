@@ -1,6 +1,6 @@
-"""Standalone verification for the FX-7/FX-9 fixes: the hooks
-``after_rabbithole_stored_documents`` (FX-7) and
-``after_vector_database_settings_update`` (FX-9) survive the plugin loader's
+"""Standalone verification for the FX-9 fix: the hooks
+``before_rabbithole_stores_documents`` and
+``after_vector_database_settings_update`` survive the plugin loader's
 reload order via a lazy in-function ``GraphRAGHandler`` import.
 
 The MyCAT plugin loader (mad_hatter/plugin.py) walks the plugin's ``*.py``
@@ -253,8 +253,9 @@ def _make_settings_handler(handler_mod, *, active_gen="gen_old", new_gen="gen_ne
 
 def test_hook_calls_derived_graph_after_reload_order():
     """Reproduces the loader's glob order (main BEFORE graphrag_handler) and
-    proves the lazy in-function import resolves the CURRENT class, so the hook
-    fires with a handler of that class (the FX-7 failure mode)."""
+    proves the lazy in-function import resolves the CURRENT class, so the
+    survives-reload guard fires with a handler of that class (the FX-7/9
+    failure mode)."""
     importlib.import_module(f"{PKG}.main")  # binds main.GraphRAGHandler = class A
     handler_mod = importlib.import_module(f"{PKG}.graphrag_handler")
     importlib.reload(handler_mod)  # class B now lives in the module
@@ -264,13 +265,29 @@ def test_hook_calls_derived_graph_after_reload_order():
     assert main.GraphRAGHandler is not handler_mod.GraphRAGHandler
 
     handler = _make_handler(handler_mod)
-    cat = types.SimpleNamespace(vector_memory_handler=handler)
 
-    asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
+    class _Extractor:
+        def __init__(self):
+            self.calls = 0
 
-    handler.create_derived_graph_for_source.assert_awaited_once_with(
-        "file.txt", [], cat
+        async def ensure_initialized(self):
+            self.calls += 1
+
+    extractor = _Extractor()
+    handler._entity_extractor = extractor
+
+    async def _embedder():
+        return None
+
+    cat = types.SimpleNamespace(
+        vector_memory_handler=handler, embedder=_embedder
     )
+    docs = [types.SimpleNamespace(metadata={})]
+
+    asyncio.run(main.before_rabbithole_stores_documents(docs, cat))
+
+    assert extractor.calls == 1
+    assert docs[0].metadata["chunk_index"] == 0
 
 
 def test_hook_skips_non_graphrag_handler():
@@ -280,8 +297,12 @@ def test_hook_skips_non_graphrag_handler():
 
     other = type("OtherHandler", (), {})()
     cat = types.SimpleNamespace(vector_memory_handler=other)
+    docs = [types.SimpleNamespace(metadata={})]
 
-    asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
+    returned = asyncio.run(main.before_rabbithole_stores_documents(docs, cat))
+
+    assert returned is docs
+    assert "chunk_index" not in docs[0].metadata
 
 
 def test_settings_hook_schedules_recompute_after_reload_order():

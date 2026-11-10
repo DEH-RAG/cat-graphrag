@@ -288,13 +288,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
         self._enable_concept_relations = enable_concept_relations
-        # Per-source LLM-extraction attempt counter (process-local). The diary
-        # ``attempt`` is not exposed to the phase body (EffING passes only
-        # completed phases to ``ingestion_phase_run`` and the handler has no
-        # scope to read the current ``processing`` entry), so the first
-        # ``not_ready`` -> ``error`` transition is tracked here. Reset when the
-        # extraction succeeds (or terminally fails) so a later re-ingestion
-        # starts a fresh budget.
+        # Per-source LLM-extraction attempt counter (process-local). The core
+        # phase body receives only the live source, not the diary ``attempt``,
+        # so the first ``not_ready`` -> ``error`` transition is tracked here.
+        # Reset when the extraction succeeds (or terminally fails) so a later
+        # re-ingestion starts a fresh budget.
         self._concept_attempts: Dict[str, int] = {}
         # Per-source (entities, relations) counts of the last drained
         # background batch. ``drain_source_tasks`` returns a bool (existing
@@ -407,51 +405,39 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def _is_empty_vector_staging_pass(
         self, source: Optional[str], metadata: Dict | None, vector=None
     ) -> bool:
-        """Whether this write belongs to EffING's empty-vector staging pass.
+        """Whether this write belongs to a legacy empty-vector staging pass.
 
-        The efficient engine stores every chunk TWICE: once in the
-        ``parsing_chunking`` phase with ``vector={}`` (``_store_empty_vectors``)
-        and again in the ``embedding`` phase with real vectors (or
-        payload-only for images). Graph extraction is vector-independent, so
-        it must run on the second pass only.
+        The old two-phase engine stored every chunk TWICE: once in the
+        ``parsing_chunking`` phase with ``vector={}`` and again in the
+        ``embedding`` phase with real vectors (or payload-only for images).
+        Graph extraction is vector-independent, so it must run on the second
+        pass only. The current core writes a source once, so this discriminator
+        never fires there; it stays to keep old data readable.
 
         The discriminator is the CONJUNCTION of two signals:
 
         1. the point carries the empty mapping ``vector={}`` (see
-           :meth:`_is_empty_mapping`) — written ONLY by EffING's staging pass;
-           and
-        2. the source's recorded phase is ``parsing_chunking`` — EffING sets
-           it before ``_run_parsing_phase`` (``set_phase``), and its
-           ``embedding`` pass (which may legitimately still carry ``{}`` for a
-           payload-only image) is a different phase.
-
-        The ``resume_owner`` lease is deliberately NOT used: the host never
-        clears it on a terminal status (only ``resume_created``), and the core
-        ingestion rewrites ``phase=parsing_chunking`` for EVERY ingestion, so a
-        classic re-ingest after an EffING ingest inherited
-        ``resume_owner``+``parsing_chunking`` and the graph was silently
-        skipped. The empty mapping is an intrinsic property of the write and
-        cannot fire on the classic path (always a list, zero-norm included).
+           :meth:`_is_empty_mapping`) — written ONLY by the staging pass; and
+        2. the source's recorded phase is ``parsing_chunking``.
 
         Vector VALIDITY is still not the discriminator: a legitimate
         payload-only / zero-norm vector (list) MUST build the graph.
 
-        No status doc / no empty mapping (classic path, direct writes) means
-        "not a staging pass": build the graph, exactly as before.
+        No status doc / no empty mapping (direct writes) means "not a staging
+        pass": build the graph, exactly as before.
         """
         if not source or not self._is_empty_mapping(vector):
             return False
         try:
-            from cat.core_plugins.cat_efficient_ingestion import registry
+            from cat.db.cruds import ingestions as crud_ingestions
 
             chat_id = (metadata or {}).get("chat_id")
-            scope = str(chat_id) if chat_id else "agent"
-            doc = await registry.get_status(self.agent_id, scope, source)
+            doc = await crud_ingestions.get_status(self.agent_id, chat_id, source)
         except Exception:  # noqa: BLE001 - never let the discriminator break a write
             return False
         if not doc:
             return False
-        return doc.get("phase") == registry.PHASE_PARSING_CHUNKING
+        return doc.get("phase") == "parsing_chunking"
 
     @staticmethod
     def _next_generation(gen: str) -> str:
@@ -2865,8 +2851,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def purge_source_graph_artifacts(self, source: str) -> int:
         """Delete the graph artifacts ONE source contributed to this tenant.
 
-        Source-scoped phase purge used by the EffING ``ingestion_phase_purge``
-        hook before an abandoned graph phase is re-run. It removes ONLY what
+        Source-scoped phase delete, called by ``IngestionPhase.delete`` before a
+        graph phase is re-run. It removes ONLY what
         the graph phases derived from ``source`` and leaves:
           - the chunk Documents themselves (owned by parsing/embedding),
           - entities/relations still referenced by OTHER sources,

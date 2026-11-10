@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""MyGRAPH phase registration must use the canonical EffING module identity.
+"""MyGRAPH registers its graph phases on the CORE ingestion protocol.
 
-The host loads ``cat/core_plugins/`` in preference to ``cat/plugins/``, so the
-canonical ``PhaseSpec`` lives at
-``cat.core_plugins.cat_efficient_ingestion.phases``. A consumer that imports the
-same file through ``cat.plugins.cat_efficient_ingestion.phases`` creates a
-SECOND module identity: ``isinstance(spec, PhaseSpec)`` is then False and
-EffING's ``merged_phases`` silently drops the specs. These tests load the real
-MyGRAPH ``main.py`` (its heavy relative modules are stubbed) and pin the
-canonical identity plus the exactly-two-phase contract.
+The two graph phases are ``cat.rabbit_hole.phases.IngestionPhase`` subclasses
+returned as CLASSES by the single ``rabbithole_ingestion_phases`` hook (the
+core instantiates them without arguments for every run). There is no EffING
+module identity to pin any more and no ``ingestion_phase_*`` hook set.
 
-The EffING phase contract is provided by the shared ``effing_testkit`` (the
-real installation when the host provides it, a synthetic one in a bare
-checkout) instead of a private stub.
+These tests load the real MyGRAPH ``main.py`` (its heavy relative modules are
+stubbed) and pin the exactly-two-phase contract, the accumulator behaviour and
+import safety.
 
 Standalone script (plugin rules): the host imports every ``.py`` under the
 plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
@@ -24,9 +20,7 @@ host checkout:
 """
 
 if __name__ == "__main__":
-    import asyncio
     import importlib.util
-    import inspect
     import os
     import sys
     import traceback
@@ -35,27 +29,14 @@ if __name__ == "__main__":
 
     PLUGIN_DIR = Path("/root/git/plugins/cat-graphrag.my")
     MAIN_PATH = PLUGIN_DIR / "main.py"
-    CANONICAL = "cat.core_plugins.cat_efficient_ingestion.phases"
-    LEGACY = "cat.plugins.cat_efficient_ingestion"
-    MISSING = object()
 
     EXPECTED_IDS = ["graph_spacy_extraction", "graph_llm_extraction"]
     EXPECTED_DEPS = ("parsing_chunking", "embedding")
 
-    def _load_effing_testkit():
-        """Import the shared ``effing_testkit`` from its sibling plugin checkout."""
-        candidates = (
-            os.path.join(os.path.dirname(str(PLUGIN_DIR)), "cat-efficient-ingestion", "tests"),
-            os.path.join(os.path.dirname(str(PLUGIN_DIR)), "cat-efficient-ingestion.my", "tests"),
-        )
-        for path in candidates:
-            if os.path.isfile(os.path.join(path, "effing_testkit.py")):
-                if path not in sys.path:
-                    sys.path.insert(0, path)
-                break
-        import effing_testkit  # noqa: E402
+    os.environ.setdefault("CAT_CRYPTO_KEY", "graphrag-test-crypto-key")
+    os.environ.setdefault("CAT_CRYPTO_SALT", "graphrag-test-crypto-salt")
 
-        return effing_testkit
+    from cat.rabbit_hole.phases import IngestionPhase
 
     def _cleanup(package_name: str) -> None:
         for name in list(sys.modules):
@@ -65,10 +46,11 @@ if __name__ == "__main__":
     def _load_plugin_main(package_name: str):
         """Load the real plugin ``main.py`` as ``package_name.main``.
 
-        The plugin's relative imports (``.graphrag_handler`` / ``.entity_extractor``)
-        pull the neo4j/spaCy stack, which the host test environment does not
-        install; both are stubbed with the two names ``main.py`` binds at import
-        time. The package is removed by the caller in ``finally``.
+        The plugin's heavy relative modules (``.graphrag_handler`` /
+        ``.entity_extractor``) pull the neo4j/spaCy stack, which the host test
+        environment does not install; both are stubbed with the names ``main.py``
+        binds at import time. The package is removed by the caller in
+        ``finally``.
         """
         assert MAIN_PATH.is_file(), f"MyGRAPH plugin not found at {PLUGIN_DIR}"
 
@@ -97,95 +79,73 @@ if __name__ == "__main__":
             raise
         return module
 
-    def _test_hook_registers_exactly_two_canonical_specs():
-        """The hook returns two specs in order, all of the canonical class."""
-        from cat.core_plugins.cat_efficient_ingestion import phases
-
+    def _test_hook_registers_exactly_two_core_phases():
+        """The hook returns two classes in order, all core IngestionPhases."""
         module = _load_plugin_main("_mygraph_phase_present")
         try:
-            specs = module.ingestion_phase_specs.function([], None)
+            classes = module.rabbithole_ingestion_phases.function([], None)
 
-            assert len(specs) == 2
-            assert [spec.id for spec in specs] == EXPECTED_IDS
-            for spec in specs:
-                assert isinstance(spec, phases.PhaseSpec)
-                assert type(spec).__module__ == CANONICAL
-                assert type(spec).__module__.startswith("cat.core_plugins")
-                assert spec.settings_category is None
-                assert spec.depends_on == EXPECTED_DEPS
-
-            assert LEGACY + ".phases" not in sys.modules
+            assert len(classes) == 2
+            assert [cls.id for cls in classes] == EXPECTED_IDS
+            for cls in classes:
+                assert issubclass(cls, IngestionPhase), cls
+                assert cls.depends_on == EXPECTED_DEPS, cls.depends_on
+                cls()  # no-argument construction, as the host does it
         finally:
             _cleanup("_mygraph_phase_present")
 
-    async def _test_merged_phases_keeps_both_graph_phases():
-        """EffING's merged_phases accepts both specs (no silent isinstance drop)."""
-        from cat.core_plugins.cat_efficient_ingestion import phases
-
+    def _test_hook_preserves_prior_accumulator_entries():
+        """The hook APPENDS: phases of other plugins stay in front."""
         module = _load_plugin_main("_mygraph_phase_merged")
         try:
-            class _PluginManager:
-                # The host registry maps a hook name to the LIST of registered
-                # CatHooks; a bare CatHook is not iterable.
-                hooks = {"ingestion_phase_specs": [module.ingestion_phase_specs]}
+            incoming = ["sentinel"]
+            classes = module.rabbithole_ingestion_phases.function(incoming, None)
 
-                async def execute_hook(self, name, *args, caller=None):
-                    assert name == "ingestion_phase_specs"
-                    return module.ingestion_phase_specs.function(*args, cat=caller)
-
-            cat = types.SimpleNamespace(plugin_manager=_PluginManager())
-            merged = await phases.merged_phases(cat, cat)
-
-            assert len(merged) == len(phases.PHASES) + 2
-            assert [phase for phase in merged if phase in EXPECTED_IDS] == EXPECTED_IDS
-            for phase_id in EXPECTED_IDS:
-                assert isinstance(merged[phase_id], phases.PhaseSpec)
+            assert classes[0] == "sentinel"
+            assert len(classes) == 3
+            assert [cls.id for cls in classes[1:]] == EXPECTED_IDS
         finally:
             _cleanup("_mygraph_phase_merged")
 
-    def _test_module_imports_and_returns_specs_unchanged_when_effing_blocked():
-        """Without EffING the plugin imports and the hook is an accumulator no-op."""
-        saved = sys.modules.get(CANONICAL, MISSING)
-        sys.modules[CANONICAL] = None  # type: ignore[assignment]
+    def _test_module_imports_and_returns_phases_unchanged_when_missing():
+        """Without the plugin phase module the hook is an import-safe no-op."""
+        module = _load_plugin_main("_mygraph_phase_absent")
         try:
-            module = _load_plugin_main("_mygraph_phase_absent")
+            saved = sys.modules.get("_mygraph_phase_absent.phases")
+            sys.modules["_mygraph_phase_absent.phases"] = None
             try:
                 incoming = ["sentinel"]
-                assert module.ingestion_phase_specs.function(incoming, None) is incoming
+                assert (
+                    module.rabbithole_ingestion_phases.function(incoming, None)
+                    is incoming
+                )
             finally:
-                _cleanup("_mygraph_phase_absent")
+                if saved is not None:
+                    sys.modules["_mygraph_phase_absent.phases"] = saved
+                else:
+                    sys.modules.pop("_mygraph_phase_absent.phases", None)
         finally:
-            if saved is MISSING:
-                sys.modules.pop(CANONICAL, None)
-            else:
-                sys.modules[CANONICAL] = saved  # type: ignore[assignment]
+            _cleanup("_mygraph_phase_absent")
 
     _tests = [
-        ("test_hook_registers_exactly_two_canonical_specs",
-         _test_hook_registers_exactly_two_canonical_specs),
-        ("test_merged_phases_keeps_both_graph_phases",
-         _test_merged_phases_keeps_both_graph_phases),
-        ("test_module_imports_and_returns_specs_unchanged_when_effing_blocked",
-         _test_module_imports_and_returns_specs_unchanged_when_effing_blocked),
+        ("test_hook_registers_exactly_two_core_phases",
+         _test_hook_registers_exactly_two_core_phases),
+        ("test_hook_preserves_prior_accumulator_entries",
+         _test_hook_preserves_prior_accumulator_entries),
+        ("test_module_imports_and_returns_phases_unchanged_when_missing",
+         _test_module_imports_and_returns_phases_unchanged_when_missing),
     ]
 
-    _testkit = _load_effing_testkit()
-    _testkit.install_stub_package()
     _failed = 0
-    try:
-        for _name, _fn in _tests:
-            try:
-                if inspect.iscoroutinefunction(_fn):
-                    asyncio.run(_fn())
-                else:
-                    _fn()
-                print(f"PASS {_name}")
-            except Exception as _exc:  # noqa: BLE001 - report and continue
-                _failed += 1
-                traceback.print_exc()
-                print(f"FAIL {_name}: {_exc}")
-    finally:
-        _testkit.uninstall_stub_package()
+    for _name, _fn in _tests:
+        try:
+            _fn()
+            print(f"PASS {_name}")
+        except Exception as _exc:  # noqa: BLE001 - report and continue
+            _failed += 1
+            traceback.print_exc()
+            print(f"FAIL {_name}: {_exc}")
 
     print(f"\ntest_phase_registration: {len(_tests) - _failed}/{len(_tests)} passed")
     raise SystemExit(1 if _failed else 0)
+

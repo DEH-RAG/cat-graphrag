@@ -1426,22 +1426,22 @@ async def _graph_walk_batch(handler, batch: list[dict[str, Any]], collection: st
 
 
 async def _graph_phase_ids(ccat) -> list[str]:
-    """The graph phases THIS plugin registers with EffING (never hardcoded).
+    """The graph phases THIS plugin registers with the core phase machine.
 
-    Reads the same ``ingestion_phase_specs`` accumulator the plugin registers
-    at activation, so adding/renaming a graph phase updates the ``--graph``
-    invalidation automatically. Returns ``[]`` when the plugin module (or
-    EffING) is unavailable.
+    Reads the same ``rabbithole_ingestion_phases`` hook the plugin registers at
+    activation, so adding/renaming a graph phase updates the ``--graph``
+    invalidation automatically. Returns ``[]`` when the plugin module is
+    unavailable.
     """
     plugin_id = _resolve_plugin_id()
     if plugin_id is None:
         return []
     try:
         plugin_main = importlib.import_module(f"cat.plugins.{plugin_id}.main")
-        specs = plugin_main.ingestion_phase_specs([], ccat)
+        classes = plugin_main.rabbithole_ingestion_phases([], ccat)
     except Exception:  # noqa: BLE001 - invalidation must not abort the wipe
         return []
-    return [spec.id for spec in specs if getattr(spec, "id", None)]
+    return [cls.id for cls in classes if getattr(cls, "id", None)]
 
 
 async def _reset_graph_phase_entries(ccat, tenant_id: str) -> int:
