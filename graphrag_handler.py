@@ -1490,7 +1490,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # embedder) MUST still build the graph. ``skip_graph`` is set by
         # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
         # recorded ingestion phase); a direct/classic write defaults to False.
-        if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
+        is_card = bool((metadata or {}).get("is_catalogue_card")) or "# CATALOGUE CARD" in (content or "")
+        is_image = (content or "").startswith("[Image]")
+        if not skip_graph and not is_card and not is_image and self._enable_entity_extraction and self._entity_extractor:
             # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
             # chunk of the source may extract in parallel. It returns the
             # extracted batch; the source's ONE write happens in
@@ -1685,11 +1687,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             entity_count, relation_count = self._last_drain_counts.get(source, (0, 0))
             processed = entity_count + relation_count
         elif self._enable_entity_extraction and self._entity_extractor:
-            content_points = [
-                p
-                for p in all_points
-                if (getattr(p, "payload", None) or {}).get("page_content", "")
-            ]
+            content_points = []
+            for p in all_points:
+                payload = getattr(p, "payload", None) or {}
+                page_content = payload.get("page_content", "")
+                if not page_content:
+                    continue
+                p_metadata = payload.get("metadata", {}) or {}
+                if (
+                    bool(p_metadata.get("is_catalogue_card"))
+                    or "# CATALOGUE CARD" in page_content
+                    or page_content.startswith("[Image]")
+                ):
+                    continue
+                content_points.append(p)
             extractions = await asyncio.gather(
                 *(
                     self._extract_document_graph(
