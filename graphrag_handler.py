@@ -1491,8 +1491,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
         # recorded ingestion phase); a direct/classic write defaults to False.
         is_card = bool((metadata or {}).get("is_catalogue_card")) or "# CATALOGUE CARD" in (content or "")
-        is_image = (content or "").startswith("[Image]")
-        if not skip_graph and not is_card and not is_image and self._enable_entity_extraction and self._entity_extractor:
+        if not skip_graph and not is_card and self._enable_entity_extraction and self._entity_extractor:
             # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
             # chunk of the source may extract in parallel. It returns the
             # extracted batch; the source's ONE write happens in
